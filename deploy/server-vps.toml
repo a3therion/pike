@@ -1,0 +1,50 @@
+# Pike Server Production Configuration for VPS deployments
+
+# QUIC listener
+bind_addr = "[::]:4433"
+
+# Local HTTP and management listeners for reverse proxy / local admin access
+http_bind_addr = "127.0.0.1:8080"
+management_bind_addr = "127.0.0.1:9090"
+deployment_topology = "single-node"
+
+internal_token = "CHANGE_ME_SET_A_RANDOM_INTERNAL_TOKEN"
+server_token = "CHANGE_ME_IF_USING_REMOTE_CONTROL_PLANE"
+
+# Standalone auth for self-hosted deployments. Replace these before first start.
+local_api_keys = ["pk_self_hosted_replace_me"]
+
+# Optional remote control-plane API base URLs (no /api/v1 suffix; code appends it).
+# Comment these in only if you are running a separate control plane.
+# control_plane_url = "https://api.example.com"
+# workers_api_url = "https://api.example.com"
+require_redis = true
+redis_url = "redis://YOUR_REDIS_HOST:6379/0"
+domain = "example.com"
+
+# Connection timeouts
+heartbeat_timeout_secs = 60
+shutdown_timeout_secs = 30
+
+[quic]
+# 60 second idle timeout (must match client config)
+idle_timeout_ms = 60000
+max_concurrent_streams = 100
+congestion_control = "bbr2"
+enable_early_data = true
+enable_dgram = true
+
+# TLS certificates (copy production certs here on the VPS)
+cert_path = "/etc/pike/tls/cert.pem"
+key_path = "/etc/pike/tls/key.pem"
+
+[abuse]
+# Conservative limits for production
+tunnel_creations_per_user_per_hour = 10
+tunnel_creations_per_ip_per_hour = 20
+auto_suspend_requests_per_minute = 1000
+
+[traffic_inspection]
+capture_headers = true
+capture_bodies = false
+max_body_preview_bytes = 65536

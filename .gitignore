@@ -1,0 +1,53 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# AI tools
+.claude/
+.omc/
+.mcp.json
+CLAUDE.md
+AGENTS.md
+.cursorrules
+.cursor/
+.copilot/
+.github/copilot-*
+.aider*
+.codeium/
+.continue/
+.tabnine*
+.sourcegraph/
+.cody/
+
+# TLS private keys (never commit!)
+config/key.pem
+*.key
+*.pem
+
+# Logs
+*.log
+logs/
+
+# Runtime data
+/tmp/
+*.pid
+.todos/
+
+# Python caches
+__pycache__/
+*.pyc

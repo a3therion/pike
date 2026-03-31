@@ -1,0 +1,31 @@
+# Pike CLI Configuration Template
+# Copy this to ~/.pike/config.toml on your client machines
+
+# Use a public DNS name that matches your TLS certificate.
+# Avoid raw IP addresses unless your certificate includes that IP as a SAN.
+
+[auth]
+api_key = "REPLACE_WITH_YOUR_API_KEY"
+
+[relay]
+addr = "relay.example.com:4433"
+ws_fallback = true
+quic_timeout_ms = 60000
+# Control-plane API origin (no /api/v1 suffix)
+api_url = "https://api.example.com"
+tls_server_name = "relay.example.com"
+insecure_skip_tls_verify = false
+
+[tunnel]
+subdomain_prefix = ""
+bind_addr = "127.0.0.1"
+
+[inspector]
+port = 4040
+enabled = true
+max_requests = 500
+
+[advanced]
+log_level = "info"
+zero_rtt = true
+heartbeat_interval = 15

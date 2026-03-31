@@ -1,0 +1,47 @@
+[Unit]
+Description=Pike Tunnel Relay Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pike
+Group=pike
+WorkingDirectory=/opt/pike
+Environment="RUST_LOG=info"
+Environment="RUST_BACKTRACE=1"
+ExecStart=/opt/pike/pike-server --config /etc/pike/server.toml
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+KillSignal=SIGTERM
+Restart=always
+RestartSec=5
+StartLimitInterval=60s
+StartLimitBurst=3
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Logging
+StandardOutput=append:/var/log/pike/server.log
+StandardError=append:/var/log/pike/server.log
+SyslogIdentifier=pike-server
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/pike /var/lib/pike /tmp
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

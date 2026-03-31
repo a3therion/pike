@@ -1,0 +1,15 @@
+target/
+node_modules/
+dashboard/
+admin/
+workers/
+packages/
+docs/
+scripts/
+infrastructure/
+.github/
+.claude/
+.omc/
+.git/
+*.md
+

@@ -1,0 +1,20 @@
+bind_addr = "127.0.0.1:4433"
+http_bind_addr = "127.0.0.1:8080"
+management_bind_addr = "127.0.0.1:9090"
+internal_token = "dev-token-12345"
+heartbeat_timeout_secs = 60
+shutdown_timeout_secs = 30
+
+[quic]
+idle_timeout_ms = 60000
+max_concurrent_streams = 100
+congestion_control = "bbr2"
+enable_early_data = true
+enable_dgram = true
+cert_path = "config/cert.pem"
+key_path = "config/key.pem"
+
+[abuse]
+tunnel_creations_per_user_per_hour = 1000
+tunnel_creations_per_ip_per_hour = 5000
+auto_suspend_requests_per_minute = 5000

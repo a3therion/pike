@@ -1,0 +1,32 @@
+[advisories]
+unmaintained = "all"
+yanked = "warn"
+# atomic-polyfill is unmaintained but required by heapless/postcard
+# Consider migrating to portable-atomic in future
+ignore = [
+    "RUSTSEC-2023-0089",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "Zlib",
+    "BSL-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
