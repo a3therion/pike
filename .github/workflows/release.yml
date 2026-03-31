@@ -136,11 +136,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          pattern: pike*
+          path: release-assets
+          merge-multiple: true
       - name: Prepare release assets
         run: |
-          mkdir -p release-assets
-          find artifacts -type f -exec cp {} release-assets/ \;
           cd release-assets
           sha256sum * > checksums.txt
       - name: Create Release
