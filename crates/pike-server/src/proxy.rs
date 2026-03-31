@@ -63,10 +63,10 @@ impl ProxyError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::TunnelUnavailable => StatusCode::BAD_GATEWAY,
-            Self::DispatchFailed => StatusCode::BAD_GATEWAY,
+            Self::TunnelUnavailable | Self::DispatchFailed | Self::Upstream(_) => {
+                StatusCode::BAD_GATEWAY
+            }
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
-            Self::Upstream(_) => StatusCode::BAD_GATEWAY,
         }
     }
 }

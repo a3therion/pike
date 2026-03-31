@@ -126,9 +126,8 @@ impl WebSocketTransport {
                             }
                         }
                     }
-                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Close(_)) | Err(_) => break,
                     Ok(_) => {}
-                    Err(_) => break,
                 }
             }
         });

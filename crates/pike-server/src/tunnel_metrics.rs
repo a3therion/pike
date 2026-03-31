@@ -55,8 +55,7 @@ impl MetricsRange {
     pub fn bucket_size_seconds(self) -> u64 {
         match self {
             Self::OneHour => 60,
-            Self::TwentyFourHours => 60 * 60,
-            Self::SevenDays => 60 * 60,
+            Self::TwentyFourHours | Self::SevenDays => 60 * 60,
         }
     }
 }

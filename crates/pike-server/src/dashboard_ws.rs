@@ -240,14 +240,13 @@ async fn handle_dashboard_ws(
             }
             msg = socket.recv() => {
                 match msg {
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                     Some(Ok(Message::Ping(data))) => {
                         if socket.send(Message::Pong(data)).await.is_err() {
                             break;
                         }
                     }
                     Some(Ok(_)) => {} // ignore other messages
-                    Some(Err(_)) => break,
                 }
             }
             _ = ping_interval.tick() => {

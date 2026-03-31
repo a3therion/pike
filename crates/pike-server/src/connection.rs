@@ -122,8 +122,7 @@ impl ClientConnection {
 
     pub fn begin_drain(&mut self) -> Result<()> {
         match self.state {
-            ConnectionState::Closed => Ok(()),
-            ConnectionState::Draining => Ok(()),
+            ConnectionState::Closed | ConnectionState::Draining => Ok(()),
             ConnectionState::Active => self.transition_to(ConnectionState::Draining),
             _ => self.transition_to(ConnectionState::Closed),
         }

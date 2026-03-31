@@ -580,9 +580,8 @@ impl HttpTunnel {
             }
 
             // Normal HTTP request-response
-            let permit = match request_limit.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => break,
+            let Ok(permit) = request_limit.clone().acquire_owned().await else {
+                break;
             };
             let local_host = self.local_host.clone();
             let local_port = self.local_port;
