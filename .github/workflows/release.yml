@@ -46,10 +46,6 @@ jobs:
             os: ubuntu-latest
             name: pike-linux-amd64
             server_name: pike-server-linux-amd64.tar.gz
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: pike-linux-arm64
-            server_name: pike-server-linux-arm64.tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
             name: pike-macos-amd64
@@ -65,18 +61,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-zigbuild
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install --locked cargo-zigbuild
       - name: Install cmake and go
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake golang-go
       - name: Build (native)
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: cargo build --release --target ${{ matrix.target }} -p pike -p pike-server
-      - name: Build (cross)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo zigbuild --release --target ${{ matrix.target }} -p pike -p pike-server
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |

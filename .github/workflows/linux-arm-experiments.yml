@@ -1,0 +1,74 @@
+name: Linux ARM Experiments
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  quiche-cross-compile:
+    name: Cross-compile Quiche - ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake golang-go
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+      - name: Build (cross)
+        run: cargo zigbuild --target ${{ matrix.target }} -p pike-core --example quiche_smoke
+
+  release-build:
+    name: Build - aarch64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+      - name: Install cmake and go
+        run: sudo apt-get update && sudo apt-get install -y cmake golang-go
+      - name: Build (cross)
+        run: cargo zigbuild --release --target aarch64-unknown-linux-gnu -p pike -p pike-server
+      - name: Package CLI artifact
+        run: |
+          cp target/aarch64-unknown-linux-gnu/release/pike pike-linux-arm64
+          chmod +x pike-linux-arm64
+      - name: Package server bundle
+        run: |
+          mkdir -p server-bundle
+          cp target/aarch64-unknown-linux-gnu/release/pike-server server-bundle/pike-server
+          cp deploy/README.md server-bundle/README.md
+          cp deploy/server-vps.toml server-bundle/server-vps.toml
+          cp deploy/setup.sh server-bundle/setup.sh
+          cp deploy/start.sh server-bundle/start.sh
+          cp deploy/pike-server.service server-bundle/pike-server.service
+          tar -czf pike-server-linux-arm64.tar.gz -C server-bundle .
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pike-linux-arm64
+          path: pike-linux-arm64
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pike-server-linux-arm64.tar.gz
+          path: pike-server-linux-arm64.tar.gz

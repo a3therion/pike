@@ -15,7 +15,7 @@ It does not include the hosted cloud control plane, dashboard UI, admin tooling,
 curl -fsSL https://pike.life/install | sh
 ```
 
-The installer downloads the latest GitHub release for Linux or macOS, verifies its SHA-256 checksum when the release publishes one, and installs `pike` into a writable bin directory.
+The current public installer rollout supports Linux x86_64 and macOS x86_64/arm64. Windows x86_64 binaries are available from GitHub Releases. Linux ARM64 and Termux artifacts are deferred, and the installer exits explicitly on those systems instead of attempting a missing download.
 
 ## Quick Start
 
@@ -32,7 +32,7 @@ The smoke test boots a local upstream service, a local `pike-server` relay in `-
 - Start from `deploy/server-vps.toml`.
 - For a standalone relay, replace `local_api_keys` with your own key list.
 - If you run your own remote control plane, set `control_plane_url`, `workers_api_url`, and `server_token`.
-- Linux release bundles are published with GitHub releases.
+- Current public Linux release bundles are x86_64 only.
 - The release workflow also publishes `ghcr.io/a3therion/pike-server:<tag>`.
 
 ## Client Configuration

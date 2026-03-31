@@ -52,27 +52,37 @@ detect_platform() {
     case "$os_name" in
         Linux)
             os="linux"
+            case "$arch_name" in
+                x86_64|amd64)
+                    arch="amd64"
+                    ;;
+                aarch64|arm64)
+                    die "Linux ARM64 binaries are not part of the current public rollout yet. Use Linux x86_64, macOS, or download another supported release asset from ${RELEASES_URL}. Termux support is deferred."
+                    ;;
+                *)
+                    die "Unsupported architecture: ${arch_name}"
+                    ;;
+            esac
             ;;
         Darwin)
             os="macos"
+            case "$arch_name" in
+                x86_64|amd64)
+                    arch="amd64"
+                    ;;
+                aarch64|arm64)
+                    arch="arm64"
+                    ;;
+                *)
+                    die "Unsupported architecture: ${arch_name}"
+                    ;;
+            esac
             ;;
         MINGW*|MSYS*|CYGWIN*)
-            die "Windows shell installs are not supported. Download the release asset from ${RELEASES_URL}"
+            die "Windows shell installs are not supported. Download the x86_64 Windows release asset from ${RELEASES_URL}"
             ;;
         *)
             die "Unsupported operating system: ${os_name}"
-            ;;
-    esac
-
-    case "$arch_name" in
-        x86_64|amd64)
-            arch="amd64"
-            ;;
-        aarch64|arm64)
-            arch="arm64"
-            ;;
-        *)
-            die "Unsupported architecture: ${arch_name}"
             ;;
     esac
 
