@@ -126,7 +126,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/pike/pike-server
+          images: ghcr.io/a3therion/pike-server
           tags: |
             type=raw,value=${{ github.ref_name }}
             type=raw,value=latest
@@ -148,8 +148,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -exec cp {} release-assets/ \;
+          cd release-assets
+          sha256sum * > checksums.txt
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: release-assets/*
           generate_release_notes: true

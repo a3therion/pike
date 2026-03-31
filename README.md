@@ -9,6 +9,14 @@ This repo is standalone and publishable on its own. It contains:
 
 It does not include the hosted cloud control plane, dashboard UI, admin tooling, billing, email flows, or the marketing site. Those live in the private `pike-cloud` repo.
 
+## Install
+
+```bash
+curl -fsSL https://pike.life/install | sh
+```
+
+The installer downloads the latest GitHub release for Linux or macOS, verifies its SHA-256 checksum when the release publishes one, and installs `pike` into a writable bin directory.
+
 ## Quick Start
 
 ```bash
@@ -25,7 +33,7 @@ The smoke test boots a local upstream service, a local `pike-server` relay in `-
 - For a standalone relay, replace `local_api_keys` with your own key list.
 - If you run your own remote control plane, set `control_plane_url`, `workers_api_url`, and `server_token`.
 - Linux release bundles are published with GitHub releases.
-- The release workflow also publishes `ghcr.io/pike/pike-server:<tag>`.
+- The release workflow also publishes `ghcr.io/a3therion/pike-server:<tag>`.
 
 ## Client Configuration
 

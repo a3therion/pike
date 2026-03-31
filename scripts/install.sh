@@ -1,81 +1,214 @@
 #!/bin/sh
-# Pike CLI Install Script
-# Usage: curl -sSL https://pike.dev/install.sh | sh
+# Pike CLI install script
+# Usage: curl -fsSL https://pike.life/install | sh
 
-set -e
+set -eu
 
-REPO="pike/pike"
-BINARY="pike"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+REPO="${PIKE_INSTALL_REPO:-a3therion/pike}"
+BINARY_NAME="pike"
+RELEASES_URL="https://github.com/${REPO}/releases"
+SYSTEM_INSTALL_DIR="/usr/local/bin"
+USER_INSTALL_DIR_DEFAULT=".local/bin"
+REQUESTED_INSTALL_DIR="${PIKE_INSTALL_DIR:-${INSTALL_DIR:-}}"
+REQUESTED_VERSION="${PIKE_INSTALL_VERSION:-}"
 
-# Detect OS and architecture
-detect_platform() {
-    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-    ARCH=$(uname -m)
-    
-    case "$OS" in
-        linux)
-            case "$ARCH" in
-                x86_64) ASSET_NAME="pike-linux-amd64" ;;
-                aarch64|arm64) ASSET_NAME="pike-linux-arm64" ;;
-                *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
-            esac
+info() {
+    printf '%s\n' "$*"
+}
+
+warn() {
+    printf '%s\n' "$*" >&2
+}
+
+die() {
+    warn "Error: $*"
+    exit 1
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+expand_path() {
+    case "$1" in
+        "~")
+            [ -n "${HOME:-}" ] || die "HOME is not set"
+            printf '%s\n' "$HOME"
             ;;
-        darwin)
-            case "$ARCH" in
-                x86_64) ASSET_NAME="pike-macos-amd64" ;;
-                aarch64|arm64) ASSET_NAME="pike-macos-arm64" ;;
-                *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
-            esac
+        "~/"*)
+            [ -n "${HOME:-}" ] || die "HOME is not set"
+            printf '%s/%s\n' "$HOME" "${1#~/}"
             ;;
         *)
-            echo "Unsupported OS: $OS"
-            exit 1
+            printf '%s\n' "$1"
             ;;
     esac
 }
 
-# Get latest release version
-get_latest_version() {
-    curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+detect_platform() {
+    os_name=$(uname -s)
+    arch_name=$(uname -m)
+
+    case "$os_name" in
+        Linux)
+            os="linux"
+            ;;
+        Darwin)
+            os="macos"
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            die "Windows shell installs are not supported. Download the release asset from ${RELEASES_URL}"
+            ;;
+        *)
+            die "Unsupported operating system: ${os_name}"
+            ;;
+    esac
+
+    case "$arch_name" in
+        x86_64|amd64)
+            arch="amd64"
+            ;;
+        aarch64|arm64)
+            arch="arm64"
+            ;;
+        *)
+            die "Unsupported architecture: ${arch_name}"
+            ;;
+    esac
+
+    asset_name="${BINARY_NAME}-${os}-${arch}"
 }
 
-# Download and install
-download_and_install() {
-    VERSION=$(get_latest_version)
-    if [ -z "$VERSION" ]; then
-        echo "Error: Could not determine latest version"
-        exit 1
+resolve_install_dir() {
+    if [ -n "$REQUESTED_INSTALL_DIR" ]; then
+        install_dir=$(expand_path "$REQUESTED_INSTALL_DIR")
+        return
     fi
-    
-    echo "Installing $BINARY $VERSION from $ASSET_NAME..."
 
-    URL="https://github.com/$REPO/releases/download/$VERSION/${ASSET_NAME}"
-    TMP_DIR=$(mktemp -d)
+    if [ "$(id -u)" -eq 0 ]; then
+        install_dir="$SYSTEM_INSTALL_DIR"
+        return
+    fi
 
-    echo "Downloading from $URL..."
-    curl -sSL "$URL" -o "$TMP_DIR/$BINARY"
-    
-    echo "Installing to $INSTALL_DIR..."
-    if [ -w "$INSTALL_DIR" ]; then
-        mv "$TMP_DIR/$BINARY" "$INSTALL_DIR/"
+    if [ -d "$SYSTEM_INSTALL_DIR" ] && [ -w "$SYSTEM_INSTALL_DIR" ]; then
+        install_dir="$SYSTEM_INSTALL_DIR"
+        return
+    fi
+
+    [ -n "${HOME:-}" ] || die "HOME is not set and ${SYSTEM_INSTALL_DIR} is not writable. Set PIKE_INSTALL_DIR."
+    install_dir="${HOME}/${USER_INSTALL_DIR_DEFAULT}"
+}
+
+build_download_urls() {
+    if [ -n "$REQUESTED_VERSION" ]; then
+        version_label="$REQUESTED_VERSION"
+        asset_url="${RELEASES_URL}/download/${REQUESTED_VERSION}/${asset_name}"
+        checksum_url="${RELEASES_URL}/download/${REQUESTED_VERSION}/checksums.txt"
+        return
+    fi
+
+    version_label="latest"
+    asset_url="${RELEASES_URL}/latest/download/${asset_name}"
+    checksum_url="${RELEASES_URL}/latest/download/checksums.txt"
+}
+
+download_file() {
+    url="$1"
+    destination="$2"
+    curl -fsSL "$url" -o "$destination"
+}
+
+sha256_file() {
+    file_path="$1"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file_path" | awk '{print $1}'
+        return
+    fi
+
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file_path" | awk '{print $1}'
+        return
+    fi
+
+    if command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$file_path" | awk '{print $NF}'
+        return
+    fi
+
+    die "No SHA-256 tool found (sha256sum, shasum, or openssl)"
+}
+
+verify_checksum() {
+    checksum_file="$1"
+    binary_file="$2"
+
+    if ! download_file "$checksum_url" "$checksum_file"; then
+        warn "Checksum file not found at ${checksum_url}; continuing without verification"
+        return
+    fi
+
+    expected_checksum=$(awk -v file="$asset_name" '$2 == file { print $1 }' "$checksum_file")
+    [ -n "$expected_checksum" ] || die "Missing checksum entry for ${asset_name}"
+
+    actual_checksum=$(sha256_file "$binary_file")
+
+    [ "$expected_checksum" = "$actual_checksum" ] || die "Checksum verification failed for ${asset_name}"
+}
+
+install_binary() {
+    tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t pike-install)
+    trap 'rm -rf "$tmp_dir"' EXIT INT TERM
+
+    binary_path="${tmp_dir}/${asset_name}"
+    checksum_path="${tmp_dir}/checksums.txt"
+    destination_path="${install_dir}/${BINARY_NAME}"
+
+    info "Installing ${BINARY_NAME} (${version_label}) for ${asset_name}"
+    info "Downloading ${asset_url}"
+    download_file "$asset_url" "$binary_path"
+    verify_checksum "$checksum_path" "$binary_path"
+
+    mkdir -p "$install_dir"
+    chmod +x "$binary_path"
+    mv "$binary_path" "$destination_path"
+    chmod 755 "$destination_path"
+
+    installed_version=$("$destination_path" --version 2>/dev/null || true)
+
+    info ""
+    if [ -n "$installed_version" ]; then
+        info "Installed ${installed_version} to ${destination_path}"
     else
-        echo "Need sudo access to install to $INSTALL_DIR"
-        sudo mv "$TMP_DIR/$BINARY" "$INSTALL_DIR/"
+        info "Installed ${BINARY_NAME} to ${destination_path}"
     fi
-    
-    chmod +x "$INSTALL_DIR/$BINARY"
-    rm -rf "$TMP_DIR"
-    
-    echo ""
-    echo "✓ $BINARY $VERSION installed successfully!"
-    echo "Run '$BINARY --help' to get started"
+
+    case ":${PATH:-}:" in
+        *:"${install_dir}":*)
+            ;;
+        *)
+            warn "Add ${install_dir} to your PATH to run ${BINARY_NAME} from any shell:"
+            warn "  export PATH=\"${install_dir}:\$PATH\""
+            ;;
+    esac
+
+    info "Run '${BINARY_NAME} --help' to get started"
 }
 
-# Main
 main() {
+    need_cmd curl
+    need_cmd uname
+    need_cmd mktemp
+    need_cmd awk
+    need_cmd id
+    need_cmd mv
+    need_cmd chmod
+    need_cmd mkdir
+
     detect_platform
-    download_and_install
+    resolve_install_dir
+    build_download_urls
+    install_binary
 }
 
-main
+main "$@"
