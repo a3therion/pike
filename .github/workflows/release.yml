@@ -86,13 +86,13 @@ jobs:
           cp deploy/pike-server.service server-bundle/pike-server.service
           tar -czf ${{ matrix.server_name }} -C server-bundle .
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}
       - name: Upload server artifact
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.server_name }}
           path: ${{ matrix.server_name }}
