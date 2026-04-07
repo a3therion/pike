@@ -206,9 +206,6 @@ impl HttpTunnel {
         timeout(LOCAL_UPSTREAM_IO_TIMEOUT, tcp.write_all(&modified_request))
             .await
             .map_err(|_| anyhow!("timed out writing request to local upstream"))??;
-        timeout(LOCAL_UPSTREAM_IO_TIMEOUT, tcp.shutdown())
-            .await
-            .map_err(|_| anyhow!("timed out closing local upstream write half"))??;
 
         let mut raw_response = Vec::with_capacity(64 * 1024);
         timeout(LOCAL_UPSTREAM_IO_TIMEOUT, async {
@@ -649,4 +646,64 @@ fn is_hop_by_hop_header(name: &str) -> bool {
             | "upgrade"
             | "expect"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HttpTunnel;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn handle_payload_keeps_write_half_open_until_response_arrives() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let read = socket.read(&mut buf).await.expect("read request");
+                assert!(read > 0, "client closed before request completed");
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let mut probe = [0u8; 1];
+            match timeout(Duration::from_millis(100), socket.read(&mut probe)).await {
+                Ok(Ok(0)) => {
+                    // Simulate frameworks like Next.js dev that treat early EOF as an aborted request.
+                    return;
+                }
+                Ok(Ok(_)) => panic!("unexpected extra request bytes"),
+                Ok(Err(error)) => panic!("probe read failed: {error}"),
+                Err(_) => {}
+            }
+
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("write response");
+        });
+
+        let response = HttpTunnel::handle_payload(
+            "127.0.0.1".to_string(),
+            port,
+            None,
+            b"GET / HTTP/1.1\r\nHost: chat.pike.life\r\n\r\n".to_vec(),
+        )
+        .await
+        .expect("forwarded response");
+
+        server.await.expect("server task");
+        let response_text = String::from_utf8(response).expect("utf8 response");
+        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
+        assert!(response_text.ends_with("ok"));
+    }
 }
