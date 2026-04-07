@@ -17,10 +17,15 @@ tls_server_name = "relay.example.com"
 insecure_skip_tls_verify = false
 
 [tunnel]
+# Deprecated for HTTP tunnel URL selection.
+# `pike http` now gets a unique URL by default unless you pass `--subdomain`.
 subdomain_prefix = ""
+# Default local bind address for TCP tunnels and legacy tooling.
 bind_addr = "127.0.0.1"
 
 [inspector]
+# Preferred starting port. Pike will auto-pick the next free loopback port
+# unless you pass `--inspector-port`.
 port = 4040
 enabled = true
 max_requests = 500

@@ -39,6 +39,12 @@ The smoke test boots a local upstream service, a local `pike-server` relay in `-
 
 Use `deploy/client-config.toml.template` as the starting point for `~/.pike/config.toml`.
 
+For HTTP tunnels:
+- `pike http 3000` now gets a unique URL by default on every run.
+- Use `pike http 3000 --subdomain my-app` only when you want a fixed URL.
+- The inspector prefers the configured port, but auto-selects the next free loopback port when that port is already in use.
+- Shared `tunnel.subdomain_prefix` config is ignored for HTTP runtime routing and only kept for backward compatibility.
+
 ## License
 
 Apache-2.0. See `LICENSE`.

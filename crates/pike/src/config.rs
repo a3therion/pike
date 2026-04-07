@@ -90,21 +90,20 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn as_http_tunnel_config(&self, local_port: u16) -> Result<TunnelConfig> {
-        let local_addr = SocketAddr::from_str(&format!("{}:{local_port}", self.tunnel.bind_addr))
-            .with_context(|| {
-            format!("invalid bind addr '{}':{local_port}", self.tunnel.bind_addr)
-        })?;
+    pub fn as_http_tunnel_config(
+        &self,
+        local_host: &str,
+        local_port: u16,
+        subdomain: Option<String>,
+    ) -> Result<TunnelConfig> {
+        let local_addr = SocketAddr::from_str(&format!("{local_host}:{local_port}"))
+            .with_context(|| format!("invalid bind addr '{local_host}':{local_port}"))?;
 
         Ok(TunnelConfig {
             id: TunnelId::new(),
             tunnel_type: TunnelType::Http {
                 local_port,
-                subdomain: if self.tunnel.subdomain_prefix.is_empty() {
-                    None
-                } else {
-                    Some(self.tunnel.subdomain_prefix.clone())
-                },
+                subdomain,
             },
             local_addr,
         })
@@ -313,5 +312,25 @@ heartbeat_interval = 15
     fn expands_tilde_config_path() {
         let expanded = resolve_config_path(Path::new("~/.pike/config.toml"));
         assert!(expanded.to_string_lossy().contains(".pike/config.toml"));
+    }
+
+    #[test]
+    fn http_tunnel_config_ignores_sticky_shared_subdomain_defaults() {
+        let mut cfg = Config::default();
+        cfg.tunnel.subdomain_prefix = "sticky".to_string();
+        cfg.tunnel.bind_addr = "0.0.0.0".to_string();
+
+        let tunnel = cfg
+            .as_http_tunnel_config("127.0.0.1", 3000, None)
+            .expect("http tunnel config");
+
+        assert_eq!(tunnel.local_addr, "127.0.0.1:3000".parse().unwrap());
+        assert!(matches!(
+            tunnel.tunnel_type,
+            TunnelType::Http {
+                local_port: 3000,
+                subdomain: None
+            }
+        ));
     }
 }

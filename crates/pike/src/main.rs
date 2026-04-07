@@ -35,6 +35,7 @@ mod session;
 mod tunnel;
 
 use std::io::IsTerminal;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,7 +45,7 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
-use pike_core::types::TunnelConfig;
+use pike_core::types::{TunnelConfig, TunnelType};
 use tokio::signal;
 
 use crate::config::Config;
@@ -81,6 +82,9 @@ enum Commands {
         /// Local host to bind.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        /// Inspector port to bind exactly for this tunnel run.
+        #[arg(long)]
+        inspector_port: Option<u16>,
         /// Maximum number of reconnection attempts (unlimited if not set).
         #[arg(long)]
         max_reconnects: Option<u32>,
@@ -215,13 +219,7 @@ fn format_elapsed(d: Duration) -> String {
     }
 }
 
-fn print_tunnel_box_http(
-    public_url: &str,
-    host: &str,
-    port: u16,
-    inspector_port: u16,
-    inspector_enabled: bool,
-) {
+fn print_tunnel_box_http(public_url: &str, host: &str, port: u16, inspector_port: Option<u16>) {
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
 
     if use_fancy() {
@@ -234,7 +232,7 @@ fn print_tunnel_box_http(
         box_row("URL", public_url);
         box_row("Local", &format!("http://{}:{}", host, port));
         box_row("Transport", "QUIC (fallback WS)");
-        if inspector_enabled {
+        if let Some(inspector_port) = inspector_port {
             box_row("Inspector", &format!("http://127.0.0.1:{}", inspector_port));
         }
         box_sep();
@@ -246,7 +244,7 @@ fn print_tunnel_box_http(
         println!("URL: {}", public_url);
         println!("Local: http://{}:{}", host, port);
         println!("Transport: QUIC (fallback WS)");
-        if inspector_enabled {
+        if let Some(inspector_port) = inspector_port {
             println!("Inspector: http://127.0.0.1:{}", inspector_port);
         }
         println!("Ctrl+C to stop");
@@ -383,16 +381,65 @@ async fn wait_for_retry(
     }
 }
 
-fn spawn_inspector(request_store: Option<&Arc<RequestStore>>, port: u16) {
-    if let Some(store) = request_store {
-        let store = Arc::clone(store);
+fn spawn_inspector(
+    request_store: Option<Arc<RequestStore>>,
+    listener: Option<tokio::net::TcpListener>,
+) {
+    if let (Some(store), Some(listener)) = (request_store, listener) {
         tokio::spawn(async move {
-            let server = InspectorServer::new(store, port);
-            if let Err(e) = server.run().await {
+            let server = InspectorServer::new(store);
+            if let Err(e) = server.run(listener).await {
                 eprintln!("Inspector server error: {e}");
             }
         });
     }
+}
+
+fn http_inspector_enabled(cfg: &Config, inspector_port_override: Option<u16>) -> bool {
+    cfg.inspector.enabled || inspector_port_override.is_some()
+}
+
+async fn bind_inspector_listener(
+    preferred_port: u16,
+    requested_port: Option<u16>,
+) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
+    if let Some(port) = requested_port {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .await
+            .map_err(|error| anyhow!("failed to bind inspector to 127.0.0.1:{port}: {error}"))?;
+        let actual_port = listener
+            .local_addr()
+            .map_err(|error| anyhow!("failed to inspect bound inspector address: {error}"))?
+            .port();
+        return Ok((listener, actual_port));
+    }
+
+    for port in preferred_port..=u16::MAX {
+        match tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => {
+                let actual_port = listener
+                    .local_addr()
+                    .map_err(|error| anyhow!("failed to inspect bound inspector address: {error}"))?
+                    .port();
+                return Ok((listener, actual_port));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to bind inspector to 127.0.0.1:{port}: {error}"
+                ));
+            }
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|error| anyhow!("failed to bind inspector to an ephemeral port: {error}"))?;
+    let actual_port = listener
+        .local_addr()
+        .map_err(|error| anyhow!("failed to inspect bound inspector address: {error}"))?
+        .port();
+    Ok((listener, actual_port))
 }
 
 async fn build_http_tunnel(
@@ -410,12 +457,16 @@ async fn build_http_tunnel(
         .take_connection()
         .ok_or_else(|| anyhow!("no connection"))?;
     let client = handler.take_client().ok_or_else(|| anyhow!("no client"))?;
+    let requested_subdomain = match &tunnel_config.tunnel_type {
+        TunnelType::Http { subdomain, .. } => subdomain.clone(),
+        TunnelType::Tcp { .. } => None,
+    };
 
     Ok(HttpTunnel::new(
         tunnel_config.clone(),
         port,
         host.to_string(),
-        Some(cfg.tunnel.subdomain_prefix.clone()).filter(|s| !s.is_empty()),
+        requested_subdomain,
         connection,
         client,
         request_store,
@@ -450,14 +501,22 @@ async fn run_http_command(
     tunnel_config: TunnelConfig,
     port: u16,
     host: String,
+    inspector_port_override: Option<u16>,
     max_reconnects: Option<u32>,
 ) -> anyhow::Result<()> {
-    let request_store = if cfg.inspector.enabled {
+    let request_store = if http_inspector_enabled(&cfg, inspector_port_override) {
         Some(Arc::new(RequestStore::new(cfg.inspector.max_requests)))
     } else {
         None
     };
-    spawn_inspector(request_store.as_ref(), cfg.inspector.port);
+    let (inspector_listener, inspector_port) = if request_store.is_some() {
+        let (listener, actual_port) =
+            bind_inspector_listener(cfg.inspector.port, inspector_port_override).await?;
+        (Some(listener), Some(actual_port))
+    } else {
+        (None, None)
+    };
+    spawn_inspector(request_store.clone(), inspector_listener);
 
     let tunnel_start = Instant::now();
     let mut reconnect_attempt = 0_u32;
@@ -511,13 +570,7 @@ async fn run_http_command(
         };
 
         if !initial_displayed {
-            print_tunnel_box_http(
-                &public_url,
-                &host,
-                port,
-                cfg.inspector.port,
-                cfg.inspector.enabled,
-            );
+            print_tunnel_box_http(&public_url, &host, port, inspector_port);
             initial_displayed = true;
         } else {
             let now = Local::now().format("%H:%M:%S");
@@ -687,15 +740,19 @@ async fn main() -> anyhow::Result<()> {
             port,
             subdomain,
             host,
+            inspector_port,
             max_reconnects,
         } => {
-            if let Some(sd) = subdomain {
-                cfg.tunnel.subdomain_prefix = sd;
-            }
-            cfg.tunnel.bind_addr = host.clone();
-            config::save_config(&config_path, &cfg).await?;
-            let tunnel_config = cfg.as_http_tunnel_config(port)?;
-            run_http_command(cfg, tunnel_config, port, host, max_reconnects).await?;
+            let tunnel_config = cfg.as_http_tunnel_config(&host, port, subdomain)?;
+            run_http_command(
+                cfg,
+                tunnel_config,
+                port,
+                host,
+                inspector_port,
+                max_reconnects,
+            )
+            .await?;
         }
         Commands::Tcp {
             port,
@@ -807,11 +864,20 @@ mod tests {
             "demo",
             "--host",
             "0.0.0.0",
+            "--inspector-port",
+            "5050",
         ])
         .expect("cli parse should succeed");
-        assert!(
-            matches!(cli.command, Commands::Http { port: 3000, subdomain: Some(_), host, max_reconnects: None } if host == "0.0.0.0")
-        );
+        assert!(matches!(
+            cli.command,
+            Commands::Http {
+                port: 3000,
+                subdomain: Some(_),
+                host,
+                inspector_port: Some(5050),
+                max_reconnects: None
+            } if host == "0.0.0.0"
+        ));
     }
 
     #[test]
@@ -942,5 +1008,73 @@ mod tests {
 
         let saved = config::load_config(&config_path).await.unwrap();
         assert_eq!(saved.auth.api_key.as_deref(), Some("pk_offline_key"));
+    }
+
+    #[tokio::test]
+    async fn http_cli_overrides_do_not_persist_shared_config() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = config::Config::default();
+        cfg.tunnel.subdomain_prefix = "sticky".to_string();
+        cfg.tunnel.bind_addr = "0.0.0.0".to_string();
+        config::save_config(&config_path, &cfg).await.unwrap();
+
+        let loaded = config::load_config(&config_path).await.unwrap();
+        let tunnel = loaded
+            .as_http_tunnel_config("127.0.0.1", 3000, Some("demo".to_string()))
+            .expect("http tunnel config");
+
+        assert!(matches!(
+            tunnel.tunnel_type,
+            TunnelType::Http {
+                local_port: 3000,
+                subdomain: Some(ref subdomain)
+            } if subdomain == "demo"
+        ));
+
+        let saved = config::load_config(&config_path).await.unwrap();
+        assert_eq!(saved.tunnel.subdomain_prefix, "sticky");
+        assert_eq!(saved.tunnel.bind_addr, "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn inspector_uses_preferred_port_when_available() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let preferred_port = reserved.local_addr().expect("reserved addr").port();
+        drop(reserved);
+
+        let (listener, actual_port) = bind_inspector_listener(preferred_port, None)
+            .await
+            .expect("bind inspector");
+
+        assert_eq!(actual_port, preferred_port);
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn inspector_auto_selects_new_port_when_preferred_is_busy() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let preferred_port = reserved.local_addr().expect("reserved addr").port();
+
+        let (listener, actual_port) = bind_inspector_listener(preferred_port, None)
+            .await
+            .expect("bind inspector");
+
+        assert!(actual_port > preferred_port);
+        drop(listener);
+        drop(reserved);
+    }
+
+    #[tokio::test]
+    async fn explicit_inspector_port_fails_when_busy() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let requested_port = reserved.local_addr().expect("reserved addr").port();
+
+        let error = bind_inspector_listener(4040, Some(requested_port))
+            .await
+            .expect_err("explicit inspector port should fail");
+
+        assert!(error.to_string().contains("already in use"));
+        drop(reserved);
     }
 }

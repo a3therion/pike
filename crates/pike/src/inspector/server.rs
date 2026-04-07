@@ -18,15 +18,17 @@ use super::storage::RequestStore;
 
 pub struct InspectorServer {
     store: Arc<RequestStore>,
-    port: u16,
 }
 
 impl InspectorServer {
-    pub fn new(store: Arc<RequestStore>, port: u16) -> Self {
-        Self { store, port }
+    pub fn new(store: Arc<RequestStore>) -> Self {
+        Self { store }
     }
 
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(
+        self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let app = Router::new()
             .route("/", get(Self::handle_root))
             .route("/api/requests", get(Self::handle_requests))
@@ -35,8 +37,7 @@ impl InspectorServer {
             .layer(ServiceBuilder::new())
             .with_state(self.store);
 
-        let addr = format!("127.0.0.1:{}", self.port);
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        let addr = listener.local_addr()?;
         println!("Inspector server running on http://{}", addr);
 
         axum::serve(listener, app).await?;
