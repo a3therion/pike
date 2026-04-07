@@ -423,7 +423,7 @@ async fn bind_inspector_listener(
                     .port();
                 return Ok((listener, actual_port));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
             Err(error) => {
                 return Err(anyhow!(
                     "failed to bind inspector to 127.0.0.1:{port}: {error}"
