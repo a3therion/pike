@@ -322,8 +322,12 @@ impl PikeClientApp {
         Ok(())
     }
 
+    fn should_send_heartbeat(&self) -> bool {
+        !matches!(self.state, ClientState::Connecting | ClientState::Closed)
+    }
+
     fn queue_heartbeat(&mut self) -> Result<()> {
-        if !matches!(self.state, ClientState::Active) {
+        if !self.should_send_heartbeat() {
             return Ok(());
         }
 
@@ -410,9 +414,18 @@ impl PikeClientApp {
                 {
                     self.registered_tunnels.insert(tunnel_id, config);
                     tracing::info!(tunnel_id = %tunnel_id, "HTTP tunnel confirmed by server");
+                } else {
+                    warn!(
+                        tunnel_id = %tunnel_id,
+                        "server confirmed tunnel missing from local registration tracking"
+                    );
                 }
 
-                if self.registered_tunnels.len() >= self.tunnels_to_register.len() {
+                let all_known_tunnels_registered =
+                    self.registered_tunnels.len() >= self.tunnels_to_register.len();
+                let no_registrations_outstanding = self.pending_registrations.is_empty();
+
+                if all_known_tunnels_registered || no_registrations_outstanding {
                     self.state = ClientState::Active;
                 }
             }
@@ -800,6 +813,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tunnel_registered_transitions_to_active_when_pending_registrations_clear() {
+        let tunnel_id = TunnelId::new();
+        let mut app = make_app(Vec::new());
+        app.state = ClientState::RegisteringTunnels;
+
+        let (result_tx, _result_rx) = oneshot::channel();
+        app.pending_registrations
+            .insert(tunnel_id.to_string(), result_tx);
+
+        app.handle_control_message(ControlMessage::TunnelRegistered {
+            tunnel_id,
+            public_url: "https://demo.pike.life".to_string(),
+            remote_port: None,
+        })
+        .expect("handle tunnel registered");
+
+        assert!(matches!(app.state, ClientState::Active));
+        assert!(app.pending_registrations.is_empty());
+    }
+
+    #[tokio::test]
     async fn register_tunnel_is_deferred_until_login_success() {
         let tunnel = sample_tunnel(TunnelId::new());
         let mut app = make_app(Vec::new());
@@ -826,6 +860,19 @@ mod tests {
 
         assert!(matches!(app.state, ClientState::RegisteringTunnels));
         assert_eq!(app.write_queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_heartbeat_sends_while_registering_tunnels() {
+        let mut app = make_app(Vec::new());
+        app.state = ClientState::RegisteringTunnels;
+
+        app.queue_heartbeat().expect("queue heartbeat");
+
+        assert_eq!(app.write_queue.len(), 1);
+        let (stream_id, _, fin) = &app.write_queue[0];
+        assert_eq!(*stream_id, CONTROL_STREAM_ID);
+        assert!(!fin);
     }
 
     #[test]
