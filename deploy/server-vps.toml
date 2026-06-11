@@ -1,7 +1,7 @@
 # Pike Server Production Configuration for VPS deployments
 
-# QUIC listener
-bind_addr = "[::]:4433"
+# QUIC listener. Keep this aligned with the CLI default relay address.
+bind_addr = "[::]:443"
 
 # Local HTTP and management listeners for reverse proxy / local admin access
 http_bind_addr = "127.0.0.1:8080"

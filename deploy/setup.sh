@@ -11,6 +11,7 @@ PIKE_USER="pike"
 PIKE_DIR="/opt/pike"
 CONFIG_DIR="/etc/pike"
 LOG_DIR="/var/log/pike"
+DATA_DIR="/var/lib/pike"
 TLS_DIR="/etc/pike/tls"
 
 # Check if running as root
@@ -24,11 +25,12 @@ if ! id "$PIKE_USER" &>/dev/null; then
   useradd --system --no-create-home --shell /bin/false "$PIKE_USER"
 fi
 
-mkdir -p "$PIKE_DIR" "$CONFIG_DIR" "$LOG_DIR" "$TLS_DIR"
-chown -R "$PIKE_USER:$PIKE_USER" "$PIKE_DIR" "$LOG_DIR"
+mkdir -p "$PIKE_DIR" "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR" "$TLS_DIR"
+chown -R "$PIKE_USER:$PIKE_USER" "$PIKE_DIR" "$LOG_DIR" "$DATA_DIR"
 chown root:root "$CONFIG_DIR" "$TLS_DIR"
+chgrp "$PIKE_USER" "$TLS_DIR"
 chmod 755 "$CONFIG_DIR"
-chmod 700 "$TLS_DIR"
+chmod 750 "$TLS_DIR"
 
 echo "Step 2: Installing binary..."
 if [ ! -f "./pike-server" ]; then
@@ -81,6 +83,9 @@ else
   echo "Install production certificates before starting pike-server:"
   echo "  - $TLS_DIR/cert.pem"
   echo "  - $TLS_DIR/key.pem"
+  echo "Certificate files must be readable by the pike group:"
+  echo "  sudo chown root:pike $TLS_DIR/cert.pem $TLS_DIR/key.pem"
+  echo "  sudo chmod 640 $TLS_DIR/cert.pem $TLS_DIR/key.pem"
 fi
 
 echo "Step 8: Installing systemd service..."

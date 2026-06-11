@@ -422,6 +422,31 @@ impl InspectorServer {
             return Object.entries(headers);
         }
 
+        function text(value) {
+            return value === null || value === undefined ? '' : String(value);
+        }
+
+        function escapeHtml(value) {
+            return text(value).replace(/[&<>"']/g, function(ch) {
+                return ({
+                    '&': '&amp;',
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    '"': '&quot;',
+                    "'": '&#39;'
+                })[ch];
+            });
+        }
+
+        function jsString(value) {
+            return JSON.stringify(text(value));
+        }
+
+        function methodClass(method) {
+            var normalized = text(method).toUpperCase();
+            return /^[A-Z]+$/.test(normalized) ? 'm-' + normalized : 'm-UNKNOWN';
+        }
+
         function renderTable() {
             var method = document.getElementById('method-filter').value;
             var status = document.getElementById('status-filter').value;
@@ -436,7 +461,7 @@ impl InspectorServer {
                 if (status === '3xx' && !(r.response_status >= 300 && r.response_status < 400)) return false;
                 if (status === '4xx' && !(r.response_status >= 400 && r.response_status < 500)) return false;
                 if (status === '5xx' && !(r.response_status >= 500)) return false;
-                if (path && !r.path.toLowerCase().includes(path)) return false;
+                if (path && !text(r.path).toLowerCase().includes(path)) return false;
                 return true;
             });
 
@@ -447,15 +472,15 @@ impl InspectorServer {
             tbody.innerHTML = filtered.map(function(r) {
                 var sc = r.response_status;
                 var cls = sc >= 500 ? 's5xx' : sc >= 400 ? 's4xx' : sc >= 300 ? 's3xx' : 's2xx';
-                var mcls = 'm-' + r.method;
+                var mcls = methodClass(r.method);
                 var t = new Date(r.timestamp).toLocaleTimeString();
                 var act = r.id === activeId ? ' active' : '';
-                return '<tr class="' + act + '" onclick="showDetail(\'' + r.id + '\')">'+
-                    '<td class="time-col">' + t + '</td>'+
-                    '<td><span class="badge ' + mcls + '">' + r.method + '</span></td>'+
-                    '<td class="path">' + r.path + '</td>'+
-                    '<td class="' + cls + '">' + sc + '</td>'+
-                    '<td class="dur-col">' + r.duration_ms + 'ms</td>'+
+                return '<tr class="' + act + '" onclick="showDetail(' + jsString(r.id) + ')">'+
+                    '<td class="time-col">' + escapeHtml(t) + '</td>'+
+                    '<td><span class="badge ' + mcls + '">' + escapeHtml(r.method) + '</span></td>'+
+                    '<td class="path">' + escapeHtml(r.path) + '</td>'+
+                    '<td class="' + cls + '">' + escapeHtml(sc) + '</td>'+
+                    '<td class="dur-col">' + escapeHtml(r.duration_ms) + 'ms</td>'+
                     '<td class="size-col">' + fmtSize(r.response_body) + '</td>'+
                     '</tr>';
             }).join('');
@@ -470,32 +495,32 @@ impl InspectorServer {
             var sc = r.response_status;
             var cls = sc >= 500 ? 's5xx' : sc >= 400 ? 's4xx' : sc >= 300 ? 's3xx' : 's2xx';
             var html = '<div class="detail-header">'+
-                '<span class="badge m-' + r.method + '">' + r.method + '</span>'+
-                '<span class="path">' + r.path + '</span>'+
+                '<span class="badge ' + methodClass(r.method) + '">' + escapeHtml(r.method) + '</span>'+
+                '<span class="path">' + escapeHtml(r.path) + '</span>'+
                 '<button onclick="closeDetail()">&#10005;</button>'+
                 '</div>';
             html += '<div class="detail-grid">'+
-                '<span class="label">Status</span><span class="' + cls + '">' + r.response_status + '</span>'+
-                '<span class="label">Duration</span><span>' + r.duration_ms + 'ms</span>'+
+                '<span class="label">Status</span><span class="' + cls + '">' + escapeHtml(r.response_status) + '</span>'+
+                '<span class="label">Duration</span><span>' + escapeHtml(r.duration_ms) + 'ms</span>'+
                 '<span class="label">Request Body</span><span>' + fmtSize(r.body) + '</span>'+
                 '<span class="label">Response Body</span><span>' + fmtSize(r.response_body) + '</span>'+
-                '<span class="label">Time</span><span>' + new Date(r.timestamp).toLocaleString() + '</span>'+
+                '<span class="label">Time</span><span>' + escapeHtml(new Date(r.timestamp).toLocaleString()) + '</span>'+
                 '</div>';
             var reqHeaderEntries = headerEntries(r.headers);
             if (reqHeaderEntries.length) {
                 html += '<div class="detail-section"><h4>Request Headers</h4>'+
-                    '<pre>' + reqHeaderEntries.map(function(e){ return e[0]+': '+e[1]; }).join('\n') + '</pre></div>';
+                    '<pre>' + reqHeaderEntries.map(function(e){ return escapeHtml(e[0]) + ': ' + escapeHtml(e[1]); }).join('\n') + '</pre></div>';
             }
             if (r.body) {
-                html += '<div class="detail-section"><h4>Request Body</h4><pre>' + r.body + '</pre></div>';
+                html += '<div class="detail-section"><h4>Request Body</h4><pre>' + escapeHtml(r.body) + '</pre></div>';
             }
             var respHeaderEntries = headerEntries(r.response_headers);
             if (respHeaderEntries.length) {
                 html += '<div class="detail-section"><h4>Response Headers</h4>'+
-                    '<pre>' + respHeaderEntries.map(function(e){ return e[0]+': '+e[1]; }).join('\n') + '</pre></div>';
+                    '<pre>' + respHeaderEntries.map(function(e){ return escapeHtml(e[0]) + ': ' + escapeHtml(e[1]); }).join('\n') + '</pre></div>';
             }
             if (r.response_body) {
-                html += '<div class="detail-section"><h4>Response Body</h4><pre>' + r.response_body + '</pre></div>';
+                html += '<div class="detail-section"><h4>Response Body</h4><pre>' + escapeHtml(r.response_body) + '</pre></div>';
             }
             panel.innerHTML = html;
             panel.classList.add('open');
@@ -573,5 +598,28 @@ impl InspectorServer {
     async fn handle_clear(State(store): State<Arc<RequestStore>>) -> StatusCode {
         store.clear();
         StatusCode::OK
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::response::Html;
+
+    use super::InspectorServer;
+
+    #[tokio::test]
+    async fn inspector_ui_escapes_captured_values_before_using_inner_html() {
+        let Html(html) = InspectorServer::handle_root().await;
+
+        assert!(html.contains("function escapeHtml"));
+        assert!(html.contains("escapeHtml(r.method)"));
+        assert!(html.contains("escapeHtml(r.path)"));
+        assert!(html.contains("escapeHtml(r.body)"));
+        assert!(html.contains("escapeHtml(r.response_body)"));
+        assert!(html.contains("escapeHtml(e[0]) + ': ' + escapeHtml(e[1])"));
+        assert!(html.contains("onclick=\"showDetail(' + jsString(r.id) + ')\""));
+        assert!(!html.contains("'<td class=\"path\">' + r.path + '</td>'"));
+        assert!(!html.contains("'<pre>' + r.body + '</pre>"));
+        assert!(!html.contains("'<pre>' + r.response_body + '</pre>"));
     }
 }

@@ -30,6 +30,8 @@ SyslogIdentifier=pike-server
 
 # Security hardening
 NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/log/pike /var/lib/pike /tmp
