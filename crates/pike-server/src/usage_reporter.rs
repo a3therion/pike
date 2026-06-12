@@ -107,7 +107,7 @@ impl UsageReporter {
 
             let metrics = self
                 .tunnel_metrics_store
-                .metrics_response(&tunnel_id, 0)
+                .metrics_response(&tunnel_id, 0, self.registry.active_tunnels() as u64)
                 .await;
             let current = ShadowCounter {
                 bytes_in: metrics.bytes_in,

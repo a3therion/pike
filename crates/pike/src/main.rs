@@ -30,9 +30,11 @@
 
 mod config;
 mod connection;
+mod diagnostics;
 mod inspector;
 mod session;
 mod tunnel;
+mod ws_probe;
 
 use std::io::IsTerminal;
 use std::net::Ipv4Addr;
@@ -106,6 +108,32 @@ enum Commands {
     Status,
     /// Display build and relay details.
     Version,
+    /// Check local config, auth, relay DNS, API health, and install context.
+    Doctor {
+        /// Also probe relay TCP and QUIC/UDP reachability.
+        #[arg(long)]
+        reachability: bool,
+        /// Timeout in seconds for network checks.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
+    /// Probe a local upstream WebSocket endpoint.
+    TestWs {
+        /// Local port serving the WebSocket endpoint.
+        port: u16,
+        /// WebSocket path on the local upstream, for example /media.
+        #[arg(long)]
+        path: String,
+        /// Number of echo frames to send.
+        #[arg(long, default_value_t = 1)]
+        frames: u32,
+        /// Send binary frames instead of text frames.
+        #[arg(long)]
+        binary: bool,
+        /// Timeout in seconds for connect and echo waits.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
 }
 
 // ─── Display Constants ──────────────────────────────────────
@@ -496,6 +524,38 @@ async fn build_tcp_tunnel(
     ))
 }
 
+async fn warn_if_local_service_unreachable(host: &str, port: u16, label: &str) {
+    let addr = format!("{host}:{port}");
+    match tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => {}
+        Ok(Err(error)) => {
+            eprintln!(
+                "  {} {}",
+                "Warning:".yellow(),
+                format!(
+                    "could not connect to local {label} at {addr}: {error}. Pike will still start, but tunnel requests will fail until the service is listening."
+                )
+                .dimmed()
+            );
+        }
+        Err(_) => {
+            eprintln!(
+                "  {} {}",
+                "Warning:".yellow(),
+                format!(
+                    "timed out connecting to local {label} at {addr}. Pike will still start, but tunnel requests will fail until the service is listening."
+                )
+                .dimmed()
+            );
+        }
+    }
+}
+
 async fn run_http_command(
     cfg: Config,
     tunnel_config: TunnelConfig,
@@ -733,7 +793,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config_path = config::resolve_config_path(&cli.config);
-    let mut cfg = config::load_or_create_config(&config_path).await?;
 
     match cli.command {
         Commands::Http {
@@ -743,6 +802,8 @@ async fn main() -> anyhow::Result<()> {
             inspector_port,
             max_reconnects,
         } => {
+            let cfg = config::load_or_create_config(&config_path).await?;
+            warn_if_local_service_unreachable(&host, port, "HTTP upstream").await;
             let tunnel_config = cfg.as_http_tunnel_config(&host, port, subdomain)?;
             run_http_command(
                 cfg,
@@ -759,10 +820,13 @@ async fn main() -> anyhow::Result<()> {
             remote_port,
             max_reconnects,
         } => {
+            let cfg = config::load_or_create_config(&config_path).await?;
+            warn_if_local_service_unreachable(&cfg.tunnel.bind_addr, port, "TCP upstream").await;
             let tunnel_config = cfg.as_tcp_tunnel_config(port, remote_port)?;
             run_tcp_command(cfg, tunnel_config, port, remote_port, max_reconnects).await?;
         }
         Commands::Login { api_key } => {
+            let mut cfg = config::load_or_create_config(&config_path).await?;
             #[derive(serde::Deserialize)]
             struct ValidateResponse {
                 email: String,
@@ -831,11 +895,42 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Status => {
+            let cfg = config::load_or_create_config(&config_path).await?;
             let is_authed = cfg.auth.api_key.as_ref().is_some_and(|k| !k.is_empty());
             print_status_box(&cfg.relay.addr, is_authed);
         }
         Commands::Version => {
+            let cfg = config::load_or_create_config(&config_path).await?;
             print_version_box(&cfg.relay.addr, cfg.relay.ws_fallback);
+        }
+        Commands::Doctor {
+            reachability,
+            timeout_secs,
+        } => {
+            diagnostics::run_doctor(
+                &config_path,
+                diagnostics::DoctorOptions {
+                    reachability,
+                    timeout: Duration::from_secs(timeout_secs),
+                },
+            )
+            .await?;
+        }
+        Commands::TestWs {
+            port,
+            path,
+            frames,
+            binary,
+            timeout_secs,
+        } => {
+            ws_probe::run_ws_test(ws_probe::WsTestOptions {
+                port,
+                path,
+                frames,
+                binary,
+                timeout: Duration::from_secs(timeout_secs),
+            })
+            .await?;
         }
     }
 
@@ -899,6 +994,37 @@ mod tests {
         let cli = Cli::try_parse_from(["pike", "login", "pk_test_123"])
             .expect("cli parse should succeed");
         assert!(matches!(cli.command, Commands::Login { api_key } if api_key == "pk_test_123"));
+    }
+
+    #[test]
+    fn parses_doctor_command_with_reachability() {
+        let cli = Cli::try_parse_from(["pike", "doctor", "--reachability", "--timeout-secs", "2"])
+            .expect("cli parse should succeed");
+        assert!(matches!(
+            cli.command,
+            Commands::Doctor {
+                reachability: true,
+                timeout_secs: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_test_ws_command() {
+        let cli = Cli::try_parse_from([
+            "pike", "test-ws", "8080", "--path", "/media", "--frames", "3", "--binary",
+        ])
+        .expect("cli parse should succeed");
+        assert!(matches!(
+            cli.command,
+            Commands::TestWs {
+                port: 8080,
+                path,
+                frames: 3,
+                binary: true,
+                timeout_secs: 5
+            } if path == "/media"
+        ));
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Result};
 use pike_core::quic::client::{LocalData, PikeClient, PikeConnection, ServerData};
 use pike_core::types::{TunnelConfig, TunnelId};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{timeout, Duration};
@@ -207,10 +207,10 @@ impl HttpTunnel {
             .await
             .map_err(|_| anyhow!("timed out writing request to local upstream"))??;
 
-        let mut raw_response = Vec::with_capacity(64 * 1024);
-        timeout(LOCAL_UPSTREAM_IO_TIMEOUT, async {
-            tcp.read_to_end(&mut raw_response).await
-        })
+        let raw_response = timeout(
+            LOCAL_UPSTREAM_IO_TIMEOUT,
+            Self::read_upstream_response(&mut tcp),
+        )
         .await
         .map_err(|_| anyhow!("timed out reading response from local upstream"))??;
 
@@ -238,6 +238,116 @@ impl HttpTunnel {
         }
 
         Ok(raw_response)
+    }
+
+    async fn read_upstream_response<R>(reader: &mut R) -> Result<Vec<u8>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut raw_response = Vec::with_capacity(64 * 1024);
+        let mut buf = [0_u8; 16 * 1024];
+
+        loop {
+            if let Some(complete_len) = Self::complete_upstream_response_len(&raw_response)? {
+                raw_response.truncate(complete_len);
+                return Ok(raw_response);
+            }
+
+            let read = reader.read(&mut buf).await?;
+            if read == 0 {
+                if raw_response.is_empty() {
+                    bail!("local upstream closed without response");
+                }
+                return Ok(raw_response);
+            }
+
+            raw_response.extend_from_slice(&buf[..read]);
+        }
+    }
+
+    fn complete_upstream_response_len(payload: &[u8]) -> Result<Option<usize>> {
+        let mut offset = 0;
+
+        loop {
+            let Some(header_end) = find_header_end(&payload[offset..]) else {
+                return Ok(None);
+            };
+            let header_end_abs = offset + header_end;
+            let header_text = std::str::from_utf8(&payload[offset..header_end_abs])?;
+            let mut lines = header_text.split("\r\n");
+
+            let status_line = lines
+                .next()
+                .ok_or_else(|| anyhow!("missing upstream status line"))?;
+            let status_code = status_line
+                .split_whitespace()
+                .nth(1)
+                .ok_or_else(|| anyhow!("missing upstream status code"))?
+                .parse::<u16>()?;
+
+            let mut content_length = None;
+            let mut chunked = false;
+            let mut body_allowed =
+                !matches!(status_code, 204 | 304) && !(100..200).contains(&status_code);
+
+            for line in lines {
+                if line.is_empty() {
+                    continue;
+                }
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+
+                let name = name.trim();
+                let value = value.trim();
+
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.parse::<usize>()?);
+                    continue;
+                }
+
+                if name.eq_ignore_ascii_case("transfer-encoding") {
+                    chunked = value
+                        .split(',')
+                        .any(|part| part.trim().eq_ignore_ascii_case("chunked"));
+                }
+            }
+
+            if status_code == 101 {
+                body_allowed = false;
+            }
+
+            let body_start = header_end_abs + 4;
+            let body_end = if !body_allowed {
+                body_start
+            } else if chunked {
+                let Some(body_len) = chunked_body_wire_len(&payload[body_start..])? else {
+                    return Ok(None);
+                };
+                body_start
+                    .checked_add(body_len)
+                    .ok_or_else(|| anyhow!("upstream body length overflow"))?
+            } else if let Some(length) = content_length {
+                let end = body_start
+                    .checked_add(length)
+                    .ok_or_else(|| anyhow!("upstream body length overflow"))?;
+                if payload.len() < end {
+                    return Ok(None);
+                }
+                end
+            } else {
+                // EOF-delimited responses, including open-ended SSE streams, cannot be
+                // completed early on the current normal HTTP QUIC response path.
+                return Ok(None);
+            };
+
+            if (100..200).contains(&status_code) && status_code != 101 {
+                offset = body_end;
+                continue;
+            }
+
+            return Ok(Some(body_end));
+        }
     }
 
     fn normalize_upstream_response(payload: &[u8]) -> Result<ParsedUpstreamResponse> {
@@ -626,6 +736,46 @@ struct ParsedUpstreamResponse {
     body: Vec<u8>,
 }
 
+fn chunked_body_wire_len(payload: &[u8]) -> Result<Option<usize>> {
+    let mut cursor = 0;
+
+    loop {
+        let Some(line_end) = find_crlf(&payload[cursor..]) else {
+            return Ok(None);
+        };
+        let line = std::str::from_utf8(&payload[cursor..cursor + line_end])?;
+        let size_text = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_text, 16)?;
+        cursor += line_end + 2;
+
+        if size == 0 {
+            loop {
+                let Some(trailer_end) = find_crlf(&payload[cursor..]) else {
+                    return Ok(None);
+                };
+                cursor += trailer_end + 2;
+                if trailer_end == 0 {
+                    return Ok(Some(cursor));
+                }
+            }
+        }
+
+        let chunk_end = cursor
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("upstream chunk length overflow"))?;
+        let terminator_end = chunk_end
+            .checked_add(2)
+            .ok_or_else(|| anyhow!("upstream chunk length overflow"))?;
+        if terminator_end > payload.len() {
+            return Ok(None);
+        }
+        if &payload[chunk_end..terminator_end] != b"\r\n" {
+            bail!("invalid upstream chunk terminator");
+        }
+        cursor = terminator_end;
+    }
+}
+
 fn find_header_end(payload: &[u8]) -> Option<usize> {
     payload.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -652,8 +802,21 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 mod tests {
     use super::HttpTunnel;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{timeout, Duration};
+
+    async fn read_request_headers(socket: &mut TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let read = socket.read(&mut buf).await.expect("read request");
+            assert!(read > 0, "client closed before request completed");
+            request.extend_from_slice(&buf[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return request;
+            }
+        }
+    }
 
     #[tokio::test]
     async fn handle_payload_keeps_write_half_open_until_response_arrives() {
@@ -664,16 +827,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept connection");
-            let mut request = Vec::new();
-            let mut buf = [0u8; 1024];
-            loop {
-                let read = socket.read(&mut buf).await.expect("read request");
-                assert!(read > 0, "client closed before request completed");
-                request.extend_from_slice(&buf[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
+            let _request = read_request_headers(&mut socket).await;
 
             let mut probe = [0u8; 1];
             match timeout(Duration::from_millis(100), socket.read(&mut probe)).await {
@@ -705,5 +859,93 @@ mod tests {
         let response_text = String::from_utf8(response).expect("utf8 response");
         assert!(response_text.starts_with("HTTP/1.1 200 OK"));
         assert!(response_text.ends_with("ok"));
+    }
+
+    #[tokio::test]
+    async fn handle_payload_returns_content_length_response_before_upstream_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let _request = read_request_headers(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .expect("write response");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let response = timeout(
+            Duration::from_millis(250),
+            HttpTunnel::handle_payload(
+                "127.0.0.1".to_string(),
+                port,
+                None,
+                b"GET / HTTP/1.1\r\nHost: chat.pike.life\r\n\r\n".to_vec(),
+            ),
+        )
+        .await
+        .expect("response should not wait for upstream EOF")
+        .expect("forwarded response");
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            response,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_payload_returns_terminated_chunked_response_before_upstream_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let _request = read_request_headers(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+                )
+                .await
+                .expect("write response");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let response = timeout(
+            Duration::from_millis(250),
+            HttpTunnel::handle_payload(
+                "127.0.0.1".to_string(),
+                port,
+                None,
+                b"GET /events HTTP/1.1\r\nHost: chat.pike.life\r\n\r\n".to_vec(),
+            ),
+        )
+        .await
+        .expect("response should not wait for upstream EOF")
+        .expect("forwarded response");
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            response,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn open_ended_chunked_response_is_not_complete_without_terminating_chunk() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nc\r\ndata: ping\n\n\r\n";
+
+        let complete_len =
+            HttpTunnel::complete_upstream_response_len(raw).expect("parse response prefix");
+
+        assert_eq!(complete_len, None);
     }
 }

@@ -856,9 +856,10 @@ async fn handle_get_metrics(
         return response;
     }
     let uptime_seconds = tunnel_uptime_seconds(&state, &tunnel_id).await;
+    let active_tunnels = state.registry.active_tunnels() as u64;
     let resp = state
         .tunnel_metrics_store
-        .metrics_response(&tunnel_id, uptime_seconds)
+        .metrics_response(&tunnel_id, uptime_seconds, active_tunnels)
         .await;
     (StatusCode::OK, axum::Json(resp)).into_response()
 }
@@ -912,6 +913,10 @@ async fn handle_get_tunnel_status(
     let registry_entry = lookup_tunnel_in_registry(&state.registry, tunnel_uuid);
     let has_registry_entry = registry_entry.is_some();
     let snapshot = state.tunnel_metrics_store.snapshot_times(&tunnel_id).await;
+    let streaming = state
+        .tunnel_metrics_store
+        .streaming_status(&tunnel_id)
+        .await;
 
     let now = chrono::Utc::now();
     let now_unix_ms = now.timestamp_millis().max(0) as u64;
@@ -966,6 +971,9 @@ async fn handle_get_tunnel_status(
             "last_activity": last_activity,
             "connected_since": connected_since,
             "transport": "QUIC",
+            "wss_connections": streaming.wss_connections,
+            "reconnects": streaming.reconnects,
+            "close_reason": streaming.close_reason,
         })),
     )
         .into_response()

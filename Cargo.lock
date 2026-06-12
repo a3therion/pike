@@ -2269,6 +2269,7 @@ dependencies = [
  "tokio",
  "tokio-quiche",
  "tokio-test",
+ "tokio-tungstenite 0.24.0",
  "toml",
  "tower",
  "tracing",

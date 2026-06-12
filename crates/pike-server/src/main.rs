@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::body::{to_bytes, Body};
@@ -17,7 +17,9 @@ use axum::http::header::{CONNECTION, CONTENT_LENGTH, HOST};
 use axum::http::{Request, Response};
 use clap::Parser;
 use pike_core::proto::{ControlMessage, ALPN_PROTOCOL, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION};
-use pike_core::quic::server::{OutboundData, PikeMessage, PikeOutboundMessage, PikeTunnelApp};
+use pike_core::quic::server::{
+    InboundData, OutboundData, PikeMessage, PikeOutboundMessage, PikeTunnelApp,
+};
 use pike_core::types::{RelayInfo, SubdomainSpec, TunnelType};
 use pike_server::admin::run_admin_command;
 use pike_server::config::{CliArgs, ServerConfig};
@@ -530,6 +532,7 @@ async fn spawn_accept_loop(
                                                                 let outbound_tx = outbound_tx.clone();
                                                                 let pending_http = pending_http.clone();
                                                                 let ws_relays = ws_relays.clone();
+                                                                let tunnel_metrics_store = tunnel_metrics_store_for_conn.clone();
                                                                 http_forwarders.push(tokio::spawn(async move {
                                                                     while let Some(tunnel_req) = http_rx.recv().await {
                                                                         match tunnel_req {
@@ -571,66 +574,13 @@ async fn spawn_accept_loop(
                                                                                 }
                                                                             }
                                                                             TunnelRequest::WebSocket(ws_request) => {
-                                                                                let WebSocketRequest {
-                                                                                    stream_header,
-                                                                                    request_id: _,
-                                                                                    raw_upgrade_request,
-                                                                                    mut ws_to_quic_rx,
-                                                                                    quic_to_ws_tx,
-                                                                                } = ws_request;
-
-                                                                                let conn_id = stream_header.connection_id;
-
-                                                                                // Store the WS relay channel for routing incoming QUIC data
-                                                                                ws_relays.lock().await.insert(conn_id, quic_to_ws_tx);
-
-                                                                                // Send the raw HTTP upgrade request through QUIC with streaming: true
-                                                                                let _ = outbound_tx
-                                                                                    .send(PikeOutboundMessage::Data(OutboundData {
-                                                                                        stream_id: None,
-                                                                                        tunnel_id: stream_header.tunnel_id,
-                                                                                        connection_id: conn_id,
-                                                                                        source_addr: stream_header.source_addr,
-                                                                                        payload: raw_upgrade_request,
-                                                                                        fin: false,
-                                                                                        streaming: true,
-                                                                                    }))
-                                                                                    .await;
-
-                                                                                // Spawn a task to relay WS frames -> QUIC
-                                                                                let outbound_tx_ws = outbound_tx.clone();
-                                                                                let ws_relays_cleanup = ws_relays.clone();
-                                                                                tokio::spawn(async move {
-                                                                                    while let Some(bytes) = ws_to_quic_rx.recv().await {
-                                                                                        if bytes.is_empty() {
-                                                                                            continue;
-                                                                                        }
-                                                                                        let _ = outbound_tx_ws
-                                                                                            .send(PikeOutboundMessage::Data(OutboundData {
-                                                                                                stream_id: None, // Will be routed by connection_id
-                                                                                                tunnel_id: stream_header.tunnel_id,
-                                                                                                connection_id: conn_id,
-                                                                                                source_addr: stream_header.source_addr,
-                                                                                                payload: bytes,
-                                                                                                fin: false,
-                                                                                                streaming: true,
-                                                                                            }))
-                                                                                            .await;
-                                                                                    }
-                                                                                    // WS closed, send fin
-                                                                                    let _ = outbound_tx_ws
-                                                                                        .send(PikeOutboundMessage::Data(OutboundData {
-                                                                                            stream_id: None,
-                                                                                            tunnel_id: stream_header.tunnel_id,
-                                                                                            connection_id: conn_id,
-                                                                                            source_addr: stream_header.source_addr,
-                                                                                            payload: vec![],
-                                                                                            fin: true,
-                                                                                            streaming: true,
-                                                                                        }))
-                                                                                        .await;
-                                                                                    ws_relays_cleanup.lock().await.remove(&conn_id);
-                                                                                });
+                                                                                handle_websocket_tunnel_request(
+                                                                                    ws_request,
+                                                                                    outbound_tx.clone(),
+                                                                                    ws_relays.clone(),
+                                                                                    tunnel_metrics_store.clone(),
+                                                                                )
+                                                                                .await;
                                                                             }
                                                                         }
                                                                     }
@@ -746,17 +696,17 @@ async fn spawn_accept_loop(
                                                 }
                                                 PikeMessage::Data(data) => {
                                                     if data.streaming {
-                                                        // Route to WS relay
-                                                        let relays = ws_relays.lock().await;
-                                                        if let Some(relay_tx) = relays.get(&data.connection_id) {
-                                                            let _ = relay_tx.send(data.payload).await;
-                                                        }
-                                                        drop(relays);
-                                                        if data.fin {
-                                                            ws_relays.lock().await.remove(&data.connection_id);
-                                                        }
-                                                    } else if let Some(response_tx) = pending_http.lock().await.remove(&data.connection_id) {
-                                                        let _ = response_tx.send(parse_http_response(&data.payload));
+                                                        handle_streaming_pike_data(
+                                                            data,
+                                                            ws_relays.clone(),
+                                                            tunnel_metrics_store_for_conn.clone(),
+                                                        )
+                                                        .await;
+                                                    } else if let Some(response_tx) =
+                                                        pending_http.lock().await.remove(&data.connection_id)
+                                                    {
+                                                        let _ = response_tx
+                                                            .send(parse_http_response(&data.payload));
                                                     }
                                                 }
                                             }
@@ -935,6 +885,183 @@ async fn wait_for_all_connections_closed(registry: Arc<ClientRegistry>) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn handle_websocket_tunnel_request(
+    ws_request: WebSocketRequest,
+    outbound_tx: mpsc::Sender<PikeOutboundMessage>,
+    ws_relays: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
+    tunnel_metrics_store: Arc<TunnelMetricsStore>,
+) {
+    let WebSocketRequest {
+        stream_header,
+        request_id: _,
+        raw_upgrade_request,
+        mut ws_to_quic_rx,
+        quic_to_ws_tx,
+    } = ws_request;
+
+    let conn_id = stream_header.connection_id;
+    let tunnel_id_string = stream_header.tunnel_id.to_string();
+    tunnel_metrics_store
+        .record_wss_open(&tunnel_id_string)
+        .await;
+
+    ws_relays.lock().await.insert(conn_id, quic_to_ws_tx);
+
+    let upgrade_send_result = outbound_tx
+        .send(PikeOutboundMessage::Data(OutboundData {
+            stream_id: None,
+            tunnel_id: stream_header.tunnel_id,
+            connection_id: conn_id,
+            source_addr: stream_header.source_addr,
+            payload: raw_upgrade_request,
+            fin: false,
+            streaming: true,
+        }))
+        .await;
+
+    if upgrade_send_result.is_err() {
+        tunnel_metrics_store
+            .record_wss_dropped_frames(&tunnel_id_string, 1, "upgrade_dispatch_failed")
+            .await;
+        tunnel_metrics_store
+            .record_wss_close(&tunnel_id_string, "upgrade_dispatch_failed")
+            .await;
+        ws_relays.lock().await.remove(&conn_id);
+        return;
+    }
+
+    let outbound_tx_ws = outbound_tx.clone();
+    let ws_relays_cleanup = ws_relays.clone();
+    let tunnel_metrics_store_ws = tunnel_metrics_store.clone();
+    let tunnel_id_for_ws = tunnel_id_string.clone();
+
+    tokio::spawn(async move {
+        while let Some(bytes) = ws_to_quic_rx.recv().await {
+            if bytes.is_empty() {
+                continue;
+            }
+
+            let frame_stats = pike_server::ws_proxy::websocket_frame_stats(&bytes);
+            let frames = frame_stats.frames.max(1);
+            let bytes_len = bytes.len() as u64;
+            let dispatch_started = Instant::now();
+            let send_result = outbound_tx_ws
+                .send(PikeOutboundMessage::Data(OutboundData {
+                    stream_id: None,
+                    tunnel_id: stream_header.tunnel_id,
+                    connection_id: conn_id,
+                    source_addr: stream_header.source_addr,
+                    payload: bytes,
+                    fin: false,
+                    streaming: true,
+                }))
+                .await;
+            let relay_latency_us = dispatch_started.elapsed().as_micros() as u64;
+
+            if send_result.is_err() {
+                tunnel_metrics_store_ws
+                    .record_wss_dropped_frames(
+                        &tunnel_id_for_ws,
+                        frames,
+                        "browser_to_quic_dispatch_failed",
+                    )
+                    .await;
+                break;
+            }
+
+            tunnel_metrics_store_ws
+                .record_wss_inbound_frames(&tunnel_id_for_ws, frames, bytes_len, relay_latency_us)
+                .await;
+        }
+
+        let fin_send_result = outbound_tx_ws
+            .send(PikeOutboundMessage::Data(OutboundData {
+                stream_id: None,
+                tunnel_id: stream_header.tunnel_id,
+                connection_id: conn_id,
+                source_addr: stream_header.source_addr,
+                payload: vec![],
+                fin: true,
+                streaming: true,
+            }))
+            .await;
+        let close_reason = if fin_send_result.is_err() {
+            "client_closed_quic_dispatch_failed"
+        } else {
+            "client_closed"
+        };
+        tunnel_metrics_store_ws
+            .record_wss_close(&tunnel_id_for_ws, close_reason)
+            .await;
+        ws_relays_cleanup.lock().await.remove(&conn_id);
+    });
+}
+
+async fn handle_streaming_pike_data(
+    data: InboundData,
+    ws_relays: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
+    tunnel_metrics_store: Arc<TunnelMetricsStore>,
+) {
+    let InboundData {
+        connection_id: conn_id,
+        tunnel_id,
+        payload,
+        fin,
+        ..
+    } = data;
+    let tunnel_id_string = tunnel_id.to_string();
+    let payload_len = payload.len() as u64;
+    let frames = if payload.is_empty() {
+        0
+    } else {
+        pike_server::ws_proxy::websocket_frame_stats(&payload)
+            .frames
+            .max(1)
+    };
+    let relay_tx = {
+        let relays = ws_relays.lock().await;
+        relays.get(&conn_id).cloned()
+    };
+
+    if let Some(relay_tx) = relay_tx {
+        let dispatch_started = Instant::now();
+        let send_result = relay_tx.send(payload).await;
+        let relay_latency_us = dispatch_started.elapsed().as_micros() as u64;
+
+        if send_result.is_ok() {
+            if frames > 0 {
+                tunnel_metrics_store
+                    .record_wss_outbound_frames(
+                        &tunnel_id_string,
+                        frames,
+                        payload_len,
+                        relay_latency_us,
+                    )
+                    .await;
+            }
+        } else if frames > 0 {
+            tunnel_metrics_store
+                .record_wss_dropped_frames(
+                    &tunnel_id_string,
+                    frames,
+                    "quic_to_browser_dispatch_failed",
+                )
+                .await;
+        }
+    } else if frames > 0 {
+        tunnel_metrics_store
+            .record_wss_dropped_frames(&tunnel_id_string, frames, "relay_missing")
+            .await;
+    }
+
+    if fin {
+        tunnel_metrics_store
+            .record_wss_close(&tunnel_id_string, "tunnel_closed")
+            .await;
+        ws_relays.lock().await.remove(&conn_id);
     }
 }
 
