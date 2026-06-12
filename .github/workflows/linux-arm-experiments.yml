@@ -63,12 +63,12 @@ jobs:
           cp deploy/pike-server.service server-bundle/pike-server.service
           tar -czf pike-server-linux-arm64.tar.gz -C server-bundle .
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pike-linux-arm64
           path: pike-linux-arm64
       - name: Upload server artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pike-server-linux-arm64.tar.gz
           path: pike-server-linux-arm64.tar.gz
