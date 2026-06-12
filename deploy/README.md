@@ -2,7 +2,7 @@
 
 This bundle targets Linux VPS deployments.
 
-Current public bundle rollout: Linux x86_64 only. Linux ARM64 bundles are deferred.
+Current public bundle rollout: Linux x86_64 and Linux ARM64.
 
 Included files:
 - `pike-server`: relay binary
