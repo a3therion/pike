@@ -43,7 +43,7 @@ toml = "0.8"
 postcard = { version = "1", features = ["alloc"] }
 
 # Networking
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.28"
 
 # Streaming
 async-stream = "0.3"
