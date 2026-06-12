@@ -26,9 +26,8 @@ pub async fn run_ws_test(options: WsTestOptions) -> Result<()> {
     println!("{}", "Pike WebSocket local upstream test".bold());
     println!("  {} {}", "Target:".dimmed(), url);
     println!(
-        "  {} {}",
-        "Scope:".dimmed(),
-        "local upstream only; this does not start or use a Pike tunnel"
+        "  {} local upstream only; this does not start or use a Pike tunnel",
+        "Scope:".dimmed()
     );
 
     let connect_result = tokio::time::timeout(options.timeout, connect_async(&url)).await;

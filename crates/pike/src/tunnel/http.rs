@@ -207,10 +207,10 @@ impl HttpTunnel {
             .await
             .map_err(|_| anyhow!("timed out writing request to local upstream"))??;
 
-        let raw_response = timeout(
+        let raw_response = Box::pin(timeout(
             LOCAL_UPSTREAM_IO_TIMEOUT,
             Self::read_upstream_response(&mut tcp),
-        )
+        ))
         .await
         .map_err(|_| anyhow!("timed out reading response from local upstream"))??;
 
@@ -701,7 +701,14 @@ impl HttpTunnel {
 
             tokio::spawn(async move {
                 let _permit = permit;
-                match Self::handle_payload(local_host, local_port, request_store, payload).await {
+                match Box::pin(Self::handle_payload(
+                    local_host,
+                    local_port,
+                    request_store,
+                    payload,
+                ))
+                .await
+                {
                     Ok(response_payload) => {
                         let _ = data_tx
                             .send(LocalData {

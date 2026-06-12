@@ -471,8 +471,8 @@ mod tests {
     async fn test_local_auth_accepts_configured_key() {
         let client = ControlPlaneClient::new(
             reqwest::Client::new(),
-            "".to_string(),
-            "".to_string(),
+            String::new(),
+            String::new(),
             false,
             Some(vec![TEST_KEY.to_string()]),
         );
@@ -492,8 +492,8 @@ mod tests {
     async fn test_local_auth_rejects_unknown_key() {
         let client = ControlPlaneClient::new(
             reqwest::Client::new(),
-            "".to_string(),
-            "".to_string(),
+            String::new(),
+            String::new(),
             false,
             Some(vec![TEST_KEY.to_string()]),
         );
@@ -699,8 +699,8 @@ internal_token = "custom-internal-token"
     async fn test_register_tunnel_local_self_hosted_without_workers() {
         let client = ControlPlaneClient::new(
             reqwest::Client::new(),
-            "".to_string(),
-            "".to_string(),
+            String::new(),
+            String::new(),
             false,
             Some(vec![TEST_KEY.to_string()]),
         );

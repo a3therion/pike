@@ -739,9 +739,9 @@ mod tests {
             .expect("register tunnel with fallback store");
         limiter.track_bandwidth(tunnel_id, FREE_TIER_BANDWIDTH_BYTES_PER_MONTH + 1);
 
-        let limited = limiter.check_limit("fallback-user".to_string());
+        let limit_result = limiter.check_limit("fallback-user".to_string());
         assert!(matches!(
-            limited,
+            limit_result,
             Err(RateLimitError::BandwidthLimitExceeded)
         ));
     }

@@ -473,7 +473,7 @@ mod tests {
     fn connection_limit_enforced() {
         let registry = ClientRegistry::with_limits(AbuseConfig::default(), 2, 10);
         for i in 0..2u64 {
-            let mut client = ClientConnection::new(uuid::Uuid::from_u128(i as u128), None);
+            let mut client = ClientConnection::new(uuid::Uuid::from_u128(u128::from(i)), None);
             client.state = ConnectionState::Authenticated;
             registry.register_client(client).expect("within limit");
         }

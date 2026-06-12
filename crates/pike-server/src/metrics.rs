@@ -1,56 +1,63 @@
-use lazy_static::lazy_static;
 use prometheus::{
-    register_counter_vec, register_histogram_vec, register_int_gauge, CounterVec, Encoder,
+    register_counter_vec, register_histogram_vec, register_int_gauge, Counter, CounterVec, Encoder,
     HistogramVec, IntGauge, TextEncoder,
 };
 use std::net::SocketAddr;
+use std::sync::LazyLock;
 
-lazy_static! {
-    /// Number of active QUIC connections
-    pub static ref ACTIVE_CONNECTIONS: IntGauge = register_int_gauge!(
+/// Number of active QUIC connections.
+pub static ACTIVE_CONNECTIONS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
         "pike_active_connections",
         "Number of active QUIC connections"
     )
-    .unwrap();
+    .expect("register pike_active_connections metric")
+});
 
-    /// Number of active tunnels
-    pub static ref ACTIVE_TUNNELS: IntGauge = register_int_gauge!(
-        "pike_active_tunnels",
-        "Number of active tunnels"
-    )
-    .unwrap();
+/// Number of active tunnels.
+pub static ACTIVE_TUNNELS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("pike_active_tunnels", "Number of active tunnels")
+        .expect("register pike_active_tunnels metric")
+});
 
-    /// Total bytes transferred (labeled by direction: "in" or "out")
-    pub static ref BYTES_TRANSFERRED: CounterVec = register_counter_vec!(
+/// Total bytes transferred, labeled by direction: "in" or "out".
+pub static BYTES_TRANSFERRED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
         "pike_bytes_transferred",
         "Total bytes transferred",
         &["direction"]
     )
-    .unwrap();
+    .expect("register pike_bytes_transferred metric")
+});
 
-    /// Request latency histogram (labeled by tunnel type: "http" or "tcp")
-    pub static ref REQUEST_LATENCY: HistogramVec = register_histogram_vec!(
+/// Request latency histogram, labeled by tunnel type: "http" or "tcp".
+pub static REQUEST_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "pike_request_latency_seconds",
         "Request latency in seconds",
         &["tunnel_type"],
         vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
     )
-    .unwrap();
+    .expect("register pike_request_latency_seconds metric")
+});
 
-    /// Error rate counter (labeled by error type)
-    pub static ref ERROR_RATE: CounterVec = register_counter_vec!(
+/// Error rate counter, labeled by error type.
+pub static ERROR_RATE: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
         "pike_errors_total",
         "Total number of errors",
         &["error_type"]
     )
-    .unwrap();
+    .expect("register pike_errors_total metric")
+});
 
-    pub static ref RATE_LIMIT_REJECTIONS: prometheus::Counter = prometheus::register_counter!(
+pub static RATE_LIMIT_REJECTIONS: LazyLock<Counter> = LazyLock::new(|| {
+    prometheus::register_counter!(
         "pike_rate_limit_rejections_total",
         "Total number of requests rejected by the per-IP rate limiter"
     )
-    .unwrap();
-}
+    .expect("register pike_rate_limit_rejections_total metric")
+});
 
 /// Metrics HTTP handler that returns Prometheus-formatted metrics
 pub async fn metrics_handler() -> String {

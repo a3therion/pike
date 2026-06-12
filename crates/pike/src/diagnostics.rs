@@ -419,7 +419,12 @@ async fn check_reachability(
         }
     }
 
-    if cfg.auth.api_key.as_ref().is_none_or(|key| key.is_empty()) {
+    if cfg
+        .auth
+        .api_key
+        .as_ref()
+        .is_none_or(std::string::String::is_empty)
+    {
         print_check(
             summary,
             CheckStatus::Skip,

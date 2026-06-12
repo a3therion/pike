@@ -820,9 +820,7 @@ impl TunnelMetrics {
             entry.dropped_frames = entry.dropped_frames.saturating_add(b.dropped_frames);
             entry.bytes_in = entry.bytes_in.saturating_add(b.bytes_in);
             entry.bytes_out = entry.bytes_out.saturating_add(b.bytes_out);
-            entry
-                .wss_latency_samples_us
-                .extend(b.latency_samples_us.into_iter());
+            entry.wss_latency_samples_us.extend(b.latency_samples_us);
         }
 
         let data = agg
@@ -1180,6 +1178,13 @@ mod tests {
 
     use super::{MetricsRange, TunnelMetricsStore};
 
+    fn assert_float_eq(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < f64::EPSILON,
+            "expected {actual} to equal {expected}"
+        );
+    }
+
     #[tokio::test]
     async fn metrics_survive_store_restart() {
         let shared_store = Arc::new(InMemoryStateStore::new()) as Arc<dyn StateStore>;
@@ -1206,11 +1211,11 @@ mod tests {
         assert_eq!(response.status_breakdown.five_xx, 1);
         assert_eq!(response.bytes_in, 15);
         assert_eq!(response.bytes_out, 28);
-        assert_eq!(response.avg_latency_ms, 100.0);
+        assert_float_eq(response.avg_latency_ms, 100.0);
         assert_eq!(response.uptime_seconds, 42);
         assert_eq!(response.active_tunnels, 3);
         assert_eq!(response.wss_connections, 0);
-        assert_eq!(response.frame_rate_fps, 0.0);
+        assert_float_eq(response.frame_rate_fps, 0.0);
         assert_eq!(response.dropped_frames, 0);
         assert_eq!(response.reconnects, 0);
         assert_eq!(response.close_reason, None);
@@ -1254,9 +1259,9 @@ mod tests {
         let active = store.metrics_response("tunnel-wss", 9, 1).await;
         assert_eq!(active.wss_connections, 1);
         assert!(active.frame_rate_fps > 0.0);
-        assert_eq!(active.latency_p50_ms, 2.0);
-        assert_eq!(active.latency_p95_ms, 2.0);
-        assert_eq!(active.latency_p99_ms, 2.0);
+        assert_float_eq(active.latency_p50_ms, 2.0);
+        assert_float_eq(active.latency_p95_ms, 2.0);
+        assert_float_eq(active.latency_p99_ms, 2.0);
         assert_eq!(active.dropped_frames, 2);
         assert_eq!(active.bytes_in, 800);
         assert_eq!(active.bytes_out, 900);

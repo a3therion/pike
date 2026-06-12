@@ -959,7 +959,7 @@ async fn handle_websocket_tunnel_request(
                     streaming: true,
                 }))
                 .await;
-            let relay_latency_us = dispatch_started.elapsed().as_micros() as u64;
+            let relay_latency_us = duration_micros_u64(dispatch_started.elapsed());
 
             if send_result.is_err() {
                 tunnel_metrics_store_ws
@@ -1029,7 +1029,7 @@ async fn handle_streaming_pike_data(
     if let Some(relay_tx) = relay_tx {
         let dispatch_started = Instant::now();
         let send_result = relay_tx.send(payload).await;
-        let relay_latency_us = dispatch_started.elapsed().as_micros() as u64;
+        let relay_latency_us = duration_micros_u64(dispatch_started.elapsed());
 
         if send_result.is_ok() {
             if frames > 0 {
@@ -1063,6 +1063,10 @@ async fn handle_streaming_pike_data(
             .await;
         ws_relays.lock().await.remove(&conn_id);
     }
+}
+
+fn duration_micros_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 async fn encode_http_request(request: Request<Body>) -> Result<Vec<u8>, ProxyError> {
@@ -1355,18 +1359,16 @@ mod tests {
 
     #[tokio::test]
     async fn required_redis_without_url_returns_error() {
-        let err = match build_rate_limit_store(None, true).await {
-            Ok(_) => panic!("required redis should fail without url"),
-            Err(err) => err,
+        let Err(err) = build_rate_limit_store(None, true).await else {
+            panic!("required redis should fail without url");
         };
         assert!(err.to_string().contains("redis_url"));
     }
 
     #[tokio::test]
     async fn required_redis_connection_failure_returns_error() {
-        let err = match build_rate_limit_store(Some("redis://127.0.0.1:1/"), true).await {
-            Ok(_) => panic!("required redis should fail on connection error"),
-            Err(err) => err,
+        let Err(err) = build_rate_limit_store(Some("redis://127.0.0.1:1/"), true).await else {
+            panic!("required redis should fail on connection error");
         };
         assert!(err.to_string().contains("required Redis state store"));
     }

@@ -101,7 +101,7 @@ pub fn websocket_frame_stats(payload: &[u8]) -> WebSocketFrameStats {
 pub fn build_raw_upgrade_request(req: &Request<Body>) -> Vec<u8> {
     let target = req.uri().path_and_query().map_or("/", |v| v.as_str());
 
-    let mut raw = format!("{} {} HTTP/1.1\r\n", req.method().as_str(), target,).into_bytes();
+    let mut raw = format!("{} {} HTTP/1.1\r\n", req.method().as_str(), target).into_bytes();
 
     for (name, value) in req.headers() {
         if let Ok(v) = value.to_str() {
