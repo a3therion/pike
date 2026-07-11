@@ -36,7 +36,9 @@ pub struct ClientRegistry {
     pub clients: DashMap<ConnectionId, ClientConnection>,
     pub tunnels: DashMap<String, TunnelEntry>,
     pub tcp_listeners: DashMap<TunnelId, TcpListenerEntry>,
-    pub revoked_api_keys: DashMap<String, ()>,
+    /// Revoked API keys mapped to the owning user_id (or "" if unknown) so a ban can be
+    /// lifted per-user (fix #6d/#7/#8). Checked on the QUIC and WS login paths.
+    pub revoked_api_keys: DashMap<String, String>,
     pub rate_limiter: Arc<RateLimiter>,
     pub abuse_detector: Arc<AbuseDetector>,
     pub total_connections: AtomicUsize,
@@ -136,16 +138,20 @@ impl ClientRegistry {
     }
 
     pub fn remove_client(&self, connection_id: &ConnectionId) {
+        // Only decrement the gauge when this call actually removed a live client.
+        // Force-removal paths (disconnect_connections / kill_user_tunnels) may remove the
+        // entry before the connection's own cleanup runs remove_client again; decrementing
+        // unconditionally would drive the gauge negative.
         if let Some((_, client)) = self.clients.remove(connection_id) {
             for tunnel_id in client.tunnels {
                 self.rate_limiter.unregister_tunnel(tunnel_id);
             }
+            crate::metrics::ACTIVE_CONNECTIONS.dec();
         }
         self.tunnels
             .retain(|_, tunnel| &tunnel.connection_id != connection_id);
         self.tcp_listeners
             .retain(|_, listener| &listener.connection_id != connection_id);
-        crate::metrics::ACTIVE_CONNECTIONS.dec();
     }
 
     pub fn register_tunnel(
@@ -185,6 +191,11 @@ impl ClientRegistry {
                 .validated_user
                 .as_ref()
                 .map(|user| user.plan.as_str());
+            // Seed control-plane limit overrides before registering so the tunnel-count
+            // cap honors the user's actual plan limits (fix #5/#18).
+            if let Some(user) = client.info.validated_user.as_ref() {
+                self.rate_limiter.set_user_limits(&user_id, &user.limits);
+            }
             self.rate_limiter
                 .register_tunnel(user_id, tunnel_id, plan_name)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -327,7 +338,12 @@ impl ClientRegistry {
         })
     }
 
+    /// Record inbound bytes (client -> upstream) for a tunnel and feed them into the
+    /// monthly bandwidth quota accounting.
     pub fn track_bandwidth(&self, tunnel_id: TunnelId, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
         self.total_bytes_in.fetch_add(bytes, Ordering::Relaxed);
         self.rate_limiter.track_bandwidth(tunnel_id, bytes);
 
@@ -338,6 +354,32 @@ impl ClientRegistry {
         {
             tunnel.bytes_in = tunnel.bytes_in.saturating_add(bytes);
         }
+    }
+
+    /// Record outbound bytes (upstream -> client) for a tunnel. Both directions count
+    /// toward the monthly bandwidth quota (fixes #1/#3/#4).
+    pub fn track_bandwidth_out(&self, tunnel_id: TunnelId, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.total_bytes_out.fetch_add(bytes, Ordering::Relaxed);
+        self.rate_limiter.track_bandwidth(tunnel_id, bytes);
+
+        if let Some(mut tunnel) = self
+            .tunnels
+            .iter_mut()
+            .find(|entry| entry.tunnel_id == tunnel_id)
+        {
+            tunnel.bytes_out = tunnel.bytes_out.saturating_add(bytes);
+        }
+    }
+
+    /// Returns true if the user identified by `user_id` is currently within their
+    /// monthly bandwidth quota. Used by the TCP proxy path to refuse over-quota
+    /// tunnels (fix #1).
+    #[must_use]
+    pub fn is_within_bandwidth_quota(&self, user_id: &str) -> bool {
+        self.rate_limiter.check_bandwidth_quota(user_id).is_ok()
     }
 
     #[must_use]
@@ -361,7 +403,7 @@ impl ClientRegistry {
     }
 
     pub async fn kill_user_tunnels(&self, user_id: &str) -> anyhow::Result<()> {
-        let connection_ids: Vec<_> = self
+        let matches: Vec<(ConnectionId, Option<String>)> = self
             .clients
             .iter()
             .filter(|entry| {
@@ -373,19 +415,99 @@ impl ClientRegistry {
                     .or(entry.info.api_key.as_deref())
                     == Some(user_id)
             })
-            .map(|entry| *entry.key())
+            .map(|entry| (*entry.key(), entry.info.api_key.clone()))
             .collect();
 
-        for connection_id in connection_ids {
+        for (connection_id, api_key) in matches {
+            // Fix #6d/#7: revoke the live session's api key so an immediate reconnect
+            // with the same key is rejected on the QUIC/WS login path.
+            if let Some(api_key) = api_key {
+                self.revoke_api_key(&api_key, user_id);
+            }
             self.remove_client(&connection_id);
         }
 
         Ok(())
     }
 
+    /// Insert an api key into the revoked set so subsequent logins with it are denied
+    /// (fix #6d). Idempotent. `user_id` lets a later unban restore all of a user's keys.
+    pub fn revoke_api_key(&self, api_key: &str, user_id: &str) {
+        self.revoked_api_keys
+            .insert(api_key.to_string(), user_id.to_string());
+    }
+
+    /// Remove a single api key from the revoked set.
+    pub fn restore_api_key(&self, api_key: &str) {
+        self.revoked_api_keys.remove(api_key);
+    }
+
+    /// Remove every revoked api key that belongs to `user_id` (e.g. on unban).
+    pub fn restore_user_api_keys(&self, user_id: &str) {
+        self.revoked_api_keys
+            .retain(|_, owner| owner.as_str() != user_id);
+    }
+
     #[must_use]
     pub fn is_api_key_allowed(&self, api_key: &str) -> bool {
         !self.revoked_api_keys.contains_key(api_key)
+    }
+
+    /// Number of active tunnels currently owned by `user_id`.
+    #[must_use]
+    pub fn active_tunnel_count_for_user(&self, user_id: &str) -> usize {
+        self.tunnels
+            .iter()
+            .filter(|entry| {
+                self.user_id_for_connection(&entry.connection_id).as_deref() == Some(user_id)
+            })
+            .count()
+    }
+
+    /// Tear down tunnels owned by `user_id` that exceed `max_tunnels` after a plan
+    /// downgrade (fix #5). Keeps the oldest `max_tunnels` and removes the newest extras.
+    /// Returns the `(subdomain, connection_id)` pairs removed so the caller can also
+    /// unregister them from the vhost router.
+    pub fn enforce_tunnel_cap(
+        &self,
+        user_id: &str,
+        max_tunnels: u32,
+    ) -> Vec<(String, ConnectionId)> {
+        let mut owned: Vec<(String, TunnelId, ConnectionId, DateTime<Utc>)> = self
+            .tunnels
+            .iter()
+            .filter(|entry| {
+                self.user_id_for_connection(&entry.connection_id).as_deref() == Some(user_id)
+            })
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.tunnel_id,
+                    entry.connection_id,
+                    entry.created_at,
+                )
+            })
+            .collect();
+
+        let max_tunnels = max_tunnels as usize;
+        if owned.len() <= max_tunnels {
+            return Vec::new();
+        }
+
+        // Keep the oldest `max_tunnels`; remove the newest extras.
+        owned.sort_by_key(|(_, _, _, created_at)| *created_at);
+        let mut removed = Vec::new();
+        for (subdomain, tunnel_id, connection_id, _) in owned.into_iter().skip(max_tunnels) {
+            if self.tunnels.remove(&subdomain).is_some() {
+                self.rate_limiter.unregister_tunnel(tunnel_id);
+                if let Some(mut client) = self.clients.get_mut(&connection_id) {
+                    client.unregister_tunnel(tunnel_id);
+                }
+                crate::metrics::ACTIVE_TUNNELS.dec();
+                removed.push((subdomain, connection_id));
+            }
+        }
+        removed
     }
 }
 
@@ -497,6 +619,8 @@ mod tests {
             email: "pro@example.com".to_string(),
             plan: "pro".to_string(),
             plan_expires_at: None,
+            status: crate::connection::UserStatus::Active,
+            limits: crate::connection::UserLimits::default(),
         });
         registry.register_client(client).expect("register client");
 

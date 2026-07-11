@@ -27,6 +27,8 @@ pub enum TcpError {
     Bind(SocketAddr, std::io::Error),
     #[error("listener not found for tunnel {0}")]
     ListenerNotFound(TunnelId),
+    #[error("tunnel over bandwidth quota, suspended, or rate-limited")]
+    QuotaExceeded,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("QUIC error: {0}")]
@@ -305,12 +307,102 @@ impl QuicConnectionIo for quiche::Connection {
     }
 }
 
+/// Bandwidth accounting + quota gate for TCP tunnels (fix #1).
+///
+/// TCP tunnels previously moved bytes with no accounting or quota enforcement — only
+/// the HTTP path metered traffic. The proxy loop now feeds every byte moved in both
+/// directions into a meter, and consults `allow()` so an over-quota / suspended /
+/// rate-limited tunnel is torn down.
+pub trait TcpBandwidthMeter: Send + Sync {
+    /// Returns `true` if the tunnel may (continue to) run. Called once before the
+    /// proxy loop starts and again each loop iteration so a user going over quota
+    /// mid-stream is cut off. Implementations should keep this cheap.
+    fn allow(&self) -> bool;
+    /// Record bytes moved from the client toward the upstream (inbound).
+    fn record_in(&self, bytes: u64);
+    /// Record bytes moved from the upstream toward the client (outbound).
+    fn record_out(&self, bytes: u64);
+}
+
+/// A meter that performs no accounting and always allows traffic. Used in tests and
+/// as a safe default where metering is not wired.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopBandwidthMeter;
+
+impl TcpBandwidthMeter for NoopBandwidthMeter {
+    fn allow(&self) -> bool {
+        true
+    }
+    fn record_in(&self, _bytes: u64) {}
+    fn record_out(&self, _bytes: u64) {}
+}
+
+/// Meter backed by the live `ClientRegistry`: it counts bytes into the same monthly
+/// bandwidth accounting the HTTP path uses (`rate_limit.rs`) and refuses the tunnel
+/// when the user is over their quota, suspended, or rate-limited (fix #1).
+pub struct RegistryTcpMeter {
+    registry: Arc<crate::registry::ClientRegistry>,
+    tunnel_id: TunnelId,
+    user_id: String,
+}
+
+impl RegistryTcpMeter {
+    #[must_use]
+    pub fn new(
+        registry: Arc<crate::registry::ClientRegistry>,
+        tunnel_id: TunnelId,
+        user_id: String,
+    ) -> Self {
+        Self {
+            registry,
+            tunnel_id,
+            user_id,
+        }
+    }
+}
+
+impl TcpBandwidthMeter for RegistryTcpMeter {
+    fn allow(&self) -> bool {
+        if self.registry.abuse_detector.is_suspended(&self.tunnel_id) {
+            return false;
+        }
+        // check_limit enforces both the per-user request governor and the monthly
+        // bandwidth quota (BandwidthLimitExceeded).
+        if self
+            .registry
+            .rate_limiter
+            .check_limit(self.user_id.clone())
+            .is_err()
+        {
+            return false;
+        }
+        self.registry
+            .rate_limiter
+            .check_tunnel_limit(self.tunnel_id)
+            .is_ok()
+    }
+
+    fn record_in(&self, bytes: u64) {
+        self.registry.track_bandwidth(self.tunnel_id, bytes);
+    }
+
+    fn record_out(&self, bytes: u64) {
+        self.registry.track_bandwidth_out(self.tunnel_id, bytes);
+    }
+}
+
 pub async fn handle_tcp_connection<Q: QuicConnectionIo>(
     tcp_stream: TcpStream,
     tunnel_id: TunnelId,
     quic_conn: &mut Q,
     stream_manager: &StreamManager,
+    meter: &dyn TcpBandwidthMeter,
 ) -> Result<u64, TcpError> {
+    // Refuse up front if the user is over quota / suspended / rate-limited (fix #1).
+    if !meter.allow() {
+        return Err(TcpError::QuotaExceeded);
+    }
+
     let stream_id = stream_manager.next_stream_id();
     stream_manager.register_stream(stream_id, tunnel_id);
 
@@ -327,7 +419,7 @@ pub async fn handle_tcp_connection<Q: QuicConnectionIo>(
     send_with_backpressure(quic_conn, stream_id, &header_frame, false).await?;
 
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
-    copy_with_backpressure(&mut tcp_read, &mut tcp_write, quic_conn, stream_id).await?;
+    copy_with_backpressure(&mut tcp_read, &mut tcp_write, quic_conn, stream_id, meter).await?;
     stream_manager.close_stream(stream_id);
 
     Ok(stream_id)
@@ -338,6 +430,7 @@ pub async fn copy_with_backpressure<Q: QuicConnectionIo>(
     tcp_write: &mut tokio::net::tcp::OwnedWriteHalf,
     quic_conn: &mut Q,
     stream_id: u64,
+    meter: &dyn TcpBandwidthMeter,
 ) -> Result<(), TcpError> {
     let mut tcp_buf = vec![0_u8; COPY_BUFFER_SIZE];
     let mut quic_buf = vec![0_u8; COPY_BUFFER_SIZE];
@@ -345,6 +438,14 @@ pub async fn copy_with_backpressure<Q: QuicConnectionIo>(
     let mut quic_read_closed = false;
 
     loop {
+        // Enforce quota/suspension mid-stream (fix #1): if the user has gone over
+        // their monthly cap or been suspended, tear the tunnel down.
+        if !meter.allow() {
+            let _ = quic_conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+            let _ = tcp_write.shutdown().await;
+            return Err(TcpError::QuotaExceeded);
+        }
+
         let mut progressed = false;
 
         loop {
@@ -352,6 +453,8 @@ pub async fn copy_with_backpressure<Q: QuicConnectionIo>(
                 Ok((n, fin)) => {
                     progressed = true;
                     if n > 0 {
+                        // upstream -> client (outbound)
+                        meter.record_out(n as u64);
                         tcp_write.write_all(&quic_buf[..n]).await?;
                     }
                     if fin {
@@ -384,6 +487,8 @@ pub async fn copy_with_backpressure<Q: QuicConnectionIo>(
                     }
                     Ok(Ok(n)) => {
                         progressed = true;
+                        // client -> upstream (inbound)
+                        meter.record_in(n as u64);
                         send_with_backpressure(quic_conn, stream_id, &tcp_buf[..n], false).await?;
                     }
                     Ok(Err(error)) => return Err(TcpError::Io(error)),
@@ -576,9 +681,15 @@ mod tests {
             shutdowns: Vec::new(),
         };
 
-        copy_with_backpressure(&mut read_half, &mut write_half, &mut mock, 4)
-            .await
-            .expect("copy with backpressure");
+        copy_with_backpressure(
+            &mut read_half,
+            &mut write_half,
+            &mut mock,
+            4,
+            &NoopBandwidthMeter,
+        )
+        .await
+        .expect("copy with backpressure");
 
         let client_received = client_task.await.expect("client task");
         assert_eq!(client_received, b"pong");

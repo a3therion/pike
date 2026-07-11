@@ -20,12 +20,50 @@ pub enum ConnectionState {
     Closed,
 }
 
+/// Account status as reported by the control plane. Consumed by the revalidation
+/// loop (fix #5): a `Suspended` user is disconnected on the next poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UserStatus {
+    #[default]
+    Active,
+    Suspended,
+}
+
+impl UserStatus {
+    #[must_use]
+    pub fn from_name(name: Option<&str>) -> Self {
+        match name.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("suspended") | Some("banned") | Some("disabled") => Self::Suspended,
+            _ => Self::Active,
+        }
+    }
+
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
+/// Per-plan limits as reported by the control plane. All fields are optional; `None`
+/// means "no explicit limit provided" and the relay falls back to its plan defaults.
+#[derive(Debug, Clone, Default)]
+pub struct UserLimits {
+    pub bandwidth_bytes_per_month: Option<u64>,
+    pub max_tunnels: Option<u32>,
+    pub requests_per_minute: Option<u32>,
+    pub requests_per_day: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedUser {
     pub user_id: String,
     pub email: String,
     pub plan: String,
     pub plan_expires_at: Option<String>,
+    /// Current account status from the control plane (fix #5). Defaults to `Active`.
+    pub status: UserStatus,
+    /// Current plan limits from the control plane (fix #5/#18).
+    pub limits: UserLimits,
 }
 
 #[derive(Debug, Clone)]

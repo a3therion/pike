@@ -10,6 +10,9 @@ Group=pike
 WorkingDirectory=/opt/pike
 Environment="RUST_LOG=info"
 Environment="RUST_BACKTRACE=1"
+# Optional error monitoring (fix #6). Leave unset to disable Sentry entirely (no-op).
+# Uncomment and set your DSN to enable panic + error-event reporting:
+# Environment="SENTRY_DSN=https://<key>@<org>.ingest.sentry.io/<project>"
 ExecStart=/opt/pike/pike-server --config /etc/pike/server.toml
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
@@ -24,8 +27,12 @@ LimitNOFILE=65535
 LimitNPROC=4096
 
 # Logging
-StandardOutput=append:/var/log/pike/server.log
-StandardError=append:/var/log/pike/server.log
+# Send stdout/stderr to the systemd journal instead of an ever-growing flat
+# file. Journald enforces retention/size caps (see the shipped
+# pike-server.service.d/journald.conf drop-in) so logs cannot fill the disk.
+# View with: journalctl -u pike-server -f
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=pike-server
 
 # Security hardening

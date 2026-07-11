@@ -83,6 +83,23 @@ impl WebSocketTunnel {
     }
 }
 
+/// RAII guard that unregisters a WebSocket-transport client from the registry on drop,
+/// freeing its connection slot on EVERY exit path from the session (clean close, early
+/// `?` error, or panic unwind). Without this, any error after `register_client` would
+/// permanently leak the slot; because the connection cap keys on `clients.len()`, leaked
+/// slots would accumulate until all new connections (QUIC and WS) are refused — a remote
+/// DoS that would nullify the connection cap.
+struct RegisteredClientGuard {
+    registry: Arc<ClientRegistry>,
+    connection_id: Uuid,
+}
+
+impl Drop for RegisteredClientGuard {
+    fn drop(&mut self) {
+        self.registry.remove_client(&self.connection_id);
+    }
+}
+
 pub async fn handle_websocket(socket: WebSocket, registry: Arc<ClientRegistry>) {
     let mut tunnel = WebSocketTunnel::new(socket);
     if let Err(error) = run_session(&mut tunnel, registry).await {
@@ -124,7 +141,11 @@ async fn run_session(tunnel: &mut WebSocketTunnel, registry: Arc<ClientRegistry>
         return Ok(());
     }
 
-    if registry.abuse_detector.is_banned(&api_key) {
+    // Fix #8: bans are stored by user_id, but this path only has the api key. Consult
+    // both the revoked-api-key set (populated when a user is banned/killed, which
+    // unifies the identifier spaces for live sessions) and the api-key-space ban check.
+    // The QUIC path additionally resolves api_key -> user_id and checks is_banned there.
+    if !registry.is_api_key_allowed(&api_key) || registry.abuse_detector.is_banned(&api_key) {
         let failure = ControlMessage::LoginFailure {
             reason: "user is banned".to_string(),
         };
@@ -140,7 +161,29 @@ async fn run_session(tunnel: &mut WebSocketTunnel, registry: Arc<ClientRegistry>
     client.transition_to(ConnectionState::Handshaking)?;
     client.authenticate(&api_key, false)?;
     client.activate()?;
-    registry.register_client(client).ok();
+    // Enforce the connection cap here too (this WS fallback transport shares the same
+    // registry). On rejection, tell the client and return WITHOUT registering, so the
+    // disconnect cleanup below never runs for an unregistered connection.
+    if let Err(error) = registry.register_client(client) {
+        tracing::warn!(%connection_id, error = %error, "refusing WS connection: at max_connections");
+        crate::metrics::CONNECTION_LIMIT_REJECTIONS.inc();
+        let failure = ControlMessage::LoginFailure {
+            reason: "server at capacity".to_string(),
+        };
+        let frame = encode_postcard_frame(&failure)?;
+        tunnel
+            .send_multiplexed_frame(CONTROL_STREAM_ID, &frame)
+            .await?;
+        return Ok(());
+    }
+
+    // The slot is now held. From here on, EVERY exit path (error via `?`, panic, or the
+    // clean loop exit) must free it — so bind an RAII guard rather than relying on the
+    // single happy-path `remove_client` call that previously leaked on any early error.
+    let _client_guard = RegisteredClientGuard {
+        registry: Arc::clone(&registry),
+        connection_id,
+    };
 
     let success = ControlMessage::LoginSuccess {
         session_id: format!("ws-session-{}", now_unix_secs()),
@@ -170,7 +213,7 @@ async fn run_session(tunnel: &mut WebSocketTunnel, registry: Arc<ClientRegistry>
         tunnel.route_stream_frame(current_stream, data).await?;
     }
 
-    registry.remove_client(&connection_id);
+    // `_client_guard` frees the connection slot on drop (here and on every early return).
     Ok(())
 }
 
@@ -251,8 +294,52 @@ mod tests {
     use pike_core::proto::ControlMessage;
     use tokio::sync::mpsc;
 
-    use super::{decode_postcard_frame, encode_postcard_frame, handle_control_message};
+    use std::sync::Arc;
+
+    use super::{decode_postcard_frame, encode_postcard_frame, handle_control_message, RegisteredClientGuard};
+    use uuid::Uuid;
+    use crate::config::AbuseConfig;
+    use crate::connection::{ClientConnection, ConnectionState};
+    use crate::registry::ClientRegistry;
     use crate::transport::{decode_multiplexed_frame, encode_multiplexed_frame};
+
+    fn register_activated_client(registry: &ClientRegistry, id: u128) -> Uuid {
+        let connection_id = Uuid::from_u128(id);
+        let mut client = ClientConnection::new(connection_id, None);
+        client.state = ConnectionState::Authenticated;
+        registry
+            .register_client(client)
+            .expect("registration within limit");
+        connection_id
+    }
+
+    #[test]
+    fn ws_session_guard_frees_slot_on_drop_and_avoids_cap_exhaustion() {
+        // Cap of 2. Simulate many WS sessions that register then exit via error (drop).
+        let registry = Arc::new(ClientRegistry::with_limits(AbuseConfig::default(), 2, 10));
+
+        for i in 0..10u128 {
+            let connection_id = register_activated_client(&registry, i);
+            assert_eq!(registry.clients.len(), 1, "one live client while session runs");
+            {
+                let _guard = RegisteredClientGuard {
+                    registry: Arc::clone(&registry),
+                    connection_id,
+                };
+                // guard drops here, mirroring the session returning (Ok or Err)
+            }
+            assert_eq!(
+                registry.clients.len(),
+                0,
+                "slot must be freed on session exit (drop), iteration {i}"
+            );
+        }
+
+        // Cap is not exhausted after 10 errored sessions: two fresh clients still register.
+        register_activated_client(&registry, 100);
+        register_activated_client(&registry, 101);
+        assert_eq!(registry.clients.len(), 2);
+    }
 
     #[test]
     fn control_message_framing_roundtrip() -> Result<()> {

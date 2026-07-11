@@ -61,6 +61,9 @@ async fn start_test_server_custom(
         dev_mode,
         TrafficInspectionConfig::default(),
         "pike.life".to_string(),
+        std::time::Duration::from_secs(30),
+        100 * 1024 * 1024,
+        false,
         shutdown_rx,
     ));
 

@@ -454,18 +454,37 @@ impl HttpTunnel {
         let mut cursor = 0;
 
         loop {
-            let line_end = find_crlf(&payload[cursor..])
+            // All indices and arithmetic are bounds-/overflow-checked so a malformed chunked
+            // body returns a decode error instead of panicking (matches the relay-side hardening).
+            let rest = payload
+                .get(cursor..)
                 .ok_or_else(|| anyhow!("invalid upstream chunk framing"))?;
-            let line = std::str::from_utf8(&payload[cursor..cursor + line_end])?;
+            let line_end =
+                find_crlf(rest).ok_or_else(|| anyhow!("invalid upstream chunk framing"))?;
+            let line_bytes = rest
+                .get(..line_end)
+                .ok_or_else(|| anyhow!("invalid upstream chunk framing"))?;
+            let line = std::str::from_utf8(line_bytes)?;
             let size_text = line.split(';').next().unwrap_or("").trim();
             let size = usize::from_str_radix(size_text, 16)?;
-            cursor += line_end + 2;
+            cursor = cursor
+                .checked_add(line_end)
+                .and_then(|c| c.checked_add(2))
+                .filter(|c| *c <= payload.len())
+                .ok_or_else(|| anyhow!("invalid upstream chunk framing"))?;
 
             if size == 0 {
                 loop {
-                    let trailer_end = find_crlf(&payload[cursor..])
+                    let rest = payload
+                        .get(cursor..)
                         .ok_or_else(|| anyhow!("invalid upstream trailer framing"))?;
-                    cursor += trailer_end + 2;
+                    let trailer_end = find_crlf(rest)
+                        .ok_or_else(|| anyhow!("invalid upstream trailer framing"))?;
+                    cursor = cursor
+                        .checked_add(trailer_end)
+                        .and_then(|c| c.checked_add(2))
+                        .filter(|c| *c <= payload.len())
+                        .ok_or_else(|| anyhow!("invalid upstream trailer framing"))?;
                     if trailer_end == 0 {
                         return Ok((decoded, cursor));
                     }
@@ -475,14 +494,23 @@ impl HttpTunnel {
             let chunk_end = cursor
                 .checked_add(size)
                 .ok_or_else(|| anyhow!("upstream chunk length overflow"))?;
-            if chunk_end + 2 > payload.len() {
+            let terminator_end = chunk_end
+                .checked_add(2)
+                .ok_or_else(|| anyhow!("upstream chunk length overflow"))?;
+            if terminator_end > payload.len() {
                 bail!("upstream chunk shorter than declared size");
             }
-            decoded.extend_from_slice(&payload[cursor..chunk_end]);
-            if &payload[chunk_end..chunk_end + 2] != b"\r\n" {
+            let chunk = payload
+                .get(cursor..chunk_end)
+                .ok_or_else(|| anyhow!("upstream chunk shorter than declared size"))?;
+            decoded.extend_from_slice(chunk);
+            let terminator = payload
+                .get(chunk_end..terminator_end)
+                .ok_or_else(|| anyhow!("invalid upstream chunk terminator"))?;
+            if terminator != b"\r\n" {
                 bail!("invalid upstream chunk terminator");
             }
-            cursor = chunk_end + 2;
+            cursor = terminator_end;
         }
     }
 

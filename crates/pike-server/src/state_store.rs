@@ -43,6 +43,10 @@ pub trait StateStore: Send + Sync {
     async fn is_banned(&self, user_id: &str) -> Result<bool>;
     async fn ban_user(&self, user_id: &str, reason: &str, duration_secs: u64) -> Result<()>;
     async fn unban_user(&self, user_id: &str) -> Result<()>;
+    async fn is_tunnel_suspended(&self, tunnel_id: &str) -> Result<bool>;
+    async fn suspend_tunnel(&self, tunnel_id: &str, reason: &str, duration_secs: u64)
+        -> Result<()>;
+    async fn unsuspend_tunnel(&self, tunnel_id: &str) -> Result<()>;
     async fn log_abuse(&self, entry: &AbuseLogEntry) -> Result<()>;
     async fn get_abuse_logs(&self, limit: usize) -> Result<Vec<AbuseLogEntry>>;
     async fn append_request_log(&self, entry: &RequestLogEntry, max_entries: usize) -> Result<()>;
@@ -79,6 +83,7 @@ struct BanEntry {
 pub struct InMemoryStateStore {
     counters: DashMap<String, u64>,
     bans: DashMap<String, BanEntry>,
+    suspensions: DashMap<String, BanEntry>,
     abuse_logs: Arc<Mutex<VecDeque<AbuseLogEntry>>>,
     request_logs: Arc<Mutex<HashMap<String, VecDeque<RequestLogEntry>>>>,
     tunnel_metrics: Arc<Mutex<HashMap<String, PersistedTunnelMetrics>>>,
@@ -90,6 +95,7 @@ impl InMemoryStateStore {
         Self {
             counters: DashMap::new(),
             bans: DashMap::new(),
+            suspensions: DashMap::new(),
             abuse_logs: Arc::new(Mutex::new(VecDeque::new())),
             request_logs: Arc::new(Mutex::new(HashMap::new())),
             tunnel_metrics: Arc::new(Mutex::new(HashMap::new())),
@@ -200,6 +206,50 @@ impl StateStore for InMemoryStateStore {
 
     async fn unban_user(&self, user_id: &str) -> Result<()> {
         self.bans.remove(user_id);
+        Ok(())
+    }
+
+    async fn is_tunnel_suspended(&self, tunnel_id: &str) -> Result<bool> {
+        let Some(entry) = self.suspensions.get(tunnel_id) else {
+            return Ok(false);
+        };
+
+        if entry
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= Instant::now())
+        {
+            drop(entry);
+            self.suspensions.remove(tunnel_id);
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    async fn suspend_tunnel(
+        &self,
+        tunnel_id: &str,
+        reason: &str,
+        duration_secs: u64,
+    ) -> Result<()> {
+        let expires_at = if duration_secs == 0 {
+            None
+        } else {
+            Some(Instant::now() + std::time::Duration::from_secs(duration_secs))
+        };
+
+        self.suspensions.insert(
+            tunnel_id.to_string(),
+            BanEntry {
+                reason: reason.to_string(),
+                expires_at,
+            },
+        );
+        Ok(())
+    }
+
+    async fn unsuspend_tunnel(&self, tunnel_id: &str) -> Result<()> {
+        self.suspensions.remove(tunnel_id);
         Ok(())
     }
 
@@ -361,6 +411,10 @@ impl RedisStateStore {
         format!("user:ban:{user_id}")
     }
 
+    fn suspend_key(tunnel_id: &str) -> String {
+        format!("tunnel:suspended:{tunnel_id}")
+    }
+
     fn request_log_key(tunnel_id: &str) -> String {
         format!("request_logs:{tunnel_id}")
     }
@@ -505,6 +559,51 @@ impl StateStore for RedisStateStore {
         conn.del::<_, ()>(Self::ban_key(user_id))
             .await
             .context("failed to remove ban from Redis")?;
+        Ok(())
+    }
+
+    async fn is_tunnel_suspended(&self, tunnel_id: &str) -> Result<bool> {
+        let mut conn = self.get_conn().await?;
+        let exists = conn
+            .exists::<_, bool>(Self::suspend_key(tunnel_id))
+            .await
+            .context("failed to check tunnel suspension in Redis")?;
+        Ok(exists)
+    }
+
+    async fn suspend_tunnel(
+        &self,
+        tunnel_id: &str,
+        reason: &str,
+        duration_secs: u64,
+    ) -> Result<()> {
+        let mut conn = self.get_conn().await?;
+        let key = Self::suspend_key(tunnel_id);
+        if duration_secs == 0 {
+            redis::cmd("SET")
+                .arg(key)
+                .arg(reason)
+                .query_async::<()>(&mut conn)
+                .await
+                .context("failed to write tunnel suspension to Redis")?;
+        } else {
+            redis::cmd("SET")
+                .arg(key)
+                .arg(reason)
+                .arg("EX")
+                .arg(duration_secs)
+                .query_async::<()>(&mut conn)
+                .await
+                .context("failed to write tunnel suspension to Redis")?;
+        }
+        Ok(())
+    }
+
+    async fn unsuspend_tunnel(&self, tunnel_id: &str) -> Result<()> {
+        let mut conn = self.get_conn().await?;
+        conn.del::<_, ()>(Self::suspend_key(tunnel_id))
+            .await
+            .context("failed to remove tunnel suspension from Redis")?;
         Ok(())
     }
 
@@ -922,6 +1021,47 @@ impl StateStore for FallbackStateStore {
             Err(err) => {
                 warn!("Redis unavailable, using in-memory fallback: {err}");
                 self.fallback.unban_user(user_id).await
+            }
+        }
+    }
+
+    async fn is_tunnel_suspended(&self, tunnel_id: &str) -> Result<bool> {
+        match self.primary.is_tunnel_suspended(tunnel_id).await {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                warn!("Redis unavailable, using in-memory fallback: {err}");
+                self.fallback.is_tunnel_suspended(tunnel_id).await
+            }
+        }
+    }
+
+    async fn suspend_tunnel(
+        &self,
+        tunnel_id: &str,
+        reason: &str,
+        duration_secs: u64,
+    ) -> Result<()> {
+        match self
+            .primary
+            .suspend_tunnel(tunnel_id, reason, duration_secs)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                warn!("Redis unavailable, using in-memory fallback: {err}");
+                self.fallback
+                    .suspend_tunnel(tunnel_id, reason, duration_secs)
+                    .await
+            }
+        }
+    }
+
+    async fn unsuspend_tunnel(&self, tunnel_id: &str) -> Result<()> {
+        match self.primary.unsuspend_tunnel(tunnel_id).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                warn!("Redis unavailable, using in-memory fallback: {err}");
+                self.fallback.unsuspend_tunnel(tunnel_id).await
             }
         }
     }

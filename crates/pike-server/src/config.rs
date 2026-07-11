@@ -16,15 +16,32 @@ const DEFAULT_MANAGEMENT_BIND_ADDR: &str = "127.0.0.1:9090";
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 45;
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_INTERNAL_TOKEN: &str = "pike-internal-token";
+/// Placeholder API key shipped in `deploy/server-vps.toml`; must be replaced before
+/// a production start (see fix #11).
+const PLACEHOLDER_LOCAL_API_KEY: &str = "pk_self_hosted_replace_me";
 const DEFAULT_TUNNEL_CREATIONS_PER_USER_PER_HOUR: u32 = 5;
 const DEFAULT_TUNNEL_CREATIONS_PER_IP_PER_HOUR: u32 = 20;
 const DEFAULT_AUTO_SUSPEND_REQUESTS_PER_MINUTE: u64 = 1_000;
 const DEFAULT_PHISHING_ERROR_RATE_PERCENT: u64 = 90;
 const DEFAULT_ABUSE_LOG_RETENTION_DAYS: i64 = 90;
-const DEFAULT_CAPTURE_HEADERS: bool = true;
+// Privacy: capture is OFF by default so the relay honors the "we do not collect the
+// content of tunneled traffic" promise. Operators must explicitly opt in via config,
+// and even then query-string values and sensitive headers are redacted (fix #17).
+const DEFAULT_CAPTURE_HEADERS: bool = false;
 const DEFAULT_CAPTURE_BODIES: bool = false;
 const DEFAULT_MAX_BODY_PREVIEW_BYTES: usize = 64 * 1024;
 const DEFAULT_DEPLOYMENT_TOPOLOGY: &str = "single-node";
+/// End-to-end timeout for a single inbound proxied HTTP request (slow-loris / hung-upstream
+/// protection). Applied to the whole request-body read + upstream round-trip + response-body
+/// read; WebSocket upgrades are exempt (long-lived by design).
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Maximum buffered request/response body size, both directions. Bodies larger than this are
+/// rejected with 413 instead of being buffered into memory (OOM protection).
+const DEFAULT_MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
+/// When false (default), the enforced per-IP identity is the real connection peer IP and any
+/// client-supplied `X-Forwarded-For` is ignored (non-spoofable). Set true ONLY when the relay
+/// sits behind Cloudflare, in which case the validated `CF-Connecting-IP` header is trusted.
+const DEFAULT_TRUST_CLOUDFLARE: bool = false;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -48,6 +65,14 @@ pub struct ServerConfig {
     pub domain: String,
     pub max_connections: usize,
     pub max_tunnels_per_connection: usize,
+    /// End-to-end inbound request timeout in seconds (fix: no inbound request timeout).
+    pub request_timeout_secs: u64,
+    /// Maximum buffered body size in bytes, both directions (fix: uncapped body buffering).
+    pub max_body_size: usize,
+    /// Trust Cloudflare's `CF-Connecting-IP` for per-IP limiting (fix: XFF-spoofable IP).
+    pub trust_cloudflare: bool,
+    /// Sentry DSN for error monitoring; `None`/empty disables Sentry entirely (fix #6).
+    pub sentry_dsn: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +83,9 @@ pub struct AbuseConfig {
     pub phishing_error_rate_percent: u64,
     pub abuse_log_retention_days: i64,
     pub webhook_url: Option<String>,
+    /// Mirrors the top-level `require_redis`. When true, a failed ban-status lookup
+    /// against the state store is logged loudly (fix #9) rather than silently ignored.
+    pub require_redis: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +118,7 @@ impl Default for AbuseConfig {
             phishing_error_rate_percent: DEFAULT_PHISHING_ERROR_RATE_PERCENT,
             abuse_log_retention_days: DEFAULT_ABUSE_LOG_RETENTION_DAYS,
             webhook_url: None,
+            require_redis: false,
         }
     }
 }
@@ -134,6 +163,10 @@ struct FileConfig {
     deployment_topology: Option<String>,
     max_connections: Option<usize>,
     max_tunnels_per_connection: Option<usize>,
+    request_timeout_secs: Option<u64>,
+    max_body_size: Option<usize>,
+    trust_cloudflare: Option<bool>,
+    sentry_dsn: Option<String>,
     quic: Option<QuicConfigFile>,
     abuse: Option<AbuseConfigFile>,
     traffic_inspection: Option<TrafficInspectionConfigFile>,
@@ -222,14 +255,15 @@ impl ServerConfig {
         let control_plane_url = parsed.control_plane_url;
         let local_api_keys = parsed.local_api_keys;
         let deployment_topology = parse_deployment_topology(parsed.deployment_topology.as_deref())?;
-        let require_redis = parsed.require_redis.unwrap_or(false);
+        // Fail-safe default (fix #16): in production mode require_redis defaults to `true`
+        // so a misconfigured instance refuses to silently fall back to in-memory state
+        // (which resets bandwidth/ban counters on restart). Operators who genuinely want
+        // in-memory state in production must set `require_redis = false` explicitly.
+        // Dev mode keeps the permissive default of `false`.
+        let require_redis = parsed.require_redis.unwrap_or(!dev_mode);
 
         if !dev_mode && control_plane_url.is_none() && local_api_keys.is_none() {
             anyhow::bail!("production mode requires either control_plane_url or local_api_keys");
-        }
-
-        if require_redis && parsed.redis_url.is_none() {
-            anyhow::bail!("require_redis = true requires redis_url to be configured");
         }
 
         let internal_token = parsed
@@ -244,11 +278,45 @@ impl ServerConfig {
             })
             .context("internal_token is required when not running in --dev-mode")?;
 
-        if !dev_mode && internal_token == DEFAULT_INTERNAL_TOKEN {
+        if !dev_mode && (internal_token == DEFAULT_INTERNAL_TOKEN || is_placeholder_secret(&internal_token))
+        {
             anyhow::bail!(
-                "internal_token cannot be the default value in production mode. \
+                "internal_token cannot be the default/placeholder value in production mode. \
                  Please set a custom internal_token in your config file."
             );
+        }
+
+        // Fix #11: refuse to start in production with placeholder/empty secrets that ship
+        // in deploy/server-vps.toml. These would otherwise silently authenticate anyone.
+        if !dev_mode {
+            if let Some(server_token) = parsed.server_token.as_deref() {
+                if server_token.trim().is_empty() || is_placeholder_secret(server_token) {
+                    anyhow::bail!(
+                        "server_token is empty or still set to a placeholder value in production \
+                         mode. Remove it (if you are not using a remote control plane) or set a \
+                         real secret."
+                    );
+                }
+            }
+
+            if let Some(local_keys) = local_api_keys.as_deref() {
+                if local_keys.iter().any(|key| {
+                    key.trim().is_empty()
+                        || key.trim() == PLACEHOLDER_LOCAL_API_KEY
+                        || is_placeholder_secret(key)
+                }) {
+                    anyhow::bail!(
+                        "local_api_keys still contains the shipped placeholder \
+                         ('{PLACEHOLDER_LOCAL_API_KEY}') or an empty/placeholder key in production \
+                         mode. Replace it with a real API key before starting."
+                    );
+                }
+            }
+        }
+
+        // Enforced after secret validation so misconfigured secrets surface first.
+        if require_redis && parsed.redis_url.is_none() {
+            anyhow::bail!("require_redis = true requires redis_url to be configured (require_redis defaults to true in production; set it to false explicitly to opt into in-memory state)");
         }
 
         Ok(Self {
@@ -273,12 +341,24 @@ impl ServerConfig {
             shutdown_timeout_secs: parsed
                 .shutdown_timeout_secs
                 .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
-            abuse: parse_abuse_config(parsed.abuse),
+            abuse: parse_abuse_config(parsed.abuse, require_redis),
             traffic_inspection: parse_traffic_inspection_config(parsed.traffic_inspection),
             deployment_topology,
             domain: parsed.domain.unwrap_or_else(|| "pike.life".to_string()),
             max_connections: parsed.max_connections.unwrap_or(1000),
             max_tunnels_per_connection: parsed.max_tunnels_per_connection.unwrap_or(10),
+            request_timeout_secs: parsed
+                .request_timeout_secs
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+            max_body_size: parsed.max_body_size.unwrap_or(DEFAULT_MAX_BODY_SIZE),
+            trust_cloudflare: parsed.trust_cloudflare.unwrap_or(DEFAULT_TRUST_CLOUDFLARE),
+            // Prefer the config file value, else fall back to the SENTRY_DSN env var. An empty
+            // string is normalized to None so Sentry stays a no-op when unset (fix #6).
+            sentry_dsn: parsed
+                .sentry_dsn
+                .or_else(|| std::env::var("SENTRY_DSN").ok())
+                .map(|dsn| dsn.trim().to_string())
+                .filter(|dsn| !dsn.is_empty()),
         })
     }
 }
@@ -343,10 +423,13 @@ fn generate_dev_tls_assets(cert_path: &Path, key_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn parse_abuse_config(parsed: Option<AbuseConfigFile>) -> AbuseConfig {
+fn parse_abuse_config(parsed: Option<AbuseConfigFile>, require_redis: bool) -> AbuseConfig {
     let defaults = AbuseConfig::default();
     let Some(parsed) = parsed else {
-        return defaults;
+        return AbuseConfig {
+            require_redis,
+            ..defaults
+        };
     };
 
     AbuseConfig {
@@ -366,6 +449,7 @@ fn parse_abuse_config(parsed: Option<AbuseConfigFile>) -> AbuseConfig {
             .abuse_log_retention_days
             .unwrap_or(defaults.abuse_log_retention_days),
         webhook_url: parsed.webhook_url,
+        require_redis,
     }
 }
 
@@ -394,6 +478,17 @@ fn parse_deployment_topology(parsed: Option<&str>) -> Result<DeploymentTopology>
             "unsupported deployment_topology: {normalized}; only \"single-node\" is supported until distributed tunnel routing is implemented"
         ),
     }
+}
+
+/// Returns true if `value` looks like a shipped placeholder secret that an operator
+/// forgot to replace (e.g. the `CHANGE_ME_*` / `*replace_me*` tokens in the deploy
+/// templates). Used to fail-closed on startup in production (fix #11).
+fn is_placeholder_secret(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.contains("change_me")
+        || normalized.contains("changeme")
+        || normalized.contains("replace_me")
+        || normalized.contains("replaceme")
 }
 
 fn parse_cc_algorithm(value: &str) -> Result<CongestionControlAlgorithm> {
@@ -430,6 +525,7 @@ http_bind_addr = "127.0.0.1:8080"
 management_bind_addr = "127.0.0.1:9090"
 internal_token = "dashboard-secret"
 control_plane_url = "https://cp.pike.life"
+require_redis = false
 heartbeat_timeout_secs = 50
 shutdown_timeout_secs = 33
 
@@ -455,7 +551,7 @@ enable_early_data = false
         assert_eq!(config.quic_config.idle_timeout_ms, 20_000);
         assert_eq!(config.quic_config.max_concurrent_streams, 128);
         assert!(!config.quic_config.enable_early_data);
-        assert!(config.traffic_inspection.capture_headers);
+        assert!(!config.traffic_inspection.capture_headers);
         assert!(!config.traffic_inspection.capture_bodies);
         assert_eq!(config.traffic_inspection.max_body_preview_bytes, 64 * 1024);
         assert_eq!(
@@ -509,6 +605,7 @@ internal_token = "custom-token"
 bind_addr = "127.0.0.1:7443"
 internal_token = "custom-token"
 local_api_keys = ["pk_test_abc123"]
+require_redis = false
 "#,
         );
 
@@ -551,7 +648,7 @@ internal_token = "pike-internal-token"
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("cannot be the default value"),
+            err_msg.contains("cannot be the default"),
             "expected error about default token, got: {err_msg}"
         );
 
@@ -565,6 +662,7 @@ internal_token = "pike-internal-token"
 bind_addr = "127.0.0.1:7443"
 control_plane_url = "https://cp.pike.life"
 internal_token = "my-custom-secret-token"
+require_redis = false
 "#,
         );
 
@@ -598,6 +696,7 @@ internal_token = "pike-internal-token"
 bind_addr = "127.0.0.1:7443"
 control_plane_url = "https://cp.pike.life"
 internal_token = "dashboard-secret"
+require_redis = false
 
 [traffic_inspection]
 capture_headers = false
@@ -621,6 +720,7 @@ max_body_preview_bytes = 2048
 bind_addr = "127.0.0.1:7443"
 control_plane_url = "https://cp.pike.life"
 internal_token = "dashboard-secret"
+require_redis = false
 deployment_topology = "single-node"
 "#,
         );
@@ -668,6 +768,78 @@ require_redis = true
         assert!(result.is_err());
         let err = result.expect_err("config should fail").to_string();
         assert!(err.contains("require_redis = true requires redis_url"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_placeholder_local_api_key_in_production() {
+        let path = write_temp_config(
+            r#"
+bind_addr = "127.0.0.1:7443"
+internal_token = "dashboard-secret"
+local_api_keys = ["pk_self_hosted_replace_me"]
+require_redis = false
+"#,
+        );
+
+        let result = ServerConfig::from_file(&path, false);
+        assert!(result.is_err());
+        let err = result.expect_err("config should fail").to_string();
+        assert!(err.contains("local_api_keys"), "unexpected error: {err}");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_placeholder_server_token_in_production() {
+        let path = write_temp_config(
+            r#"
+bind_addr = "127.0.0.1:7443"
+control_plane_url = "https://cp.pike.life"
+internal_token = "dashboard-secret"
+server_token = "CHANGE_ME_IF_USING_REMOTE_CONTROL_PLANE"
+require_redis = false
+"#,
+        );
+
+        let result = ServerConfig::from_file(&path, false);
+        assert!(result.is_err());
+        let err = result.expect_err("config should fail").to_string();
+        assert!(err.contains("server_token"), "unexpected error: {err}");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn require_redis_defaults_true_in_production() {
+        let path = write_temp_config(
+            r#"
+bind_addr = "127.0.0.1:7443"
+control_plane_url = "https://cp.pike.life"
+internal_token = "dashboard-secret"
+"#,
+        );
+
+        // No require_redis and no redis_url: production must refuse to start (fail-safe).
+        let result = ServerConfig::from_file(&path, false);
+        assert!(result.is_err());
+        let err = result.expect_err("config should fail").to_string();
+        assert!(err.contains("require_redis"), "unexpected error: {err}");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn dev_mode_require_redis_defaults_false() {
+        let path = write_temp_config(
+            r#"
+bind_addr = "127.0.0.1:7443"
+"#,
+        );
+
+        let config = ServerConfig::from_file(&path, true).expect("dev config should parse");
+        assert!(!config.require_redis);
 
         let _ = fs::remove_file(path);
     }

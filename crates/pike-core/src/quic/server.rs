@@ -13,6 +13,10 @@ use tracing::info;
 const SCRATCH_BUFFER_SIZE: usize = 64 * 1024;
 const CONTROL_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Default per-stream body buffering cap. A non-streaming request/response body is buffered
+/// in memory until the QUIC stream's `FIN`; without a cap a peer can stream an unbounded body
+/// and exhaust relay memory. Overridable via [`PikeTunnelApp::with_max_body_size`].
+const DEFAULT_MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -115,6 +119,9 @@ pub struct PikeTunnelApp {
     /// allowing subsequent outbound data to reuse the same QUIC stream.
     streaming_connections: HashMap<u64, u64>,
     last_keepalive: std::time::Instant,
+    /// Maximum bytes buffered for a single non-streaming stream body before the connection is
+    /// torn down (OOM protection).
+    max_body_size: usize,
 }
 
 impl PikeTunnelApp {
@@ -136,7 +143,17 @@ impl PikeTunnelApp {
             streaming_connections: HashMap::new(),
             session_id: None,
             last_keepalive: Instant::now(),
+            max_body_size: DEFAULT_MAX_BODY_SIZE,
         }
+    }
+
+    /// Override the per-stream body buffering cap (OOM protection). The relay wires this to
+    /// its configured `max_body_size` so the tunnel-protocol layer rejects oversized bodies
+    /// before they are fully materialized in memory.
+    #[must_use]
+    pub fn with_max_body_size(mut self, max_body_size: usize) -> Self {
+        self.max_body_size = max_body_size.max(1);
+        self
     }
 
     fn is_authenticated(&self) -> bool {
@@ -269,11 +286,21 @@ impl PikeTunnelApp {
         chunk: &[u8],
         fin: bool,
     ) -> Result<(), PikeError> {
+        let max_body_size = self.max_body_size;
         let stream = self
             .streams
             .entry(stream_id)
             .or_insert_with(|| StreamInfo::data(stream_id));
         stream.recv_buf.extend_from_slice(chunk);
+
+        // OOM protection: a non-streaming body is buffered until FIN. Reject once the buffer
+        // exceeds the configured cap instead of growing without bound. Streaming streams drain
+        // their buffer every chunk (below), so this only fires on genuinely oversized bodies.
+        if !stream.streaming && stream.recv_buf.len() > max_body_size {
+            return Err(PikeError::ProtocolError(format!(
+                "stream {stream_id} body exceeds max body size {max_body_size} bytes"
+            )));
+        }
 
         if !stream.header_received {
             // Extract only the first frame (the stream header).
@@ -737,5 +764,49 @@ mod tests {
         assert_eq!(inbound.payload, b"hello");
         assert!(inbound.fin);
         assert!(!inbound.streaming);
+    }
+
+    #[tokio::test]
+    async fn oversized_non_streaming_body_is_rejected() {
+        let (data_tx, _data_rx) = mpsc::channel(16);
+        let (_out_tx, out_rx) = mpsc::channel(16);
+        // Cap the body at a tiny size so a modest payload trips it.
+        let mut app = PikeTunnelApp::new(data_tx, out_rx).with_max_body_size(16);
+
+        let stream_id = 8;
+        // A single non-fin chunk larger than the cap must return an error, not buffer
+        // unboundedly and not panic.
+        let oversized = vec![0u8; 1024];
+        let result = app.process_data_chunk(stream_id, &oversized, false);
+        assert!(
+            result.is_err(),
+            "oversized non-streaming body should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_within_cap_is_accepted() {
+        let (data_tx, mut data_rx) = mpsc::channel(16);
+        let (_out_tx, out_rx) = mpsc::channel(16);
+        let mut app = PikeTunnelApp::new(data_tx, out_rx).with_max_body_size(1024 * 1024);
+
+        let tunnel_id = TunnelId::new();
+        let stream_id = 8;
+        let header = StreamHeader {
+            tunnel_id,
+            connection_id: 42,
+            source_addr: "10.1.1.3:50200".parse().expect("valid socket"),
+            streaming: false,
+        };
+        let mut header_bytes = encode_frame(&header).expect("encode header");
+        header_bytes.extend_from_slice(b"hello");
+
+        app.process_data_chunk(stream_id, &header_bytes, true)
+            .expect("body within cap should be accepted");
+        let inbound = data_rx.recv().await.expect("inbound data");
+        let PikeMessage::Data(inbound) = inbound else {
+            panic!("expected data message");
+        };
+        assert_eq!(inbound.payload, b"hello");
     }
 }

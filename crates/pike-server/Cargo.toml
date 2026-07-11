@@ -45,6 +45,10 @@ sha2 = "0.10"
 base64 = "0.22"
 futures-util = "0.3"
 http-body-util = "0.1"
+# Optional error monitoring (fix #6). Disabled at runtime unless SENTRY_DSN is set; uses the
+# rustls transport to avoid pulling in OpenSSL (the rest of the stack is rustls-based).
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry-tracing = "0.34"
 
 
 [dev-dependencies]

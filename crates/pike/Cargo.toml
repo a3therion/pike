@@ -24,6 +24,7 @@ colored = "2"
 indicatif = "0.17"
 dirs = "5"
 rand = "0.8"
+rpassword = "7"
 axum = { workspace = true }
 tower = { workspace = true }
 uuid = { workspace = true }

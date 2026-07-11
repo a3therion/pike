@@ -59,6 +59,38 @@ pub static RATE_LIMIT_REJECTIONS: LazyLock<Counter> = LazyLock::new(|| {
     .expect("register pike_rate_limit_rejections_total metric")
 });
 
+/// Incremented whenever an incoming connection is refused because the relay is already
+/// at `max_connections`. A rising value means the connection cap is actively shedding
+/// load (fix: connection limit was previously soft-tracking only → unbounded tasks).
+pub static CONNECTION_LIMIT_REJECTIONS: LazyLock<Counter> = LazyLock::new(|| {
+    prometheus::register_counter!(
+        "pike_connection_limit_rejections_total",
+        "Total number of connections refused because the relay is at max_connections"
+    )
+    .expect("register pike_connection_limit_rejections_total metric")
+});
+
+/// Incremented whenever a ban-status lookup against the state store fails, which
+/// degrades ban enforcement to the local cache (fix #9). A rising value means
+/// bans may not be enforced for users not already cached locally.
+pub static BAN_CHECK_ERRORS: LazyLock<Counter> = LazyLock::new(|| {
+    prometheus::register_counter!(
+        "pike_ban_check_errors_total",
+        "Total number of ban-status lookups that failed against the state store"
+    )
+    .expect("register pike_ban_check_errors_total metric")
+});
+
+/// Incremented when the periodic control-plane revalidation loop disconnects a
+/// connection because the user is now suspended/banned or the key is invalid.
+pub static REVALIDATION_DISCONNECTS: LazyLock<Counter> = LazyLock::new(|| {
+    prometheus::register_counter!(
+        "pike_revalidation_disconnects_total",
+        "Connections dropped by the periodic control-plane revalidation loop"
+    )
+    .expect("register pike_revalidation_disconnects_total metric")
+});
+
 /// Metrics HTTP handler that returns Prometheus-formatted metrics
 pub async fn metrics_handler() -> String {
     let encoder = TextEncoder::new();

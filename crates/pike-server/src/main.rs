@@ -24,7 +24,7 @@ use pike_core::types::{RelayInfo, SubdomainSpec, TunnelType};
 use pike_server::admin::run_admin_command;
 use pike_server::config::{CliArgs, ServerConfig};
 use pike_server::connection::{ClientConnection, ConnectionState, ValidatedUser};
-use pike_server::control_plane::{AuthCache, ControlPlaneClient};
+use pike_server::control_plane::{ApiKeyValidation, AuthCache, ControlPlaneClient};
 use pike_server::dashboard_ws::{DashboardBroadcaster, DashboardEvent};
 use pike_server::http::run_http_server;
 use pike_server::ingest::RequestBuffer;
@@ -46,15 +46,60 @@ use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificat
 use tokio_quiche::ConnectionParams;
 use tracing::{error, info, warn};
 
+/// Initialize Sentry when a non-empty DSN is provided. Returns `None` (a complete no-op)
+/// when `dsn` is `None`, so the relay builds and runs identically without `SENTRY_DSN`.
+///
+/// The `panic` feature installs a panic hook that reports panics; error-level tracing events
+/// are captured via the `sentry-tracing` layer wired in [`init_tracing`].
+fn init_sentry(dsn: Option<&str>) -> Option<sentry::ClientInitGuard> {
+    let dsn = dsn?;
+    if dsn.trim().is_empty() {
+        return None;
+    }
+    let guard = sentry::init((
+        dsn.to_string(),
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            // Report panics and error events; no performance tracing by default (minimal).
+            attach_stacktrace: true,
+            ..Default::default()
+        },
+    ));
+    Some(guard)
+}
+
+/// Build the tracing subscriber. When Sentry is enabled, an additional layer forwards
+/// error-level events to Sentry (and lower levels as breadcrumbs) via `sentry-tracing`.
+fn init_tracing(sentry_enabled: bool) {
+    use tracing_subscriber::prelude::*;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .compact();
+    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    if sentry_enabled {
+        registry.with(sentry_tracing::layer()).init();
+    } else {
+        registry.init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .compact()
-        .init();
-
     let args = CliArgs::parse();
     let config = ServerConfig::from_file(&args.config, args.dev_mode)?;
+
+    // Fix #6: initialize Sentry error monitoring ONLY when a DSN is configured. When unset
+    // this is a complete no-op — no network, no behavior change — and the guard is None. The
+    // guard must outlive the program, so it is bound here and held for all of `main`.
+    let sentry_guard = init_sentry(config.sentry_dsn.as_deref());
+    init_tracing(sentry_guard.is_some());
+    // Held for the lifetime of the process so buffered events flush on shutdown.
+    let _sentry_guard = sentry_guard;
+
     let state_store =
         build_rate_limit_store(config.redis_url.as_deref(), config.require_redis).await?;
 
@@ -71,6 +116,19 @@ async fn main() -> Result<()> {
 
     if config.dev_mode {
         warn!("Running in DEV MODE - no control plane");
+    }
+
+    if config.trust_cloudflare {
+        // We honor CF-Connecting-IP for per-IP rate limiting / bans. That header is only
+        // trustworthy if this relay's public port is firewalled to Cloudflare's edge IP
+        // ranges — otherwise an attacker connecting directly can spoof any client IP and
+        // defeat per-IP limiting and bans. This is enforced at the network layer (firewall),
+        // not in code, so surface it loudly at startup.
+        warn!(
+            "trust_cloudflare is ENABLED: CF-Connecting-IP is trusted for per-IP limiting. \
+             You MUST restrict the relay's inbound port to Cloudflare edge IP ranges at the \
+             firewall, or clients can spoof their IP and bypass per-IP rate limits and bans."
+        );
     }
 
     info!(
@@ -110,15 +168,43 @@ async fn main() -> Result<()> {
         usage_reporter.spawn_flush_loop(shutdown_rx.clone());
     }
 
+    // Build the control-plane client + auth cache once and share them between the
+    // accept loop and the periodic revalidation loop (fix #5).
+    let control_plane_http_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let control_plane = Arc::new(ControlPlaneClient::new(
+        control_plane_http_client,
+        config.control_plane_url.clone().unwrap_or_default(),
+        config
+            .workers_api_url
+            .clone()
+            .or_else(|| config.control_plane_url.clone())
+            .unwrap_or_default(),
+        config.dev_mode,
+        config.local_api_keys.clone(),
+    ));
+    let auth_cache = AuthCache::new(Duration::from_secs(300));
+
     let accept_loop = spawn_accept_loop(
         registry.clone(),
         vhost_router.clone(),
         broadcaster.clone(),
         tunnel_metrics_store.clone(),
+        control_plane.clone(),
+        auth_cache.clone(),
         config.clone(),
         shutdown_rx.clone(),
     )
     .await?;
+    let revalidation_loop = spawn_revalidation_loop(
+        registry.clone(),
+        vhost_router.clone(),
+        control_plane.clone(),
+        auth_cache.clone(),
+        config.clone(),
+        shutdown_rx.clone(),
+    );
     let heartbeat_loop = spawn_half_open_monitor(
         registry.clone(),
         vhost_router.clone(),
@@ -158,6 +244,7 @@ async fn main() -> Result<()> {
     let _ = heartbeat_loop.await;
     let _ = http_loop.await;
     let _ = management_loop.await;
+    let _ = revalidation_loop.await;
     let _ = accept_loop.await;
 
     info!("shutdown complete");
@@ -250,6 +337,9 @@ fn spawn_http_loop(
             config.dev_mode,
             config.traffic_inspection.clone(),
             config.domain.clone(),
+            std::time::Duration::from_secs(config.request_timeout_secs),
+            config.max_body_size,
+            config.trust_cloudflare,
             shutdown_rx,
         )
         .await
@@ -282,30 +372,17 @@ fn spawn_management_loop(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_accept_loop(
     registry: Arc<ClientRegistry>,
     vhost_router: Arc<VhostRouter>,
     broadcaster: Arc<DashboardBroadcaster>,
     tunnel_metrics_store: Arc<TunnelMetricsStore>,
+    control_plane: Arc<ControlPlaneClient>,
+    auth_cache: Arc<AuthCache>,
     config: ServerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let http_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let control_plane = Arc::new(ControlPlaneClient::new(
-        http_client,
-        config.control_plane_url.clone().unwrap_or_default(),
-        config
-            .workers_api_url
-            .clone()
-            .or_else(|| config.control_plane_url.clone())
-            .unwrap_or_default(),
-        config.dev_mode,
-        config.local_api_keys.clone(),
-    ));
-    let auth_cache = AuthCache::new(Duration::from_secs(300));
-
     let socket = tokio::net::UdpSocket::bind(config.bind_addr)
         .await
         .with_context(|| format!("failed to bind QUIC socket on {}", config.bind_addr))?;
@@ -376,7 +453,23 @@ async fn spawn_accept_loop(
                                 continue;
                             }
 
-                            registry.register_client(client).ok();
+                            // Enforce the connection cap BEFORE spawning any per-connection
+                            // tasks. Previously the Result was discarded, so `max_connections`
+                            // was soft-tracking only and a flood of QUIC connections could spawn
+                            // unbounded tasks (reachable DoS). On rejection we warn, count it, and
+                            // drop `conn` (closing it) without registering — so the disconnect
+                            // path never runs for an unregistered client and the gauge stays
+                            // balanced.
+                            if let Err(error) = registry.register_client(client) {
+                                warn!(
+                                    %connection_id,
+                                    error = %error,
+                                    "refusing QUIC connection: at max_connections"
+                                );
+                                pike_server::metrics::CONNECTION_LIMIT_REJECTIONS.inc();
+                                drop(conn);
+                                continue;
+                            }
 
                             let registry_for_conn = registry.clone();
                             let vhost_router_for_conn = vhost_router.clone();
@@ -389,7 +482,8 @@ async fn spawn_accept_loop(
                             tokio::spawn(async move {
                                 let (data_tx, mut data_rx) = mpsc::channel(256);
                                 let (outbound_tx, outbound_rx) = mpsc::channel(256);
-                                let app = PikeTunnelApp::new(data_tx, outbound_rx);
+                                let app = PikeTunnelApp::new(data_tx, outbound_rx)
+                                    .with_max_body_size(server_config.max_body_size);
                                 conn.start(app);
                                 let pending_http = Arc::new(Mutex::new(HashMap::<
                                     u64,
@@ -453,14 +547,21 @@ async fn spawn_accept_loop(
                                                             };
                                                             info!(subdomain = %subdomain, "Registering tunnel with subdomain");
 
-                                                            if matches!(&config.tunnel_type, TunnelType::Http { .. }) {
+                                                            // Fix #2: register EVERY tunnel type with the control plane (not
+                                                            // just HTTP) so tunnel-count limits are durably enforced in D1 and
+                                                            // TCP tunnels are visible/suspendable, not just tracked in memory.
+                                                            {
+                                                                let tunnel_type_str = match &config.tunnel_type {
+                                                                    TunnelType::Http { .. } => "http",
+                                                                    TunnelType::Tcp { .. } => "tcp",
+                                                                };
                                                                 let requested_subdomain =
                                                                     subdomain.trim_end_matches(&format!(".{}", server_config.domain));
                                                                 if let Err(error) = control_plane_for_conn
                                                                     .register_tunnel(
                                                                         &api_key,
                                                                         requested_subdomain,
-                                                                        "http",
+                                                                        tunnel_type_str,
                                                                     )
                                                                     .await
                                                                 {
@@ -504,6 +605,15 @@ async fn spawn_accept_loop(
                                                             }
                                                             info!("Tunnel registered in registry");
 
+                                                            // Reconcile this tunnel's suspension state from the durable store
+                                                            // once, at registration (off the request hot path). This is what
+                                                            // lets `is_suspended` stay a non-blocking in-memory check while
+                                                            // still honoring a suspension persisted by a previous run.
+                                                            registry_for_conn
+                                                                .abuse_detector
+                                                                .refresh_tunnel_suspension(tunnel_id)
+                                                                .await;
+
                                                             if let Some(user_id) = registry_for_conn
                                                                 .user_id_for_connection(&connection_id)
                                                             {
@@ -533,6 +643,7 @@ async fn spawn_accept_loop(
                                                                 let pending_http = pending_http.clone();
                                                                 let ws_relays = ws_relays.clone();
                                                                 let tunnel_metrics_store = tunnel_metrics_store_for_conn.clone();
+                                                                let registry_ws_forwarder = registry_for_conn.clone();
                                                                 http_forwarders.push(tokio::spawn(async move {
                                                                     while let Some(tunnel_req) = http_rx.recv().await {
                                                                         match tunnel_req {
@@ -579,6 +690,7 @@ async fn spawn_accept_loop(
                                                                                     outbound_tx.clone(),
                                                                                     ws_relays.clone(),
                                                                                     tunnel_metrics_store.clone(),
+                                                                                    registry_ws_forwarder.clone(),
                                                                                 )
                                                                                 .await;
                                                                             }
@@ -651,6 +763,25 @@ async fn spawn_accept_loop(
 
                                                             match auth_result {
                                                                 Ok(user) => {
+                                                                    // Fix #6d/#8: the primary QUIC login path previously never
+                                                                    // checked bans. Reject revoked keys, banned users (by
+                                                                    // user_id, the identifier bans are stored under), and
+                                                                    // control-plane-suspended accounts here.
+                                                                    if !registry_for_conn.is_api_key_allowed(&api_key)
+                                                                        || registry_for_conn
+                                                                            .abuse_detector
+                                                                            .is_banned(&user.user_id)
+                                                                        || !user.status.is_active()
+                                                                    {
+                                                                        warn!(connection_id = %connection_id, user_id = %user.user_id, "login rejected: user banned/suspended or api key revoked");
+                                                                        let _ = outbound_tx
+                                                                            .send(PikeOutboundMessage::Control(ControlMessage::LoginFailure {
+                                                                                reason: "account suspended or banned".to_string(),
+                                                                            }))
+                                                                            .await;
+                                                                        continue;
+                                                                    }
+
                                                                     auth_cache_for_conn.insert(&api_key, user.clone());
 
                                                                     if let Some(mut client) =
@@ -700,6 +831,7 @@ async fn spawn_accept_loop(
                                                             data,
                                                             ws_relays.clone(),
                                                             tunnel_metrics_store_for_conn.clone(),
+                                                            registry_for_conn.clone(),
                                                         )
                                                         .await;
                                                     } else if let Some(response_tx) =
@@ -849,6 +981,125 @@ fn spawn_half_open_monitor(
     })
 }
 
+/// Periodically re-query the control plane for each live connection's current plan,
+/// limits, and status (fix #5). This closes the gap where the relay snapshotted the
+/// plan at registration and only checked ban/plan at login (cached ~300s): a
+/// suspended/banned user or downgraded plan now takes effect within one poll interval
+/// instead of persisting for the life of the connection.
+fn spawn_revalidation_loop(
+    registry: Arc<ClientRegistry>,
+    vhost_router: Arc<VhostRouter>,
+    control_plane: Arc<ControlPlaneClient>,
+    auth_cache: Arc<AuthCache>,
+    config: ServerConfig,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if config.dev_mode {
+            info!("revalidation loop disabled in dev mode");
+            return;
+        }
+        // Every 45s: within the auth-cache TTL window so revocations take effect promptly.
+        let interval = Duration::from_secs(45);
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() && *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(interval) => {
+                    revalidate_connections(&registry, &vhost_router, &control_plane, &auth_cache).await;
+                }
+            }
+        }
+        info!("revalidation loop stopped");
+    })
+}
+
+async fn revalidate_connections(
+    registry: &Arc<ClientRegistry>,
+    vhost_router: &Arc<VhostRouter>,
+    control_plane: &Arc<ControlPlaneClient>,
+    auth_cache: &Arc<AuthCache>,
+) {
+    // Group live connections by api key so each key is validated once per pass.
+    let mut by_key: HashMap<String, Vec<uuid::Uuid>> = HashMap::new();
+    for entry in &registry.clients {
+        if let Some(api_key) = entry.info.api_key.clone() {
+            by_key.entry(api_key).or_default().push(*entry.key());
+        }
+    }
+
+    for (api_key, conn_ids) in by_key {
+        match control_plane.validate_api_key_status(&api_key).await {
+            ApiKeyValidation::Unavailable(error) => {
+                // Transient control-plane failure (network/timeout/5xx). Do NOTHING this
+                // pass: leave the live connections intact. Acting here would let a
+                // momentary blip disconnect every connected user; previously it also
+                // added the key to the permanent revoked set, permanently bricking every
+                // key until a relay restart. The QUIC login path re-validates on any
+                // future reconnect, so a genuinely-bad key is still caught there.
+                warn!(error = %error, "revalidation: control plane unavailable; leaving connections intact this pass");
+            }
+            ApiKeyValidation::Invalid => {
+                // Definitive negative: the key/user is genuinely invalid. Disconnect the
+                // live sessions. We do NOT add to the permanent revoked set — the login
+                // path's own validation rejects any reconnect, and not touching the
+                // revoked set means a later false-positive can never persist.
+                warn!("revalidation: api key no longer valid; disconnecting");
+                disconnect_connections(registry, vhost_router, &conn_ids);
+                pike_server::metrics::REVALIDATION_DISCONNECTS.inc();
+            }
+            ApiKeyValidation::Valid(user) => {
+                let user = *user;
+                let banned = registry.abuse_detector.is_banned(&user.user_id);
+                if !user.status.is_active() || banned {
+                    warn!(user_id = %user.user_id, banned, "revalidation: user suspended/banned; disconnecting");
+                    disconnect_connections(registry, vhost_router, &conn_ids);
+                    pike_server::metrics::REVALIDATION_DISCONNECTS.inc();
+                    continue;
+                }
+
+                // Refresh the stored plan ceilings and per-user limit overrides.
+                let max_tunnels = registry.rate_limiter.update_user_plan(
+                    &user.user_id,
+                    Some(&user.plan),
+                    &user.limits,
+                );
+
+                // Refresh the cached validated user (plan/status/limits) on each conn.
+                for conn_id in &conn_ids {
+                    if let Some(mut client) = registry.clients.get_mut(conn_id) {
+                        client.set_validated_user(user.clone());
+                    }
+                }
+                auth_cache.insert(&api_key, user.clone());
+
+                // Tear down tunnels beyond the (possibly reduced) plan cap.
+                if let Some(max_tunnels) = max_tunnels {
+                    let removed = registry.enforce_tunnel_cap(&user.user_id, max_tunnels);
+                    for (subdomain, conn_id) in removed {
+                        warn!(user_id = %user.user_id, subdomain = %subdomain, "revalidation: tearing down tunnel over new plan cap");
+                        vhost_router.unregister_if_owner(&subdomain, &conn_id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn disconnect_connections(
+    registry: &Arc<ClientRegistry>,
+    vhost_router: &Arc<VhostRouter>,
+    conn_ids: &[uuid::Uuid],
+) {
+    for conn_id in conn_ids {
+        vhost_router.unregister_by_connection_id(conn_id);
+        registry.remove_client(conn_id);
+    }
+}
+
 fn spawn_signal_handler(shutdown_tx: watch::Sender<bool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         #[cfg(unix)]
@@ -893,6 +1144,7 @@ async fn handle_websocket_tunnel_request(
     outbound_tx: mpsc::Sender<PikeOutboundMessage>,
     ws_relays: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
     tunnel_metrics_store: Arc<TunnelMetricsStore>,
+    registry: Arc<ClientRegistry>,
 ) {
     let WebSocketRequest {
         stream_header,
@@ -937,6 +1189,8 @@ async fn handle_websocket_tunnel_request(
     let ws_relays_cleanup = ws_relays.clone();
     let tunnel_metrics_store_ws = tunnel_metrics_store.clone();
     let tunnel_id_for_ws = tunnel_id_string.clone();
+    let registry_ws = registry.clone();
+    let ws_tunnel_id = stream_header.tunnel_id;
 
     tokio::spawn(async move {
         while let Some(bytes) = ws_to_quic_rx.recv().await {
@@ -947,6 +1201,9 @@ async fn handle_websocket_tunnel_request(
             let frame_stats = pike_server::ws_proxy::websocket_frame_stats(&bytes);
             let frames = frame_stats.frames.max(1);
             let bytes_len = bytes.len() as u64;
+            // Fix #4: meter browser -> upstream WebSocket bytes into the bandwidth
+            // quota accounting, not just frame-count observability.
+            registry_ws.track_bandwidth(ws_tunnel_id, bytes_len);
             let dispatch_started = Instant::now();
             let send_result = outbound_tx_ws
                 .send(PikeOutboundMessage::Data(OutboundData {
@@ -1004,6 +1261,7 @@ async fn handle_streaming_pike_data(
     data: InboundData,
     ws_relays: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
     tunnel_metrics_store: Arc<TunnelMetricsStore>,
+    registry: Arc<ClientRegistry>,
 ) {
     let InboundData {
         connection_id: conn_id,
@@ -1014,6 +1272,11 @@ async fn handle_streaming_pike_data(
     } = data;
     let tunnel_id_string = tunnel_id.to_string();
     let payload_len = payload.len() as u64;
+    // Fix #4: meter upstream -> browser WebSocket/streaming bytes into the bandwidth
+    // quota accounting.
+    if payload_len > 0 {
+        registry.track_bandwidth_out(tunnel_id, payload_len);
+    }
     let frames = if payload.is_empty() {
         0
     } else {
@@ -1251,26 +1514,54 @@ fn normalize_http_response(payload: &[u8]) -> Result<NormalizedHttpResponse, Pro
 }
 
 fn decode_chunked_body(payload: &[u8]) -> Result<(Vec<u8>, usize), ProxyError> {
+    // Attacker-controlled input (a malicious tunnel client or upstream can craft this
+    // response). Every index and every arithmetic op below is bounds-/overflow-checked so
+    // that malformed framing returns a decode error (surfaced as 502) instead of panicking
+    // with a slice-out-of-bounds or an integer overflow (fix: reachable DoS panic).
     let mut decoded = Vec::new();
-    let mut cursor = 0;
+    let mut cursor = 0usize;
 
     loop {
-        let line_end = find_crlf(&payload[cursor..])
+        // `cursor` is maintained <= payload.len() on every iteration; the guard keeps that
+        // invariant explicit so `payload[cursor..]` can never panic.
+        let rest = payload
+            .get(cursor..)
             .ok_or_else(|| ProxyError::Upstream("invalid upstream chunk framing".to_string()))?;
-        let line = std::str::from_utf8(&payload[cursor..cursor + line_end]).map_err(|error| {
+        let line_end = find_crlf(rest)
+            .ok_or_else(|| ProxyError::Upstream("invalid upstream chunk framing".to_string()))?;
+        let line_bytes = rest
+            .get(..line_end)
+            .ok_or_else(|| ProxyError::Upstream("invalid upstream chunk framing".to_string()))?;
+        let line = std::str::from_utf8(line_bytes).map_err(|error| {
             ProxyError::Upstream(format!("invalid chunk size encoding: {error}"))
         })?;
         let size_text = line.split(';').next().unwrap_or("").trim();
         let size = usize::from_str_radix(size_text, 16)
             .map_err(|error| ProxyError::Upstream(format!("invalid chunk size: {error}")))?;
-        cursor += line_end + 2;
+        // Advance past "<size>\r\n"; saturating/checked so a crafted length cannot overflow.
+        cursor = cursor
+            .checked_add(line_end)
+            .and_then(|c| c.checked_add(2))
+            .filter(|c| *c <= payload.len())
+            .ok_or_else(|| {
+                ProxyError::Upstream("invalid upstream chunk framing".to_string())
+            })?;
 
         if size == 0 {
             loop {
-                let trailer_end = find_crlf(&payload[cursor..]).ok_or_else(|| {
+                let rest = payload.get(cursor..).ok_or_else(|| {
                     ProxyError::Upstream("invalid upstream trailer framing".to_string())
                 })?;
-                cursor += trailer_end + 2;
+                let trailer_end = find_crlf(rest).ok_or_else(|| {
+                    ProxyError::Upstream("invalid upstream trailer framing".to_string())
+                })?;
+                cursor = cursor
+                    .checked_add(trailer_end)
+                    .and_then(|c| c.checked_add(2))
+                    .filter(|c| *c <= payload.len())
+                    .ok_or_else(|| {
+                        ProxyError::Upstream("invalid upstream trailer framing".to_string())
+                    })?;
                 if trailer_end == 0 {
                     return Ok((decoded, cursor));
                 }
@@ -1280,19 +1571,29 @@ fn decode_chunked_body(payload: &[u8]) -> Result<(Vec<u8>, usize), ProxyError> {
         let chunk_end = cursor
             .checked_add(size)
             .ok_or_else(|| ProxyError::Upstream("upstream chunk length overflow".to_string()))?;
-        if chunk_end + 2 > payload.len() {
+        // `chunk_end + 2` (the trailing CRLF) must fit in the payload; overflow-checked.
+        let terminator_end = chunk_end
+            .checked_add(2)
+            .ok_or_else(|| ProxyError::Upstream("upstream chunk length overflow".to_string()))?;
+        if terminator_end > payload.len() {
             return Err(ProxyError::Upstream(
                 "upstream chunk shorter than declared size".to_string(),
             ));
         }
 
-        decoded.extend_from_slice(&payload[cursor..chunk_end]);
-        if &payload[chunk_end..chunk_end + 2] != b"\r\n" {
+        let chunk = payload.get(cursor..chunk_end).ok_or_else(|| {
+            ProxyError::Upstream("upstream chunk shorter than declared size".to_string())
+        })?;
+        decoded.extend_from_slice(chunk);
+        let terminator = payload.get(chunk_end..terminator_end).ok_or_else(|| {
+            ProxyError::Upstream("invalid upstream chunk terminator".to_string())
+        })?;
+        if terminator != b"\r\n" {
             return Err(ProxyError::Upstream(
                 "invalid upstream chunk terminator".to_string(),
             ));
         }
-        cursor = chunk_end + 2;
+        cursor = terminator_end;
     }
 }
 
@@ -1326,7 +1627,7 @@ mod tests {
 
     use super::{
         build_rate_limit_store, check_protocol_version, encode_http_request, parse_http_response,
-        PROTOCOL_VERSION,
+        ProxyError, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -1436,5 +1737,53 @@ mod tests {
         assert!(!has_transfer_encoding);
         assert!(!has_connection);
         assert_eq!(content_length.as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn decode_chunked_body_valid() {
+        let (decoded, consumed) =
+            super::decode_chunked_body(b"5\r\nhello\r\n0\r\n\r\n").expect("valid chunked body");
+        assert_eq!(&decoded[..], b"hello");
+        assert_eq!(consumed, b"5\r\nhello\r\n0\r\n\r\n".len());
+    }
+
+    // A crafted chunk header declaring a size far larger than the payload must NOT panic
+    // (the old `chunk_end + 2` arithmetic could overflow / index out of bounds → DoS).
+    #[test]
+    fn decode_chunked_body_oversized_size_does_not_panic() {
+        // Declares 0xFFFFFFFFFFFFFFFF bytes but supplies none.
+        let err = super::decode_chunked_body(b"ffffffffffffffff\r\nX")
+            .expect_err("oversized chunk must be rejected");
+        assert!(matches!(err, ProxyError::Upstream(_)));
+    }
+
+    #[test]
+    fn decode_chunked_body_short_chunk_does_not_panic() {
+        // Declares 100 bytes but only supplies 2.
+        let err = super::decode_chunked_body(b"64\r\nhi")
+            .expect_err("short chunk must be rejected");
+        assert!(matches!(err, ProxyError::Upstream(_)));
+    }
+
+    #[test]
+    fn decode_chunked_body_missing_terminator_does_not_panic() {
+        // Chunk body present but no trailing CRLF and no room for it.
+        let err = super::decode_chunked_body(b"2\r\nhi")
+            .expect_err("missing terminator must be rejected");
+        assert!(matches!(err, ProxyError::Upstream(_)));
+    }
+
+    #[test]
+    fn decode_chunked_body_garbage_size_does_not_panic() {
+        let err = super::decode_chunked_body(b"zzzz\r\ndata\r\n")
+            .expect_err("non-hex chunk size must be rejected");
+        assert!(matches!(err, ProxyError::Upstream(_)));
+    }
+
+    #[test]
+    fn decode_chunked_body_no_framing_does_not_panic() {
+        let err = super::decode_chunked_body(b"no-crlf-anywhere")
+            .expect_err("missing framing must be rejected");
+        assert!(matches!(err, ProxyError::Upstream(_)));
     }
 }

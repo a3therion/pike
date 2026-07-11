@@ -101,6 +101,7 @@ jobs:
           cp deploy/setup.sh server-bundle/setup.sh
           cp deploy/start.sh server-bundle/start.sh
           cp deploy/pike-server.service server-bundle/pike-server.service
+          cp deploy/journald.conf server-bundle/journald.conf
           tar -czf ${{ matrix.server_name }} -C server-bundle .
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -149,6 +150,17 @@ jobs:
     name: Create Release
     needs: [build, container]
     runs-on: ubuntu-latest
+    # Signing secrets. Provision these in the repo settings
+    # (Settings -> Secrets and variables -> Actions):
+    #   PIKE_MINISIGN_SECRET_KEY -> the full contents of your minisign .key file
+    #   PIKE_MINISIGN_PASSWORD   -> the key password (leave UNSET for a
+    #                               passwordless key generated with `minisign -G -W`)
+    # Generate a keypair once with: minisign -G -p pike-minisign.pub -s pike-minisign.key
+    # and paste the second line of the .pub into scripts/install.sh
+    # (PIKE_MINISIGN_PUBKEY). Keep the .key contents ONLY in the secret above.
+    env:
+      PIKE_MINISIGN_SECRET_KEY: ${{ secrets.PIKE_MINISIGN_SECRET_KEY }}
+      PIKE_MINISIGN_PASSWORD: ${{ secrets.PIKE_MINISIGN_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -160,6 +172,25 @@ jobs:
         run: |
           cd release-assets
           sha256sum * > checksums.txt
+      # Sign checksums.txt with minisign so the install script can verify
+      # release authenticity. Guarded by `if:` so releases still succeed when
+      # the signing secret has not been provisioned yet.
+      - name: Install minisign
+        if: ${{ env.PIKE_MINISIGN_SECRET_KEY != '' }}
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Sign checksums with minisign
+        if: ${{ env.PIKE_MINISIGN_SECRET_KEY != '' }}
+        working-directory: release-assets
+        run: |
+          umask 077
+          # Materialize the secret key from the repo secret (never committed).
+          printf '%s\n' "$PIKE_MINISIGN_SECRET_KEY" > minisign.key
+          # Produce the detached signature checksums.txt.minisig. The password
+          # (if any) is fed on stdin; an empty PIKE_MINISIGN_PASSWORD works for
+          # a passwordless key.
+          printf '%s\n' "$PIKE_MINISIGN_PASSWORD" | minisign -S -s minisign.key -m checksums.txt
+          rm -f minisign.key
+          test -f checksums.txt.minisig
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:

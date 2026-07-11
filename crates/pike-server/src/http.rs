@@ -8,14 +8,13 @@ use anyhow::Context;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{any, get};
 use axum::Router;
 use dashmap::DashMap;
-use http_body_util::BodyExt;
 use tower::ServiceExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -25,7 +24,7 @@ use crate::auth::AuthLayer;
 use crate::config::TrafficInspectionConfig;
 use crate::dashboard_ws::{
     dashboard_ws_handler, validate_local_api_key, validate_token, DashboardBroadcaster,
-    DashboardEvent, DashboardWsState,
+    DashboardEvent, DashboardWsState, WsTicketEntry, WsTicketStore, WS_TICKET_TTL,
 };
 use crate::ingest::{IngestEntry, RequestBuffer};
 use crate::proxy::{extract_host, is_websocket_upgrade, proxy_request, ProxyContext, ProxyError};
@@ -40,9 +39,6 @@ use crate::tunnel_metrics::{MetricsRange, TunnelMetricsStore};
 use crate::websocket::handle_websocket;
 use crate::ws_proxy;
 use pike_core::types::TunnelId;
-
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-pub const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 #[derive(serde::Serialize)]
 struct CapturedHeader {
@@ -319,7 +315,14 @@ struct HttpState {
     request_log_store: Arc<RequestLogStore>,
     tunnel_metrics_store: Arc<TunnelMetricsStore>,
     sse_tokens: Arc<DashMap<String, SseTokenEntry>>,
+    /// Short-lived single-use tickets for the dashboard WebSocket (shared with the WS
+    /// handler so the raw JWT never travels in the WebSocket URL).
+    ws_tickets: WsTicketStore,
     domain: String,
+    /// End-to-end inbound proxy timeout (fix: no inbound request timeout).
+    request_timeout: Duration,
+    /// Maximum buffered body size per direction; larger bodies get a 413 (fix: OOM).
+    max_body_size: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -336,15 +339,22 @@ pub async fn run_http_server(
     dev_mode: bool,
     traffic_inspection: TrafficInspectionConfig,
     domain: String,
+    request_timeout: Duration,
+    max_body_size: usize,
+    trust_cloudflare: bool,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let http_client = reqwest::Client::new();
+    // Shared between the ws-ticket mint endpoint (HttpState) and the /ws/dashboard
+    // consumer (DashboardWsState).
+    let ws_tickets: WsTicketStore = Arc::new(DashMap::new());
     let ws_state = DashboardWsState {
         broadcaster: broadcaster.clone(),
         control_plane_url: control_plane_url.clone(),
         local_api_keys: local_api_keys.clone(),
         http_client: http_client.clone(),
         dev_mode,
+        ws_tickets: ws_tickets.clone(),
     };
 
     let allowed_origins: Vec<HeaderValue> = if dev_mode {
@@ -380,7 +390,10 @@ pub async fn run_http_server(
         request_log_store,
         tunnel_metrics_store,
         sse_tokens: Arc::new(DashMap::new()),
+        ws_tickets: ws_tickets.clone(),
         domain,
+        request_timeout,
+        max_body_size,
     };
 
     let platform_router = Router::new()
@@ -412,6 +425,10 @@ pub async fn run_http_server(
             "/api/v1/sse-token",
             axum::routing::post(handle_create_sse_token),
         )
+        .route(
+            "/api/v1/ws-ticket",
+            axum::routing::post(handle_create_ws_ticket),
+        )
         .with_state(state_base.clone())
         .layer(cors_layer);
 
@@ -421,12 +438,15 @@ pub async fn run_http_server(
     };
 
     let sse_tokens_for_eviction = state.sse_tokens.clone();
+    let ws_tickets_for_eviction = state.ws_tickets.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
             sse_tokens_for_eviction
                 .retain(|_, entry| entry.created_at.elapsed() <= Duration::from_secs(60));
+            ws_tickets_for_eviction
+                .retain(|_, entry| entry.created_at.elapsed() <= WS_TICKET_TTL);
         }
     });
 
@@ -435,8 +455,10 @@ pub async fn run_http_server(
         .fallback(any(handle_request))
         .with_state(state)
         .layer(AuthLayer::new(registry.clone()))
-        .layer(RequestBodyLimitLayer::new(DEFAULT_MAX_BODY_SIZE))
-        .layer(IpRateLimitLayer::new(ip_limiter))
+        // Cap the inbound request body at the configured max (fix: OOM). tower-http returns
+        // 413 automatically once the limit is exceeded, before the handler buffers anything.
+        .layer(RequestBodyLimitLayer::new(max_body_size))
+        .layer(IpRateLimitLayer::new(ip_limiter, trust_cloudflare))
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -484,7 +506,6 @@ async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("http")
         .to_string();
-    let request_content_length = request_content_length(&req);
 
     let tunnel_entry = crate::proxy::extract_host(req.headers())
         .map(|host| crate::router::normalize_host(&host))
@@ -507,7 +528,12 @@ async fn handle_request(
             .registry
             .user_id_for_connection(&tunnel.connection_id)
             .unwrap_or_else(|| format!("conn:{}", tunnel.connection_id));
-        if let Err(error) = state.registry.rate_limiter.check_limit(user_id) {
+        if let Err(error) = state.registry.rate_limiter.check_limit(user_id.clone()) {
+            let headers = exceeded_headers();
+            return build_rate_limited_response(error, Some(&headers));
+        }
+        // Enforce the per-plan daily request quota (fix #18).
+        if let Err(error) = state.registry.rate_limiter.check_daily_request(&user_id) {
             let headers = exceeded_headers();
             return build_rate_limited_response(error, Some(&headers));
         }
@@ -562,40 +588,63 @@ async fn handle_request(
         }
     }
 
-    // Capture method and path for live event broadcasting
+    // Fix: apply an end-to-end timeout to the entire inbound proxy path (request-body read +
+    // upstream round-trip + response-body read). A slow-loris client or a hung upstream can no
+    // longer pin a task/connection indefinitely; on expiry we return 504. WebSocket upgrades
+    // were already returned above and are intentionally exempt (long-lived by design).
+    let request_timeout = state.request_timeout;
+    let proxy_future = async move {
+    // Capture method and path for live event broadcasting.
     let req_method = req.method().to_string();
-    let req_path = req
-        .uri()
-        .path_and_query()
-        .map_or("/".to_string(), |pq| pq.to_string());
+    // Fix #17: keep the path but redact the VALUES of sensitive query-string params
+    // (tokens, secrets, session ids, ...) so we do not persist tunneled-request secrets,
+    // using the same field-name heuristic as header/body redaction.
+    let req_path = redact_path_query(
+        req.uri().path(),
+        req.uri().query(),
+    );
 
     // Capture request headers and body preview
     let req_content_type = content_type_str(req.headers());
     let req_headers_json = maybe_capture_headers(req.headers(), &state.traffic_inspection);
 
-    let req_body_preview = {
-        if should_capture_body_preview(
-            &state.traffic_inspection,
-            req_content_type.as_deref(),
-            request_content_length,
-        ) {
-            let (parts, body) = req.into_parts();
-            let bytes = body
-                .collect()
-                .await
-                .map(|c| c.to_bytes())
-                .unwrap_or_default();
-            let preview = preview_body(
-                &bytes,
-                state.traffic_inspection.max_body_preview_bytes,
-                req_content_type.as_deref(),
-            );
-            req = Request::from_parts(parts, Body::from(bytes.clone()));
-            preview
-        } else {
-            None
-        }
+    // Fix #3: buffer the request body once so we meter the ACTUAL number of bytes
+    // (chunked/streamed uploads carry no Content-Length, so the header-based figure
+    // is 0). The tunnel protocol buffers the whole request downstream anyway, so this
+    // does not lose streaming we did not already lose. Preview reuses the same buffer.
+    //
+    // TODO(memory-bound): this materializes the full body in memory. It is NOT a new
+    // vector — the localhop/QUIC tunnel path already buffers the entire body (see the
+    // known "uncapped response-body buffering over QUIC" item) — but the correct fix is
+    // a single max-body-size cap enforced at the tunnel-protocol layer for BOTH
+    // directions (reject with 413 rather than truncate; truncating here would corrupt
+    // the forwarded body). Metering already reads the true length from this buffer, so
+    // that cap can be added without touching the accounting below.
+    let (req_parts, req_body) = req.into_parts();
+    // Fix: bound the buffered request body at max_body_size and reject with 413 instead of
+    // OOMing. The tower RequestBodyLimitLayer already enforces this at the edge; this is
+    // defense-in-depth for the manual buffering below.
+    let Ok(req_body_bytes) = axum::body::to_bytes(req_body, state.max_body_size).await else {
+        crate::metrics::ERROR_RATE
+            .with_label_values(&["request_body_too_large"])
+            .inc();
+        return build_payload_too_large_response();
     };
+    let request_body_len = req_body_bytes.len() as u64;
+    let req_body_preview = if should_capture_body_preview(
+        &state.traffic_inspection,
+        req_content_type.as_deref(),
+        request_body_len,
+    ) {
+        preview_body(
+            &req_body_bytes,
+            state.traffic_inspection.max_body_preview_bytes,
+            req_content_type.as_deref(),
+        )
+    } else {
+        None
+    };
+    req = Request::from_parts(req_parts, Body::from(req_body_bytes));
 
     let proxy_start = Instant::now();
 
@@ -613,7 +662,7 @@ async fn handle_request(
                 user_id: None,
                 tunnel_id: tunnel_entry.as_ref().map(|entry| entry.tunnel_id),
                 request_count_per_minute: None,
-                bandwidth_bytes: Some(request_content_length),
+                bandwidth_bytes: Some(request_body_len),
                 reason: format!("matched malware signature {signature}"),
             });
         return Response::builder()
@@ -638,49 +687,57 @@ async fn handle_request(
 
     let response_time_ms = proxy_start.elapsed().as_millis() as u64;
 
-    // Capture response headers and body preview
+    // Capture response headers
     let resp_content_type = content_type_str(response.headers());
     let resp_headers_json = maybe_capture_headers(response.headers(), &state.traffic_inspection);
-    let resp_content_len = response_content_length(&response);
 
-    let resp_body_preview = {
-        if should_capture_body_preview(
-            &state.traffic_inspection,
-            resp_content_type.as_deref(),
-            resp_content_len,
-        ) {
-            let (parts, body) = response.into_parts();
-            let bytes = body
-                .collect()
-                .await
-                .map(|c| c.to_bytes())
-                .unwrap_or_default();
-            let preview = preview_body(
-                &bytes,
-                state.traffic_inspection.max_body_preview_bytes,
-                resp_content_type.as_deref(),
-            );
-            response = Response::from_parts(parts, Body::from(bytes.clone()));
-            preview
-        } else {
-            None
-        }
+    // Fix #3: buffer the response body to meter the ACTUAL bytes returned. Chunked
+    // upstream responses may carry no Content-Length, so the header value defaults to
+    // 0 and would otherwise be billed as unmetered. Tunneled responses are already
+    // fully buffered by the localhop protocol, so this preserves current behavior.
+    let (resp_parts, resp_body) = response.into_parts();
+    // Fix: cap the buffered response body from the tunnel at max_body_size and reject with
+    // 413 rather than buffering an unbounded body into memory (OOM protection, both
+    // directions).
+    let Ok(resp_body_bytes) = axum::body::to_bytes(resp_body, state.max_body_size).await else {
+        crate::metrics::ERROR_RATE
+            .with_label_values(&["response_body_too_large"])
+            .inc();
+        return build_payload_too_large_response();
     };
+    let response_body_len = resp_body_bytes.len() as u64;
+    let resp_body_preview = if should_capture_body_preview(
+        &state.traffic_inspection,
+        resp_content_type.as_deref(),
+        response_body_len,
+    ) {
+        preview_body(
+            &resp_body_bytes,
+            state.traffic_inspection.max_body_preview_bytes,
+            resp_content_type.as_deref(),
+        )
+    } else {
+        None
+    };
+    let response = Response::from_parts(resp_parts, Body::from(resp_body_bytes));
 
     if let Some(tunnel) = tunnel_entry {
         let status_code = response.status().as_u16();
         state
             .registry
             .record_tunnel_request(tunnel.tunnel_id, status_code);
-        let response_content_length = response_content_length(&response);
-        let total_bytes = request_content_length.saturating_add(response_content_length);
+        let response_content_length = response_body_len;
+        let total_bytes = request_body_len.saturating_add(response_content_length);
         state
             .registry
-            .track_bandwidth(tunnel.tunnel_id, total_bytes);
+            .track_bandwidth(tunnel.tunnel_id, request_body_len);
+        state
+            .registry
+            .track_bandwidth_out(tunnel.tunnel_id, response_content_length);
 
         crate::metrics::BYTES_TRANSFERRED
             .with_label_values(&["in"])
-            .inc_by(request_content_length as f64);
+            .inc_by(request_body_len as f64);
         crate::metrics::BYTES_TRANSFERRED
             .with_label_values(&["out"])
             .inc_by(response_content_length as f64);
@@ -697,7 +754,7 @@ async fn handle_request(
                 path: req_path.clone(),
                 status_code,
                 duration_ms: response_time_ms,
-                request_size: request_content_length,
+                request_size: request_body_len,
                 response_size: response_content_length,
                 tunnel_id: tunnel.tunnel_id.to_string(),
             };
@@ -716,7 +773,7 @@ async fn handle_request(
                         &tunnel_id,
                         status_code,
                         response_time_ms,
-                        request_content_length,
+                        request_body_len,
                         response_content_length,
                     )
                     .await;
@@ -773,7 +830,26 @@ async fn handle_request(
         }
     }
 
+        response
+    };
+
+    let Ok(response) = tokio::time::timeout(request_timeout, proxy_future).await else {
+        crate::metrics::ERROR_RATE
+            .with_label_values(&["request_timeout"])
+            .inc();
+        return Response::builder()
+            .status(StatusCode::GATEWAY_TIMEOUT)
+            .body(Body::from("gateway timeout"))
+            .unwrap_or_else(|_| Response::new(Body::from("gateway timeout")));
+    };
     response
+}
+
+fn build_payload_too_large_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .body(Body::from("payload too large"))
+        .unwrap_or_else(|_| Response::new(Body::from("payload too large")))
 }
 
 async fn dispatch_platform_request(state: HttpState, req: Request<Body>) -> Response<Body> {
@@ -1102,6 +1178,46 @@ async fn handle_create_sse_token(
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+#[derive(serde::Serialize)]
+struct WsTicketResponse {
+    ticket: String,
+}
+
+/// POST /api/v1/ws-ticket — mint a short-lived, single-use ticket for the dashboard
+/// WebSocket so the raw JWT never appears in the WS URL (and therefore not in access
+/// logs). Authenticated by the caller's Bearer token — a JWT, a self-hosted static api
+/// key, or dev mode — exactly like the sse-token endpoint.
+async fn handle_create_ws_ticket(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let user_id = match authenticate_platform_user(&state, &headers).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+
+    let ticket = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+
+    state.ws_tickets.insert(
+        ticket.clone(),
+        WsTicketEntry {
+            user_id,
+            created_at: Instant::now(),
+        },
+    );
+
+    let resp_body = serde_json::to_vec(&WsTicketResponse { ticket }).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(resp_body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(axum::http::header::AUTHORIZATION)
@@ -1320,22 +1436,26 @@ fn apply_rate_limit_headers(headers: &mut axum::http::HeaderMap, rate: &RateLimi
     );
 }
 
-fn request_content_length(request: &Request<Body>) -> u64 {
-    request
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0)
-}
+/// Rebuild a `path?query` string, redacting the VALUES of sensitive query params
+/// (fix #17). Non-sensitive params are preserved verbatim so the log stays useful.
+fn redact_path_query(path: &str, query: Option<&str>) -> String {
+    let Some(query) = query else {
+        return path.to_string();
+    };
+    if query.is_empty() {
+        return path.to_string();
+    }
 
-fn response_content_length(response: &Response<Body>) -> u64 {
-    response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0)
+    let redacted = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if is_sensitive_field_name(key) => format!("{key}=<redacted>"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    format!("{path}?{redacted}")
 }
 
 #[cfg(test)]

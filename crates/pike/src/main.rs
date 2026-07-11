@@ -42,7 +42,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context, Result};
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -103,7 +103,12 @@ enum Commands {
         max_reconnects: Option<u32>,
     },
     /// Store API key in config.
-    Login { api_key: String },
+    Login {
+        /// API key (DEPRECATED: passing the key as an argument leaks it to
+        /// shell history and process listings). Prefer PIKE_API_KEY, piped
+        /// stdin, or the interactive hidden prompt.
+        api_key: Option<String>,
+    },
     /// Display authentication state.
     Status,
     /// Display build and relay details.
@@ -152,6 +157,59 @@ const PIKE_LOGO: &str = r"  ██████╗ ██╗██╗  ██╗�
 
 fn is_tty() -> bool {
     std::io::stdout().is_terminal()
+}
+
+/// Resolve the API key for `pike login` using the following precedence:
+/// explicit positional arg > `PIKE_API_KEY` env > piped stdin > interactive
+/// hidden prompt. The positional argument is deprecated because it leaks the
+/// secret to shell history and process listings.
+fn resolve_login_api_key(positional: Option<String>) -> Result<String> {
+    if let Some(key) = positional {
+        eprintln!(
+            "  {} {}",
+            "\u{25CF}".yellow(),
+            "Passing the API key as a command-line argument is deprecated and \
+             insecure (it leaks to shell history and process listings). Use \
+             PIKE_API_KEY, piped stdin, or the interactive prompt instead."
+                .dimmed(),
+        );
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            return Err(anyhow!("API key must not be empty"));
+        }
+        return Ok(key);
+    }
+
+    if let Ok(key) = std::env::var("PIKE_API_KEY") {
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            return Err(anyhow!("PIKE_API_KEY is set but empty"));
+        }
+        return Ok(key);
+    }
+
+    // If stdin is not a terminal, read the key from the pipe.
+    if !std::io::stdin().is_terminal() {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read API key from stdin")?;
+        let key = buf.trim().to_string();
+        if key.is_empty() {
+            return Err(anyhow!("no API key provided on stdin"));
+        }
+        return Ok(key);
+    }
+
+    // Interactive hidden prompt (no echo).
+    let key = rpassword::prompt_password("Enter your Pike API key: ")
+        .context("failed to read API key from prompt")?;
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err(anyhow!("API key must not be empty"));
+    }
+    Ok(key)
 }
 
 fn terminal_width() -> usize {
@@ -826,6 +884,7 @@ async fn main() -> anyhow::Result<()> {
             run_tcp_command(cfg, tunnel_config, port, remote_port, max_reconnects).await?;
         }
         Commands::Login { api_key } => {
+            let api_key = resolve_login_api_key(api_key)?;
             let mut cfg = config::load_or_create_config(&config_path).await?;
             #[derive(serde::Deserialize)]
             struct ValidateResponse {
@@ -993,7 +1052,7 @@ mod tests {
     fn parses_login_command() {
         let cli = Cli::try_parse_from(["pike", "login", "pk_test_123"])
             .expect("cli parse should succeed");
-        assert!(matches!(cli.command, Commands::Login { api_key } if api_key == "pk_test_123"));
+        assert!(matches!(cli.command, Commands::Login { api_key } if api_key.as_deref() == Some("pk_test_123")));
     }
 
     #[test]

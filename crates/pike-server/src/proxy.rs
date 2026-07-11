@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::ws::Message as AxumWsMessage;
-use axum::http::header::{CONNECTION, HOST, UPGRADE};
+use axum::http::header::{CONNECTION, HOST, SEC_WEBSOCKET_KEY, UPGRADE};
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use pike_core::proto::StreamHeader;
 use tokio::sync::{mpsc, oneshot};
@@ -171,7 +171,16 @@ pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
         .map(|value| value.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
 
-    has_upgrade && is_ws
+    // Require a non-empty Sec-WebSocket-Key too: without it this is not a valid RFC 6455
+    // handshake, and accepting only Connection+Upgrade would let a client route a plain
+    // request into the (timeout-exempt) WebSocket path to dodge the inbound request timeout.
+    let has_ws_key = headers
+        .get(SEC_WEBSOCKET_KEY)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+
+    has_upgrade && is_ws && has_ws_key
 }
 
 #[must_use]
@@ -257,9 +266,23 @@ mod tests {
             .uri("/")
             .header("connection", "keep-alive, Upgrade")
             .header("upgrade", "websocket")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
             .body(Body::empty())
             .expect("request");
         assert!(is_websocket_upgrade(req.headers()));
+    }
+
+    #[test]
+    fn upgrade_without_sec_websocket_key_is_not_websocket() {
+        // Connection+Upgrade present but no Sec-WebSocket-Key: must NOT be treated as a
+        // WebSocket upgrade, so it can't escape the inbound request timeout.
+        let req = Request::builder()
+            .uri("/")
+            .header("connection", "keep-alive, Upgrade")
+            .header("upgrade", "websocket")
+            .body(Body::empty())
+            .expect("request");
+        assert!(!is_websocket_upgrade(req.headers()));
     }
 
     #[tokio::test]

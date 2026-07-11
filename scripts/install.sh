@@ -12,6 +12,23 @@ USER_INSTALL_DIR_DEFAULT=".local/bin"
 REQUESTED_INSTALL_DIR="${PIKE_INSTALL_DIR:-${INSTALL_DIR:-}}"
 REQUESTED_VERSION="${PIKE_INSTALL_VERSION:-}"
 
+# --- Release signature verification (opt-in) --------------------------------
+# Replace the placeholder below with your real minisign PUBLIC key (the single
+# base64 line from the .pub file, NOT the whole file, NOT the private key).
+#
+# Generate a keypair once with:
+#   minisign -G -p pike-minisign.pub -s pike-minisign.key
+# The second line of pike-minisign.pub is the value to paste here.
+#
+# Behavior:
+#   * While this is left as the placeholder, signature verification is SKIPPED
+#     with a loud warning. Checksum verification (see verify_checksum) still
+#     runs and still fails closed regardless.
+#   * Once a real key is baked in, checksums.txt MUST carry a valid detached
+#     minisign signature (checksums.txt.minisig) or the install aborts.
+PIKE_MINISIGN_PUBKEY="REPLACE_WITH_REAL_MINISIGN_PUBLIC_KEY"
+# ----------------------------------------------------------------------------
+
 info() {
     printf '%s\n' "$*"
 }
@@ -114,12 +131,14 @@ build_download_urls() {
         version_label="$REQUESTED_VERSION"
         asset_url="${RELEASES_URL}/download/${REQUESTED_VERSION}/${asset_name}"
         checksum_url="${RELEASES_URL}/download/${REQUESTED_VERSION}/checksums.txt"
+        signature_url="${checksum_url}.minisig"
         return
     fi
 
     version_label="latest"
     asset_url="${RELEASES_URL}/latest/download/${asset_name}"
     checksum_url="${RELEASES_URL}/latest/download/checksums.txt"
+    signature_url="${checksum_url}.minisig"
 }
 
 download_file() {
@@ -153,9 +172,9 @@ verify_checksum() {
     checksum_file="$1"
     binary_file="$2"
 
+    # Fail closed: a missing or unreachable checksum file aborts the install.
     if ! download_file "$checksum_url" "$checksum_file"; then
-        warn "Checksum file not found at ${checksum_url}; continuing without verification"
-        return
+        die "Checksum file not found at ${checksum_url}; refusing to install unverified binary"
     fi
 
     expected_checksum=$(awk -v file="$asset_name" '$2 == file { print $1 }' "$checksum_file")
@@ -166,18 +185,45 @@ verify_checksum() {
     [ "$expected_checksum" = "$actual_checksum" ] || die "Checksum verification failed for ${asset_name}"
 }
 
+verify_signature() {
+    checksum_file="$1"
+    signature_file="$2"
+
+    # Opt-in: skip (loudly) until a real public key is baked into the script.
+    if [ "$PIKE_MINISIGN_PUBKEY" = "REPLACE_WITH_REAL_MINISIGN_PUBLIC_KEY" ]; then
+        warn "WARNING: no minisign public key is baked into this installer; skipping signature verification of checksums.txt."
+        warn "WARNING: checksum integrity is still enforced, but authenticity is NOT. Set PIKE_MINISIGN_PUBKEY to enable signature checks."
+        return
+    fi
+
+    # A real key is configured => signature verification is mandatory.
+    command -v minisign >/dev/null 2>&1 \
+        || die "A minisign public key is configured but 'minisign' is not installed; install minisign to verify the release signature"
+
+    if ! download_file "$signature_url" "$signature_file"; then
+        die "Signature file not found at ${signature_url}; refusing to install (a signing key is configured)"
+    fi
+
+    minisign -V -P "$PIKE_MINISIGN_PUBKEY" -m "$checksum_file" -x "$signature_file" >/dev/null 2>&1 \
+        || die "Signature verification failed for checksums.txt"
+
+    info "Verified checksums.txt signature with minisign"
+}
+
 install_binary() {
     tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t pike-install)
     trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 
     binary_path="${tmp_dir}/${asset_name}"
     checksum_path="${tmp_dir}/checksums.txt"
+    signature_path="${tmp_dir}/checksums.txt.minisig"
     destination_path="${install_dir}/${BINARY_NAME}"
 
     info "Installing ${BINARY_NAME} (${version_label}) for ${asset_name}"
     info "Downloading ${asset_url}"
     download_file "$asset_url" "$binary_path"
     verify_checksum "$checksum_path" "$binary_path"
+    verify_signature "$checksum_path" "$signature_path"
 
     mkdir -p "$install_dir"
     chmod +x "$binary_path"

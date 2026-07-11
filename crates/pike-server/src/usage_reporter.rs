@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -147,7 +148,23 @@ impl UsageReporter {
             .map(|pending| pending.report.clone())
             .collect();
 
-        if let Err(error) = self.send_batch(&payload).await {
+        // Idempotency key keyed on each tunnel's cumulative ("to") counter, which
+        // uniquely positions this window on the counter timeline. A retried batch (send
+        // failed → `shadow_counters` not advanced → same deltas AND same cumulative on
+        // the next flush) hashes identically and is deduped by Workers; two distinct
+        // windows that happen to carry identical deltas have different cumulative
+        // counters, so they hash differently and are NOT wrongly dropped.
+        let id_entries: Vec<ReportIdEntry> = pending_reports
+            .iter()
+            .map(|pending| ReportIdEntry {
+                tunnel_id: pending.report.tunnel_id.clone(),
+                user_id: pending.report.user_id.clone(),
+                cumulative: pending.current,
+            })
+            .collect();
+        let report_id = batch_report_id(&id_entries);
+
+        if let Err(error) = self.send_batch(&payload, &report_id).await {
             error!(error = %error, count = payload.len(), "failed to report usage batch to Workers API");
             return;
         }
@@ -195,9 +212,14 @@ impl UsageReporter {
         tunnel_users
     }
 
-    async fn send_batch(&self, reports: &[UsageReport]) -> anyhow::Result<()> {
+    async fn send_batch(&self, reports: &[UsageReport], report_id: &str) -> anyhow::Result<()> {
         #[derive(Serialize)]
         struct UsagePayload<'a> {
+            // Fix #19: a unique id per batch so the Workers `/internal/report` endpoint
+            // can dedupe a retried batch (e.g. after a dropped ack) instead of
+            // double-counting. `shadow_counters` still only advance on a 2xx, so a
+            // duplicate carrying the same id is harmless.
+            report_id: &'a str,
             reports: &'a [UsageReport],
         }
 
@@ -210,7 +232,7 @@ impl UsageReporter {
             .http_client
             .post(url)
             .bearer_auth(&self.server_token)
-            .json(&UsagePayload { reports })
+            .json(&UsagePayload { report_id, reports })
             .timeout(Duration::from_secs(10))
             .send()
             .await?;
@@ -222,5 +244,94 @@ impl UsageReporter {
         }
 
         Ok(())
+    }
+}
+
+/// One tunnel's contribution to a batch's idempotency key: its identity plus the
+/// cumulative ("to") counter the batch is advancing it to.
+struct ReportIdEntry {
+    tunnel_id: String,
+    user_id: String,
+    cumulative: ShadowCounter,
+}
+
+/// Derive a stable idempotency key for a batch (fix #19).
+///
+/// The key is keyed on each tunnel's *cumulative* counter (the "to" position), not on the
+/// per-window delta. This gives two properties the Workers-side 1h dedup relies on:
+///
+/// * **Stable across retries.** `flush` only advances `shadow_counters` on a 2xx, so a
+///   batch whose ack was lost is recomputed on the next flush from the same baseline; if
+///   no traffic occurred in between it has the same deltas *and* the same cumulative
+///   counter, hashing identically so Workers dedupes it. (A random uuid per send would
+///   defeat dedup.)
+/// * **Unique across windows.** Two genuinely different windows that happen to carry the
+///   same byte/request delta still sit at different cumulative positions on the counter
+///   timeline, so they hash differently and the second is NOT wrongly dropped as a
+///   duplicate. (A delta-only or timestamp-less key collided here — the original bug.)
+fn batch_report_id(entries: &[ReportIdEntry]) -> String {
+    let mut lines: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            format!(
+                "{}:{}:{}:{}:{}",
+                e.tunnel_id,
+                e.user_id,
+                e.cumulative.bytes_in,
+                e.cumulative.bytes_out,
+                e.cumulative.request_count
+            )
+        })
+        .collect();
+    lines.sort();
+
+    let mut hasher = Sha256::new();
+    for line in lines {
+        hasher.update(line.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{batch_report_id, ReportIdEntry, ShadowCounter};
+
+    fn entry(tunnel: &str, bytes_in: u64, bytes_out: u64, requests: u64) -> ReportIdEntry {
+        ReportIdEntry {
+            tunnel_id: tunnel.to_string(),
+            user_id: "u1".to_string(),
+            cumulative: ShadowCounter {
+                bytes_in,
+                bytes_out,
+                request_count: requests,
+            },
+        }
+    }
+
+    #[test]
+    fn report_id_is_stable_for_a_retried_batch() {
+        // A retry recomputes from an un-advanced baseline with no intervening traffic:
+        // same cumulative counter → same id → Workers dedupes it (no double-count).
+        let batch = [entry("t1", 1000, 2000, 5)];
+        assert_eq!(batch_report_id(&batch), batch_report_id(&batch));
+    }
+
+    #[test]
+    fn report_id_differs_for_same_delta_in_different_windows() {
+        // Two windows with an identical delta (1000 in) but at different cumulative
+        // positions must NOT collide — otherwise the second window is wrongly dropped as
+        // a duplicate (the original bug). Window 1 advances the counter to 1000, window 2
+        // to 2000.
+        let window1 = [entry("t1", 1000, 0, 0)];
+        let window2 = [entry("t1", 2000, 0, 0)];
+        assert_ne!(batch_report_id(&window1), batch_report_id(&window2));
+    }
+
+    #[test]
+    fn report_id_is_order_independent() {
+        let a = [entry("t1", 10, 20, 1), entry("t2", 30, 40, 2)];
+        let b = [entry("t2", 30, 40, 2), entry("t1", 10, 20, 1)];
+        assert_eq!(batch_report_id(&a), batch_report_id(&b));
     }
 }

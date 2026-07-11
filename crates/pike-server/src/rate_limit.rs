@@ -10,6 +10,7 @@ use governor::{DefaultDirectRateLimiter, Quota, RateLimiter as Governor};
 use pike_core::types::TunnelId;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
+use crate::connection::UserLimits;
 use crate::state_store::StateStore;
 
 pub type UserId = String;
@@ -27,6 +28,14 @@ const SELF_HOSTED_USER_REQUESTS_PER_MINUTE: u32 = 10_000;
 const PRO_TIER_MAX_REQUESTS_PER_TUNNEL_PER_MINUTE: u32 = 1_000;
 const ENTERPRISE_MAX_REQUESTS_PER_TUNNEL_PER_MINUTE: u32 = 10_000;
 const SELF_HOSTED_MAX_REQUESTS_PER_TUNNEL_PER_MINUTE: u32 = 10_000;
+// Per-plan daily request ceilings (fix #18). Previously `requests_per_day` was
+// decorative: the per-minute governor alone permits ~720k/day on the free tier.
+// The control plane may override these via the user's `limits.requests_per_day`.
+const FREE_TIER_REQUESTS_PER_DAY: Option<u32> = Some(10_000);
+const PRO_TIER_REQUESTS_PER_DAY: Option<u32> = Some(500_000);
+const ENTERPRISE_REQUESTS_PER_DAY: Option<u32> = None;
+const SELF_HOSTED_REQUESTS_PER_DAY: Option<u32> = None;
+const DAY_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubscriptionPlan {
@@ -57,24 +66,28 @@ impl SubscriptionPlan {
                 max_tunnels: Some(FREE_TIER_MAX_TUNNELS),
                 user_requests_per_minute: FREE_TIER_USER_REQUESTS_PER_MINUTE,
                 tunnel_requests_per_minute: FREE_TIER_MAX_REQUESTS_PER_TUNNEL_PER_MINUTE,
+                requests_per_day: FREE_TIER_REQUESTS_PER_DAY,
             },
             Self::Pro => PlanLimits {
                 bandwidth_bytes_per_month: Some(PRO_TIER_BANDWIDTH_BYTES_PER_MONTH),
                 max_tunnels: Some(PRO_TIER_MAX_TUNNELS),
                 user_requests_per_minute: PRO_TIER_USER_REQUESTS_PER_MINUTE,
                 tunnel_requests_per_minute: PRO_TIER_MAX_REQUESTS_PER_TUNNEL_PER_MINUTE,
+                requests_per_day: PRO_TIER_REQUESTS_PER_DAY,
             },
             Self::Enterprise => PlanLimits {
                 bandwidth_bytes_per_month: None,
                 max_tunnels: None,
                 user_requests_per_minute: ENTERPRISE_USER_REQUESTS_PER_MINUTE,
                 tunnel_requests_per_minute: ENTERPRISE_MAX_REQUESTS_PER_TUNNEL_PER_MINUTE,
+                requests_per_day: ENTERPRISE_REQUESTS_PER_DAY,
             },
             Self::SelfHosted => PlanLimits {
                 bandwidth_bytes_per_month: None,
                 max_tunnels: None,
                 user_requests_per_minute: SELF_HOSTED_USER_REQUESTS_PER_MINUTE,
                 tunnel_requests_per_minute: SELF_HOSTED_MAX_REQUESTS_PER_TUNNEL_PER_MINUTE,
+                requests_per_day: SELF_HOSTED_REQUESTS_PER_DAY,
             },
         }
     }
@@ -86,6 +99,16 @@ struct PlanLimits {
     max_tunnels: Option<u32>,
     user_requests_per_minute: u32,
     tunnel_requests_per_minute: u32,
+    requests_per_day: Option<u32>,
+}
+
+/// Per-user overrides sourced from the control plane's `limits` (fix #5/#18). Each
+/// field, when `Some`, supersedes the plan default.
+#[derive(Debug, Clone, Copy, Default)]
+struct UserLimitOverrides {
+    bandwidth_bytes_per_month: Option<u64>,
+    max_tunnels: Option<u32>,
+    requests_per_day: Option<u32>,
 }
 
 struct PlannedRateLimiter {
@@ -127,6 +150,8 @@ pub enum RateLimitError {
     BandwidthLimitExceeded,
     #[error("free tier tunnel limit exceeded")]
     TunnelLimitExceeded,
+    #[error("daily request limit exceeded")]
+    DailyRequestLimitExceeded,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +176,10 @@ pub struct RateLimiter {
     tunnel_owners: DashMap<TunnelId, UserId>,
     user_plans: DashMap<UserId, SubscriptionPlan>,
     tunnel_plans: DashMap<TunnelId, SubscriptionPlan>,
+    user_limit_overrides: DashMap<UserId, UserLimitOverrides>,
+    /// In-memory daily-request fallback when no state store is configured:
+    /// (day_epoch, count).
+    user_daily_requests: DashMap<UserId, (u64, u64)>,
     state_store: Option<Arc<dyn StateStore>>,
 }
 
@@ -164,6 +193,8 @@ impl std::fmt::Debug for RateLimiter {
             .field("tunnel_owners", &self.tunnel_owners)
             .field("user_plans", &self.user_plans)
             .field("tunnel_plans", &self.tunnel_plans)
+            .field("user_limit_overrides", &self.user_limit_overrides)
+            .field("user_daily_requests", &self.user_daily_requests)
             .field("state_store_configured", &self.state_store.is_some())
             .finish()
     }
@@ -195,6 +226,8 @@ impl RateLimiter {
             tunnel_owners: DashMap::new(),
             user_plans: DashMap::new(),
             tunnel_plans: DashMap::new(),
+            user_limit_overrides: DashMap::new(),
+            user_daily_requests: DashMap::new(),
             state_store,
         }
     }
@@ -291,7 +324,12 @@ impl RateLimiter {
             usage.active_tunnels = 0;
         }
 
-        if let Some(max_tunnels) = plan_limits.max_tunnels {
+        let max_tunnels = self
+            .user_limit_overrides
+            .get(&user_id)
+            .and_then(|entry| entry.max_tunnels)
+            .or(plan_limits.max_tunnels);
+        if let Some(max_tunnels) = max_tunnels {
             if usage.active_tunnels >= max_tunnels {
                 return Err(RateLimitError::TunnelLimitExceeded);
             }
@@ -383,13 +421,125 @@ impl RateLimiter {
         let bandwidth_bytes = self
             .read_store_bandwidth(user_id, month)
             .unwrap_or(fallback_bandwidth);
-        if let Some(max_bandwidth) = plan_limits.bandwidth_bytes_per_month {
+        // Control-plane override (if any) supersedes the plan default (fix #5).
+        let max_bandwidth = self
+            .user_limit_overrides
+            .get(user_id)
+            .and_then(|entry| entry.bandwidth_bytes_per_month)
+            .or(plan_limits.bandwidth_bytes_per_month);
+        if let Some(max_bandwidth) = max_bandwidth {
             if bandwidth_bytes > max_bandwidth {
                 return Err(RateLimitError::BandwidthLimitExceeded);
             }
         }
 
         Ok(())
+    }
+
+    /// Public bandwidth-quota check used by non-HTTP proxy paths (TCP, fix #1).
+    /// Returns `Err(BandwidthLimitExceeded)` when the user is over their monthly cap.
+    pub fn check_bandwidth_quota(&self, user_id: &str) -> Result<(), RateLimitError> {
+        self.ensure_user_quota(&user_id.to_string())
+    }
+
+    /// Record control-plane-provided per-user limit overrides (fix #5/#18).
+    pub fn set_user_limits(&self, user_id: &str, limits: &UserLimits) {
+        self.user_limit_overrides.insert(
+            user_id.to_string(),
+            UserLimitOverrides {
+                bandwidth_bytes_per_month: limits.bandwidth_bytes_per_month,
+                max_tunnels: limits.max_tunnels,
+                requests_per_day: limits.requests_per_day,
+            },
+        );
+    }
+
+    /// Refresh a user's plan and limit ceilings from the control plane (fix #5), then
+    /// return the effective maximum tunnel count so the caller can tear down excess
+    /// tunnels. `None` means unlimited.
+    pub fn update_user_plan(
+        &self,
+        user_id: &str,
+        plan_name: Option<&str>,
+        limits: &UserLimits,
+    ) -> Option<u32> {
+        let plan = SubscriptionPlan::from_name(plan_name);
+        self.user_plans.insert(user_id.to_string(), plan);
+        self.set_user_limits(user_id, limits);
+
+        // Rebuild the user request-rate limiter if the plan changed.
+        if let Some(mut limiter) = self.limits.get_mut(user_id) {
+            if limiter.plan != plan {
+                *limiter = PlannedRateLimiter::new(plan);
+            }
+        }
+
+        // Update plan/limiter for every tunnel this user owns.
+        let owned: Vec<TunnelId> = self
+            .tunnel_owners
+            .iter()
+            .filter(|entry| entry.value() == user_id)
+            .map(|entry| *entry.key())
+            .collect();
+        let tunnel_per_minute = plan.limits().tunnel_requests_per_minute;
+        for tunnel_id in owned {
+            self.tunnel_plans.insert(tunnel_id, plan);
+            self.tunnel_limits
+                .insert(tunnel_id, Self::new_direct_limiter(tunnel_per_minute));
+        }
+
+        limits.max_tunnels.or(plan.limits().max_tunnels)
+    }
+
+    /// Count one request against the user's daily quota and enforce the per-plan (or
+    /// control-plane-overridden) `requests_per_day` ceiling (fix #18). Persists to the
+    /// state store when configured so the count survives restarts and is shared
+    /// process-wide; otherwise uses an in-memory per-day counter.
+    pub fn check_daily_request(&self, user_id: &str) -> Result<(), RateLimitError> {
+        let plan = self
+            .user_plans
+            .get(user_id)
+            .map(|entry| *entry)
+            .unwrap_or(SubscriptionPlan::Free);
+        let limit = self
+            .user_limit_overrides
+            .get(user_id)
+            .and_then(|entry| entry.requests_per_day)
+            .or(plan.limits().requests_per_day);
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+
+        let day = now_unix_secs() / DAY_SECS;
+        let count = if self.state_store.is_some() {
+            let key = Self::daily_request_key(user_id, day);
+            self.call_store_result(async {
+                let Some(store) = &self.state_store else {
+                    return Ok(0);
+                };
+                store.increment_counter(&key, DAY_SECS).await
+            })
+            .unwrap_or(0)
+        } else {
+            let mut entry = self
+                .user_daily_requests
+                .entry(user_id.to_string())
+                .or_insert((day, 0));
+            if entry.0 != day {
+                *entry = (day, 0);
+            }
+            entry.1 = entry.1.saturating_add(1);
+            entry.1
+        };
+
+        if count > u64::from(limit) {
+            return Err(RateLimitError::DailyRequestLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn daily_request_key(user_id: &str, day_epoch: u64) -> String {
+        format!("req:{user_id}:{day_epoch}")
     }
 
     fn bandwidth_key(user_id: &str, month_epoch: u64) -> String {
@@ -523,12 +673,14 @@ pub mod ip_rate_limit {
     #[derive(Debug, Clone)]
     pub struct IpRateLimitLayer {
         limiter: Arc<IpRateLimiter>,
+        trust_cloudflare: bool,
     }
 
     impl IpRateLimitLayer {
-        pub fn new(limiter: IpRateLimiter) -> Self {
+        pub fn new(limiter: IpRateLimiter, trust_cloudflare: bool) -> Self {
             Self {
                 limiter: Arc::new(limiter),
+                trust_cloudflare,
             }
         }
     }
@@ -540,6 +692,7 @@ pub mod ip_rate_limit {
             IpRateLimitMiddleware {
                 inner,
                 limiter: self.limiter.clone(),
+                trust_cloudflare: self.trust_cloudflare,
             }
         }
     }
@@ -548,6 +701,7 @@ pub mod ip_rate_limit {
     pub struct IpRateLimitMiddleware<S> {
         inner: S,
         limiter: Arc<IpRateLimiter>,
+        trust_cloudflare: bool,
     }
 
     impl<S> Service<Request<Body>> for IpRateLimitMiddleware<S>
@@ -564,7 +718,7 @@ pub mod ip_rate_limit {
         }
 
         fn call(&mut self, req: Request<Body>) -> Self::Future {
-            let ip = extract_ip(&req);
+            let ip = extract_ip(&req, self.trust_cloudflare);
             if !self.limiter.check(ip) {
                 crate::metrics::RATE_LIMIT_REJECTIONS.inc();
                 let mut resp = Response::new(Body::from("rate limit exceeded"));
@@ -578,23 +732,93 @@ pub mod ip_rate_limit {
         }
     }
 
-    fn extract_ip(req: &Request<Body>) -> IpAddr {
-        // Prefer X-Forwarded-For from a reverse proxy and take the first entry.
-        if let Some(xff) = req.headers().get("x-forwarded-for") {
-            if let Ok(v) = xff.to_str() {
-                if let Some(first) = v.split(',').next() {
-                    if let Ok(ip) = first.trim().parse::<IpAddr>() {
+    /// Resolve the client IP used for per-IP rate limiting/banning.
+    ///
+    /// Security (fix: XFF-spoofable per-IP limiting): the client-supplied `X-Forwarded-For`
+    /// header is NEVER trusted, because any client can forge it to evade or frame another
+    /// IP. The enforced identity is the real connection peer IP from Axum's `ConnectInfo`.
+    ///
+    /// When `trust_cloudflare` is set (relay deployed behind Cloudflare), we instead honor
+    /// Cloudflare's `CF-Connecting-IP` header — a single, non-list value that Cloudflare sets
+    /// and overwrites on every request. Even then we only accept a well-formed single IP and
+    /// fall back to the peer IP otherwise. `X-Forwarded-For` is ignored in both modes.
+    fn extract_ip(req: &Request<Body>, trust_cloudflare: bool) -> IpAddr {
+        let peer_ip = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip());
+
+        if trust_cloudflare {
+            if let Some(cf_ip) = req.headers().get("cf-connecting-ip") {
+                if let Ok(value) = cf_ip.to_str() {
+                    if let Ok(ip) = value.trim().parse::<IpAddr>() {
                         return ip;
                     }
                 }
             }
         }
 
-        // Fall back to the socket address injected by Axum's ConnectInfo extension.
-        req.extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ci| ci.0.ip())
-            .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+        peer_ip.unwrap_or(IpAddr::from([127, 0, 0, 1]))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::extract_ip;
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use std::net::{IpAddr, SocketAddr};
+
+        fn request_with_peer(peer: &str) -> Request<Body> {
+            let mut req = Request::builder().body(Body::empty()).expect("request");
+            let addr: SocketAddr = format!("{peer}:12345").parse().expect("peer addr");
+            req.extensions_mut().insert(ConnectInfo(addr));
+            req
+        }
+
+        #[test]
+        fn forged_xff_does_not_change_enforced_ip() {
+            let mut req = request_with_peer("203.0.113.7");
+            // Attacker forges X-Forwarded-For claiming to be a different IP.
+            req.headers_mut()
+                .insert("x-forwarded-for", "10.0.0.1, 8.8.8.8".parse().unwrap());
+            // Enforced IP must be the real peer, ignoring the spoofed header.
+            assert_eq!(
+                extract_ip(&req, false),
+                "203.0.113.7".parse::<IpAddr>().unwrap()
+            );
+            // Even in Cloudflare mode, plain XFF is never trusted.
+            assert_eq!(
+                extract_ip(&req, true),
+                "203.0.113.7".parse::<IpAddr>().unwrap()
+            );
+        }
+
+        #[test]
+        fn cf_connecting_ip_trusted_only_when_enabled() {
+            let mut req = request_with_peer("203.0.113.7");
+            req.headers_mut()
+                .insert("cf-connecting-ip", "198.51.100.9".parse().unwrap());
+            // Not behind Cloudflare: ignore the header, use the peer.
+            assert_eq!(
+                extract_ip(&req, false),
+                "203.0.113.7".parse::<IpAddr>().unwrap()
+            );
+            // Behind Cloudflare: trust the validated CF header.
+            assert_eq!(
+                extract_ip(&req, true),
+                "198.51.100.9".parse::<IpAddr>().unwrap()
+            );
+        }
+
+        #[test]
+        fn falls_back_to_peer_when_no_connect_info() {
+            let req = Request::builder().body(Body::empty()).expect("request");
+            assert_eq!(
+                extract_ip(&req, false),
+                "127.0.0.1".parse::<IpAddr>().unwrap()
+            );
+        }
     }
 }
 
@@ -772,6 +996,49 @@ mod tests {
             limiter.check_limit(user_id),
             Err(RateLimitError::BandwidthLimitExceeded)
         ));
+    }
+
+    #[test]
+    fn enforces_daily_request_quota_with_override() {
+        use crate::connection::UserLimits;
+        let limiter = RateLimiter::new();
+        let tunnel_id = TunnelId::new();
+        let user_id = "daily-user".to_string();
+        limiter
+            .register_tunnel(user_id.clone(), tunnel_id, None)
+            .expect("register tunnel");
+        limiter.set_user_limits(
+            &user_id,
+            &UserLimits {
+                requests_per_day: Some(3),
+                ..UserLimits::default()
+            },
+        );
+
+        for _ in 0..3 {
+            limiter
+                .check_daily_request(&user_id)
+                .expect("within daily quota");
+        }
+        assert!(matches!(
+            limiter.check_daily_request(&user_id),
+            Err(RateLimitError::DailyRequestLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn plan_downgrade_reduces_tunnel_cap() {
+        use crate::connection::UserLimits;
+        let limiter = RateLimiter::new();
+        let user_id = "downgrade-user".to_string();
+        for _ in 0..super::PRO_TIER_MAX_TUNNELS {
+            limiter
+                .register_tunnel(user_id.clone(), TunnelId::new(), Some("pro"))
+                .expect("within pro cap");
+        }
+        // Downgrade to free: effective cap becomes FREE_TIER_MAX_TUNNELS.
+        let max = limiter.update_user_plan(&user_id, Some("free"), &UserLimits::default());
+        assert_eq!(max, Some(super::FREE_TIER_MAX_TUNNELS));
     }
 
     #[test]

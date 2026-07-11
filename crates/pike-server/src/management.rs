@@ -2,13 +2,17 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use std::str::FromStr;
+
 use crate::metrics::metrics_handler;
 use anyhow::Context;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{header::AUTHORIZATION, Request, Response, StatusCode};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use pike_core::types::TunnelId;
+use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::json;
@@ -112,6 +116,17 @@ pub fn management_router(registry: Arc<ClientRegistry>, internal_token: &str) ->
         .route("/api/tunnels", get(get_tunnels))
         .route("/api/stats", get(get_stats))
         .route("/api/connections", get(get_connections))
+        // Fix #6c: authenticated push endpoints that act on the LIVE registry so the
+        // control-plane admin gets an immediate enforcement path. They degrade
+        // gracefully: if unreachable, the D1 status + revalidation poll still enforces.
+        .route("/api/tunnels/{id}/suspend", post(suspend_tunnel_handler))
+        .route(
+            "/api/tunnels/{id}/unsuspend",
+            post(unsuspend_tunnel_handler),
+        )
+        .route("/api/users/{id}/disconnect", post(disconnect_user_handler))
+        .route("/api/users/{id}/ban", post(ban_user_handler))
+        .route("/api/users/{id}/unban", post(unban_user_handler))
         .with_state(state)
         .layer(
             ServiceBuilder::new().layer(AsyncRequireAuthorizationLayer::new(
@@ -212,6 +227,100 @@ async fn get_connections(State(state): State<ManagementState>) -> Json<Connectio
     Json(ConnectionsResponse { connections })
 }
 
+fn json_ok(message: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "status": "ok", "message": message }).to_string()))
+        .unwrap_or_else(|_| Response::new(Body::from("ok")))
+}
+
+fn json_error(status: StatusCode, message: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "error": message }).to_string()))
+        .unwrap_or_else(|_| Response::new(Body::from("error")))
+}
+
+/// POST /api/tunnels/:id/suspend — suspend a tunnel on the live registry (persists to
+/// the state store via the abuse detector).
+async fn suspend_tunnel_handler(
+    State(state): State<ManagementState>,
+    Path(tunnel_id): Path<String>,
+) -> Response<Body> {
+    let Ok(parsed) = Uuid::from_str(&tunnel_id) else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid tunnel_id");
+    };
+    match state.registry.abuse_detector.suspend_tunnel(TunnelId(parsed)) {
+        Ok(()) => {
+            tracing::warn!(tunnel_id = %tunnel_id, "tunnel suspended via management API");
+            json_ok("tunnel suspended")
+        }
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+/// POST /api/tunnels/:id/unsuspend — lift a tunnel suspension on the live registry
+/// (clears the state-store record via the abuse detector).
+async fn unsuspend_tunnel_handler(
+    State(state): State<ManagementState>,
+    Path(tunnel_id): Path<String>,
+) -> Response<Body> {
+    let Ok(parsed) = Uuid::from_str(&tunnel_id) else {
+        return json_error(StatusCode::BAD_REQUEST, "invalid tunnel_id");
+    };
+    match state.registry.abuse_detector.unsuspend_tunnel(TunnelId(parsed)) {
+        Ok(()) => {
+            tracing::warn!(tunnel_id = %tunnel_id, "tunnel unsuspended via management API");
+            json_ok("tunnel unsuspended")
+        }
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+/// POST /api/users/:id/disconnect — tear down a user's live QUIC connections and
+/// revoke their session api keys (without a persistent ban).
+async fn disconnect_user_handler(
+    State(state): State<ManagementState>,
+    Path(user_id): Path<String>,
+) -> Response<Body> {
+    if let Err(error) = state.registry.kill_user_tunnels(&user_id).await {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    tracing::warn!(user_id = %user_id, "user disconnected via management API");
+    json_ok("user disconnected")
+}
+
+/// POST /api/users/:id/ban — persistently ban a user and immediately disconnect their
+/// live connections + revoke their session api keys.
+async fn ban_user_handler(
+    State(state): State<ManagementState>,
+    Path(user_id): Path<String>,
+) -> Response<Body> {
+    if let Err(error) = state.registry.abuse_detector.ban_user(user_id.clone()) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    if let Err(error) = state.registry.kill_user_tunnels(&user_id).await {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    tracing::warn!(user_id = %user_id, "user banned via management API");
+    json_ok("user banned")
+}
+
+/// POST /api/users/:id/unban — lift a ban and restore the user's revoked api keys.
+async fn unban_user_handler(
+    State(state): State<ManagementState>,
+    Path(user_id): Path<String>,
+) -> Response<Body> {
+    if let Err(error) = state.registry.abuse_detector.unban_user(user_id.clone()) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    state.registry.restore_user_api_keys(&user_id);
+    tracing::info!(user_id = %user_id, "user unbanned via management API");
+    json_ok("user unbanned")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -304,6 +413,54 @@ mod tests {
             .expect("connections array");
         assert_eq!(connections.len(), 1);
         assert_eq!(connections[0]["client_addr"], "127.0.0.1:50001");
+    }
+
+    #[tokio::test]
+    async fn suspend_endpoint_requires_token() {
+        let app = management_router(Arc::new(ClientRegistry::new()), TOKEN);
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/tunnels/{}/suspend", uuid::Uuid::new_v4()))
+            .body(Body::empty())
+            .expect("request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn suspend_endpoint_suspends_with_valid_token() {
+        let registry = Arc::new(ClientRegistry::new());
+        let tunnel_id = pike_core::types::TunnelId::new();
+        let app = management_router(registry.clone(), TOKEN);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/tunnels/{tunnel_id}/suspend"))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(registry.abuse_detector.is_suspended(&tunnel_id));
+    }
+
+    #[tokio::test]
+    async fn ban_endpoint_bans_with_valid_token() {
+        let registry = Arc::new(ClientRegistry::new());
+        let app = management_router(registry.clone(), TOKEN);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/users/user-123/ban")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .expect("request");
+
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(registry.abuse_detector.is_banned(&"user-123".to_string()));
     }
 
     #[tokio::test]

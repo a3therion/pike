@@ -4,7 +4,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 use pike_core::types::TunnelId;
-use pike_server::connection::{ClientConnection, ConnectionState, ValidatedUser};
+use pike_server::connection::{
+    ClientConnection, ConnectionState, UserLimits, UserStatus, ValidatedUser,
+};
 use pike_server::registry::ClientRegistry;
 use pike_server::tunnel_metrics::TunnelMetricsStore;
 use pike_server::usage_reporter::UsageReporter;
@@ -30,6 +32,8 @@ fn build_registry_with_validated_tunnel(
         email: "test@example.test".to_string(),
         plan: "pro".to_string(),
         plan_expires_at: None,
+        status: UserStatus::Active,
+        limits: UserLimits::default(),
     });
 
     registry.register_client(client).ok();

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket};
@@ -100,7 +100,35 @@ pub enum DashboardEvent {
 
 #[derive(Debug, Deserialize)]
 pub struct DashboardWsQuery {
+    /// Short-lived single-use ticket minted by `POST /api/v1/ws-ticket`. Preferred: it
+    /// keeps the raw JWT out of the WebSocket URL (and therefore out of access logs).
+    pub ticket: Option<String>,
+    /// Legacy direct token (self-hosted static api key, or JWT). Kept as a resilient
+    /// fallback for clients that can't obtain a ticket.
     pub token: Option<String>,
+}
+
+/// Time-to-live for a `ws-ticket`. Long enough to cover a fetch + WebSocket open,
+/// short enough that a leaked ticket is near-useless. Tickets are also single-use.
+pub(crate) const WS_TICKET_TTL: Duration = Duration::from_secs(30);
+
+/// A minted WebSocket auth ticket: the authenticated user plus its creation time.
+#[derive(Debug)]
+pub(crate) struct WsTicketEntry {
+    pub user_id: String,
+    pub created_at: Instant,
+}
+
+/// Shared store of outstanding `ws-ticket`s. Cloned into both the HTTP state (which
+/// mints tickets) and the dashboard WebSocket state (which consumes them).
+pub(crate) type WsTicketStore = Arc<DashMap<String, WsTicketEntry>>;
+
+fn ws_error(status: StatusCode, msg: &'static str) -> axum::response::Response {
+    Response::builder()
+        .status(status)
+        .body(Body::from(msg))
+        .unwrap_or_else(|_| Response::new(Body::from("error")))
+        .into_response()
 }
 
 /// Validate a JWT token by calling the Workers API.
@@ -153,54 +181,56 @@ pub struct DashboardWsState {
     pub local_api_keys: Option<Vec<String>>,
     pub http_client: reqwest::Client,
     pub dev_mode: bool,
+    pub(crate) ws_tickets: WsTicketStore,
 }
 
-/// Axum handler for `GET /ws/dashboard?token=...`
+/// Resolve the authenticated user for a dashboard WebSocket connection. Prefers a
+/// single-use `ticket`; falls back to the legacy `token` (self-hosted static key or JWT)
+/// so older/degraded clients keep working.
+async fn authenticate_dashboard_ws(
+    state: &DashboardWsState,
+    query: &DashboardWsQuery,
+) -> Result<String, axum::response::Response> {
+    // Preferred path: a short-lived, single-use ticket. Consume it (remove) regardless of
+    // expiry so a ticket can never be replayed.
+    if let Some(ticket) = query.ticket.as_deref().filter(|t| !t.is_empty()) {
+        return match state.ws_tickets.remove(ticket) {
+            Some((_, entry)) if entry.created_at.elapsed() <= WS_TICKET_TTL => Ok(entry.user_id),
+            _ => Err(ws_error(StatusCode::UNAUTHORIZED, "invalid or expired ticket")),
+        };
+    }
+
+    // Legacy fallback: a token in the query string.
+    let token = match query.token.as_deref() {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(ws_error(StatusCode::UNAUTHORIZED, "missing ticket")),
+    };
+
+    if let Some(local_keys) = state.local_api_keys.as_deref() {
+        return validate_local_api_key(local_keys, token)
+            .ok_or_else(|| ws_error(StatusCode::UNAUTHORIZED, "invalid token"));
+    }
+
+    let Some(ref url) = state.control_plane_url else {
+        return Err(ws_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth source not configured",
+        ));
+    };
+    validate_token(url, token, &state.http_client)
+        .await
+        .ok_or_else(|| ws_error(StatusCode::UNAUTHORIZED, "invalid token"))
+}
+
+/// Axum handler for `GET /ws/dashboard?ticket=...` (preferred) or `?token=...` (legacy).
 pub async fn dashboard_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<DashboardWsState>,
     Query(query): Query<DashboardWsQuery>,
 ) -> impl IntoResponse {
-    let token = match query.token {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            return Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(Body::from("missing token"))
-                .unwrap_or_else(|_| Response::new(Body::from("unauthorized")))
-                .into_response();
-        }
-    };
-
-    let user_id = if let Some(local_keys) = state.local_api_keys.as_deref() {
-        match validate_local_api_key(local_keys, &token) {
-            Some(uid) => uid,
-            None => {
-                return Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .body(Body::from("invalid token"))
-                    .unwrap_or_else(|_| Response::new(Body::from("unauthorized")))
-                    .into_response();
-            }
-        }
-    } else {
-        let Some(ref url) = state.control_plane_url else {
-            return Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("auth source not configured"))
-                .unwrap_or_else(|_| Response::new(Body::from("unavailable")))
-                .into_response();
-        };
-        match validate_token(url, &token, &state.http_client).await {
-            Some(uid) => uid,
-            None => {
-                return Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .body(Body::from("invalid token"))
-                    .unwrap_or_else(|_| Response::new(Body::from("unauthorized")))
-                    .into_response();
-            }
-        }
+    let user_id = match authenticate_dashboard_ws(&state, &query).await {
+        Ok(uid) => uid,
+        Err(response) => return response,
     };
 
     info!(user_id = %user_id, "dashboard WebSocket upgrading");
@@ -259,4 +289,88 @@ async fn handle_dashboard_ws(
 
     info!(user_id = %user_id, "dashboard WebSocket disconnected");
     broadcaster.remove_if_empty(&user_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(ws_tickets: WsTicketStore, local_api_keys: Option<Vec<String>>) -> DashboardWsState {
+        DashboardWsState {
+            broadcaster: Arc::new(DashboardBroadcaster::new()),
+            control_plane_url: None,
+            local_api_keys,
+            http_client: reqwest::Client::new(),
+            dev_mode: false,
+            ws_tickets,
+        }
+    }
+
+    fn query(ticket: Option<&str>, token: Option<&str>) -> DashboardWsQuery {
+        DashboardWsQuery {
+            ticket: ticket.map(str::to_string),
+            token: token.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_ticket_authenticates_and_is_single_use() {
+        let tickets: WsTicketStore = Arc::new(DashMap::new());
+        tickets.insert(
+            "abc".to_string(),
+            WsTicketEntry {
+                user_id: "user-1".to_string(),
+                created_at: Instant::now(),
+            },
+        );
+        let st = state(tickets, None);
+
+        let first = authenticate_dashboard_ws(&st, &query(Some("abc"), None)).await;
+        assert_eq!(first.unwrap(), "user-1");
+
+        // Second use must fail — the ticket was consumed.
+        let second = authenticate_dashboard_ws(&st, &query(Some("abc"), None)).await;
+        assert_eq!(second.unwrap_err().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn expired_ticket_is_rejected_and_consumed() {
+        let tickets: WsTicketStore = Arc::new(DashMap::new());
+        let past = Instant::now()
+            .checked_sub(WS_TICKET_TTL + Duration::from_secs(5))
+            .expect("instant in the past");
+        tickets.insert(
+            "old".to_string(),
+            WsTicketEntry {
+                user_id: "user-1".to_string(),
+                created_at: past,
+            },
+        );
+        let st = state(tickets.clone(), None);
+
+        let res = authenticate_dashboard_ws(&st, &query(Some("old"), None)).await;
+        assert_eq!(res.unwrap_err().status(), StatusCode::UNAUTHORIZED);
+        // Even an expired ticket is removed so it can't be retried.
+        assert!(tickets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_local_api_key_token_still_works() {
+        let st = state(
+            Arc::new(DashMap::new()),
+            Some(vec!["pk_self_hosted".to_string()]),
+        );
+        let ok = authenticate_dashboard_ws(&st, &query(None, Some("pk_self_hosted"))).await;
+        assert!(ok.unwrap().starts_with("local-"));
+
+        let bad = authenticate_dashboard_ws(&st, &query(None, Some("wrong"))).await;
+        assert_eq!(bad.unwrap_err().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_ticket_and_token_is_rejected() {
+        let st = state(Arc::new(DashMap::new()), None);
+        let res = authenticate_dashboard_ws(&st, &query(None, None)).await;
+        assert_eq!(res.unwrap_err().status(), StatusCode::UNAUTHORIZED);
+    }
 }

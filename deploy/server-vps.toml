@@ -26,6 +26,26 @@ domain = "example.com"
 heartbeat_timeout_secs = 60
 shutdown_timeout_secs = 30
 
+# Max concurrent client connections (hard cap; excess connections are refused).
+max_connections = 1000
+
+# End-to-end timeout (seconds) for a single inbound proxied HTTP request. Protects against
+# slow-loris clients and hung upstreams; returns 504 on expiry. WebSocket upgrades are exempt.
+request_timeout_secs = 30
+
+# Maximum buffered request/response body size in bytes (both directions). Larger bodies are
+# rejected with 413 instead of being buffered into memory. Default 100 MiB.
+max_body_size = 104857600
+
+# Set true ONLY when this relay sits behind Cloudflare. When true, the per-IP rate limiter
+# trusts Cloudflare's validated CF-Connecting-IP header. When false (default) it uses the real
+# connection peer IP and ignores any client-supplied X-Forwarded-For (non-spoofable).
+trust_cloudflare = false
+
+# Optional Sentry DSN for error monitoring. Leave commented / empty to disable (no-op). Can
+# also be supplied via the SENTRY_DSN environment variable.
+# sentry_dsn = "https://<key>@<org>.ingest.sentry.io/<project>"
+
 [quic]
 # 60 second idle timeout (must match client config)
 idle_timeout_ms = 60000

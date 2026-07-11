@@ -17,9 +17,15 @@ use pike_core::types::TunnelId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::runtime::{Handle, RuntimeFlavor};
+use tracing::{error, warn};
 
 use crate::config::AbuseConfig;
 use crate::state_store::StateStore;
+
+/// Default suspension duration persisted to the state store (30 days). Suspensions
+/// are refreshed by the abuse detector/admin actions; a bounded TTL keeps stale
+/// entries from lingering forever if an operator never lifts them.
+const DEFAULT_SUSPEND_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 
 pub type UserId = String;
 
@@ -125,6 +131,7 @@ pub struct AbuseDetector {
     auto_suspend_requests_per_minute: u64,
     phishing_error_rate_percent: u64,
     abuse_log_retention_days: i64,
+    require_redis: bool,
 }
 
 impl fmt::Debug for AbuseDetector {
@@ -198,6 +205,7 @@ impl AbuseDetector {
             auto_suspend_requests_per_minute: config.auto_suspend_requests_per_minute,
             phishing_error_rate_percent: config.phishing_error_rate_percent,
             abuse_log_retention_days: config.abuse_log_retention_days,
+            require_redis: config.require_redis,
         }
     }
 
@@ -385,6 +393,21 @@ impl AbuseDetector {
 
     pub fn suspend_tunnel(&self, tunnel_id: TunnelId) -> Result<(), AbuseError> {
         self.suspended_tunnels.insert(tunnel_id);
+        // Fix #6b: persist to the shared state store (like ban_user) so the suspension
+        // survives restarts and is visible process-wide, not just in this instance's set.
+        let tunnel_id_string = tunnel_id.to_string();
+        let _ = self.call_store_result(async {
+            let Some(store) = &self.state_store else {
+                return Ok(());
+            };
+            store
+                .suspend_tunnel(
+                    &tunnel_id_string,
+                    "tunnel suspended",
+                    DEFAULT_SUSPEND_DURATION_SECS,
+                )
+                .await
+        });
         self.log_abuse(AbuseLogEntry {
             timestamp: Utc::now(),
             source_ip: None,
@@ -406,6 +429,20 @@ impl AbuseDetector {
         Ok(())
     }
 
+    /// Lift a tunnel suspension. Mirrors [`Self::suspend_tunnel`]: clears the in-memory
+    /// set and the shared state store so the tunnel is servable again process-wide.
+    pub fn unsuspend_tunnel(&self, tunnel_id: TunnelId) -> Result<(), AbuseError> {
+        self.suspended_tunnels.remove(&tunnel_id);
+        let tunnel_id_string = tunnel_id.to_string();
+        let _ = self.call_store_result(async {
+            let Some(store) = &self.state_store else {
+                return Ok(());
+            };
+            store.unsuspend_tunnel(&tunnel_id_string).await
+        });
+        Ok(())
+    }
+
     #[must_use]
     pub fn list_bans(&self) -> Vec<UserId> {
         self.banned_users
@@ -420,26 +457,72 @@ impl AbuseDetector {
             return true;
         }
 
-        let is_banned_in_store = self
-            .call_store_result(async {
-                let Some(store) = &self.state_store else {
-                    return Ok(false);
-                };
-                store.is_banned(user_id).await
-            })
-            .unwrap_or(false);
-
-        if is_banned_in_store {
-            self.banned_users.insert(user_id.clone());
-            return true;
+        // Fix #9: previously this did `.unwrap_or(false)`, so a mid-flight Redis outage
+        // silently treated everyone as not-banned (fail-open). We now distinguish a
+        // genuine "not banned" (Ok(false)) from a store error.
+        //
+        // Chosen behavior on store error: fall back to the local `banned_users` cache
+        // (already consulted above, hence effectively "not banned" for uncached users)
+        // AND emit a loud error + metric. We deliberately do NOT globally deny all
+        // logins on a store outage — that would lock out every legitimate user and turn
+        // a Redis blip into a full outage — but we make the degradation loud and
+        // measurable so operators notice that ban enforcement is impaired. Users already
+        // banned in this process's cache stay banned regardless of store health.
+        match self.call_store_result(async {
+            let Some(store) = &self.state_store else {
+                return Ok(false);
+            };
+            store.is_banned(user_id).await
+        }) {
+            Ok(true) => {
+                self.banned_users.insert(user_id.clone());
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                crate::metrics::BAN_CHECK_ERRORS.inc();
+                if self.require_redis {
+                    error!(error = %err, user_id = %user_id, "ban-status lookup against required state store failed; ban enforcement DEGRADED to local cache");
+                } else {
+                    warn!(error = %err, user_id = %user_id, "ban-status lookup against state store failed; falling back to local ban cache");
+                }
+                false
+            }
         }
-
-        false
     }
 
     #[must_use]
     pub fn is_suspended(&self, tunnel_id: &TunnelId) -> bool {
+        // Hot path: in-memory only, never blocks. This is checked on every proxied
+        // request, so it must not do a Redis round-trip. The durable store is reconciled
+        // into this set out-of-band via `refresh_tunnel_suspension` (at tunnel
+        // registration and on the periodic revalidation pass), so a suspension persisted
+        // by a previous run / another instance is still honored — just without a
+        // per-request `block_on` against the store.
         self.suspended_tunnels.contains(tunnel_id)
+    }
+
+    /// Reconcile a single tunnel's suspension state from the durable store into the
+    /// in-memory set. Must be called OFF the request hot path (tunnel registration +
+    /// periodic revalidation).
+    ///
+    /// ADD-only: a store hit inserts into the set, but a store miss never removes.
+    /// Auto-suspensions (see [`Self::record_request`]) live in memory only and are not
+    /// persisted, so a `false` from the store must not clobber them. Local unsuspends go
+    /// through [`Self::unsuspend_tunnel`], which removes from the set directly.
+    pub async fn refresh_tunnel_suspension(&self, tunnel_id: TunnelId) {
+        let Some(store) = &self.state_store else {
+            return;
+        };
+        match store.is_tunnel_suspended(&tunnel_id.to_string()).await {
+            Ok(true) => {
+                self.suspended_tunnels.insert(tunnel_id);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(error = %err, tunnel_id = %tunnel_id, "failed to refresh tunnel suspension from store");
+            }
+        }
     }
 
     pub fn log_abuse(&self, entry: AbuseLogEntry) {
@@ -590,6 +673,29 @@ mod tests {
 
         let detector_after_restart = AbuseDetector::with_store(AbuseConfig::default(), store);
         assert!(detector_after_restart.is_banned(&user));
+    }
+
+    #[tokio::test]
+    async fn test_suspended_tunnel_persists() {
+        let store = Arc::new(InMemoryStateStore::new()) as Arc<dyn StateStore>;
+        let detector = AbuseDetector::with_store(AbuseConfig::default(), store.clone());
+        let tunnel_id = TunnelId::new();
+
+        detector.suspend_tunnel(tunnel_id).expect("suspend tunnel");
+        // suspend_tunnel updates the in-memory set on this instance directly.
+        assert!(detector.is_suspended(&tunnel_id));
+
+        // The suspension is persisted to the store (fix #6b). is_suspended is now an
+        // in-memory-only hot-path check, so a fresh detector doesn't see it until the
+        // store is reconciled off the hot path via refresh_tunnel_suspension (called at
+        // tunnel registration + on the revalidation pass). Before the refresh it is
+        // absent; after, it is present.
+        let detector_after_restart = AbuseDetector::with_store(AbuseConfig::default(), store);
+        assert!(!detector_after_restart.is_suspended(&tunnel_id));
+        detector_after_restart
+            .refresh_tunnel_suspension(tunnel_id)
+            .await;
+        assert!(detector_after_restart.is_suspended(&tunnel_id));
     }
 
     #[tokio::test]

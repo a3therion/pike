@@ -164,6 +164,18 @@ pub async fn create_default_config(path: &Path) -> Result<()> {
         tokio::fs::create_dir_all(parent)
             .await
             .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
+            let perms = Permissions::from_mode(0o700);
+            tokio::fs::set_permissions(parent, perms)
+                .await
+                .with_context(|| {
+                    format!("failed to secure config directory {}", parent.display())
+                })?;
+        }
     }
 
     let default = Config::default();
@@ -189,7 +201,19 @@ pub async fn save_config(path: &Path, config: &Config) -> Result<()> {
     let content = toml::to_string_pretty(config).context("failed to serialize config")?;
     tokio::fs::write(path, content)
         .await
-        .with_context(|| format!("failed to write config file {}", path.display()))
+        .with_context(|| format!("failed to write config file {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        let perms = Permissions::from_mode(0o600);
+        tokio::fs::set_permissions(path, perms)
+            .await
+            .with_context(|| format!("failed to secure config file {}", path.display()))?;
+    }
+
+    Ok(())
 }
 
 pub async fn watch_config<F>(path: PathBuf, on_change: F) -> Result<()>
