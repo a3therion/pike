@@ -205,9 +205,7 @@ impl ControlPlaneClient {
                 // Any other non-success (3xx/4xx besides 401) is ambiguous — treat as
                 // transient so we never disconnect a live user on an unexpected response.
                 error!(url = %url, status = %status, "API key validation returned unexpected status");
-                return ApiKeyValidation::Unavailable(format!(
-                    "auth validation returned {status}"
-                ));
+                return ApiKeyValidation::Unavailable(format!("auth validation returned {status}"));
             }
 
             let body: ValidateApiKeyResponse = match response.json().await {

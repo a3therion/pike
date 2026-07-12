@@ -196,7 +196,10 @@ async fn authenticate_dashboard_ws(
     if let Some(ticket) = query.ticket.as_deref().filter(|t| !t.is_empty()) {
         return match state.ws_tickets.remove(ticket) {
             Some((_, entry)) if entry.created_at.elapsed() <= WS_TICKET_TTL => Ok(entry.user_id),
-            _ => Err(ws_error(StatusCode::UNAUTHORIZED, "invalid or expired ticket")),
+            _ => Err(ws_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid or expired ticket",
+            )),
         };
     }
 

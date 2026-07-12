@@ -6,13 +6,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pike_core::types::TunnelId;
 use pike_server::{
     config::TrafficInspectionConfig, dashboard_ws::DashboardBroadcaster, http::run_http_server,
     ingest::RequestBuffer, proxy::TunnelRequest, registry::ClientRegistry,
     request_log::RequestLogStore, router::TunnelEntry, router::VhostRouter,
     tunnel_metrics::TunnelMetricsStore,
 };
-use pike_core::types::TunnelId;
 use tokio::sync::{mpsc, watch};
 
 #[tokio::test]

@@ -11,13 +11,13 @@ use axum::extract::{Path, State};
 use axum::http::{header::AUTHORIZATION, Request, Response, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use pike_core::types::TunnelId;
-use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use pike_core::types::TunnelId;
 use serde::Serialize;
 use serde_json::json;
 use tower::ServiceBuilder;
 use tower_http::auth::{AsyncAuthorizeRequest, AsyncRequireAuthorizationLayer};
+use uuid::Uuid;
 
 use crate::registry::ClientRegistry;
 
@@ -231,7 +231,9 @@ fn json_ok(message: &str) -> Response<Body> {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "status": "ok", "message": message }).to_string()))
+        .body(Body::from(
+            json!({ "status": "ok", "message": message }).to_string(),
+        ))
         .unwrap_or_else(|_| Response::new(Body::from("ok")))
 }
 
@@ -252,7 +254,11 @@ async fn suspend_tunnel_handler(
     let Ok(parsed) = Uuid::from_str(&tunnel_id) else {
         return json_error(StatusCode::BAD_REQUEST, "invalid tunnel_id");
     };
-    match state.registry.abuse_detector.suspend_tunnel(TunnelId(parsed)) {
+    match state
+        .registry
+        .abuse_detector
+        .suspend_tunnel(TunnelId(parsed))
+    {
         Ok(()) => {
             tracing::warn!(tunnel_id = %tunnel_id, "tunnel suspended via management API");
             json_ok("tunnel suspended")
@@ -270,7 +276,11 @@ async fn unsuspend_tunnel_handler(
     let Ok(parsed) = Uuid::from_str(&tunnel_id) else {
         return json_error(StatusCode::BAD_REQUEST, "invalid tunnel_id");
     };
-    match state.registry.abuse_detector.unsuspend_tunnel(TunnelId(parsed)) {
+    match state
+        .registry
+        .abuse_detector
+        .unsuspend_tunnel(TunnelId(parsed))
+    {
         Ok(()) => {
             tracing::warn!(tunnel_id = %tunnel_id, "tunnel unsuspended via management API");
             json_ok("tunnel unsuspended")

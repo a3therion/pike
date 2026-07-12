@@ -445,8 +445,7 @@ pub async fn run_http_server(
             interval.tick().await;
             sse_tokens_for_eviction
                 .retain(|_, entry| entry.created_at.elapsed() <= Duration::from_secs(60));
-            ws_tickets_for_eviction
-                .retain(|_, entry| entry.created_at.elapsed() <= WS_TICKET_TTL);
+            ws_tickets_for_eviction.retain(|_, entry| entry.created_at.elapsed() <= WS_TICKET_TTL);
         }
     });
 
@@ -594,241 +593,239 @@ async fn handle_request(
     // were already returned above and are intentionally exempt (long-lived by design).
     let request_timeout = state.request_timeout;
     let proxy_future = async move {
-    // Capture method and path for live event broadcasting.
-    let req_method = req.method().to_string();
-    // Fix #17: keep the path but redact the VALUES of sensitive query-string params
-    // (tokens, secrets, session ids, ...) so we do not persist tunneled-request secrets,
-    // using the same field-name heuristic as header/body redaction.
-    let req_path = redact_path_query(
-        req.uri().path(),
-        req.uri().query(),
-    );
+        // Capture method and path for live event broadcasting.
+        let req_method = req.method().to_string();
+        // Fix #17: keep the path but redact the VALUES of sensitive query-string params
+        // (tokens, secrets, session ids, ...) so we do not persist tunneled-request secrets,
+        // using the same field-name heuristic as header/body redaction.
+        let req_path = redact_path_query(req.uri().path(), req.uri().query());
 
-    // Capture request headers and body preview
-    let req_content_type = content_type_str(req.headers());
-    let req_headers_json = maybe_capture_headers(req.headers(), &state.traffic_inspection);
+        // Capture request headers and body preview
+        let req_content_type = content_type_str(req.headers());
+        let req_headers_json = maybe_capture_headers(req.headers(), &state.traffic_inspection);
 
-    // Fix #3: buffer the request body once so we meter the ACTUAL number of bytes
-    // (chunked/streamed uploads carry no Content-Length, so the header-based figure
-    // is 0). The tunnel protocol buffers the whole request downstream anyway, so this
-    // does not lose streaming we did not already lose. Preview reuses the same buffer.
-    //
-    // TODO(memory-bound): this materializes the full body in memory. It is NOT a new
-    // vector — the localhop/QUIC tunnel path already buffers the entire body (see the
-    // known "uncapped response-body buffering over QUIC" item) — but the correct fix is
-    // a single max-body-size cap enforced at the tunnel-protocol layer for BOTH
-    // directions (reject with 413 rather than truncate; truncating here would corrupt
-    // the forwarded body). Metering already reads the true length from this buffer, so
-    // that cap can be added without touching the accounting below.
-    let (req_parts, req_body) = req.into_parts();
-    // Fix: bound the buffered request body at max_body_size and reject with 413 instead of
-    // OOMing. The tower RequestBodyLimitLayer already enforces this at the edge; this is
-    // defense-in-depth for the manual buffering below.
-    let Ok(req_body_bytes) = axum::body::to_bytes(req_body, state.max_body_size).await else {
-        crate::metrics::ERROR_RATE
-            .with_label_values(&["request_body_too_large"])
-            .inc();
-        return build_payload_too_large_response();
-    };
-    let request_body_len = req_body_bytes.len() as u64;
-    let req_body_preview = if should_capture_body_preview(
-        &state.traffic_inspection,
-        req_content_type.as_deref(),
-        request_body_len,
-    ) {
-        preview_body(
-            &req_body_bytes,
-            state.traffic_inspection.max_body_preview_bytes,
+        // Fix #3: buffer the request body once so we meter the ACTUAL number of bytes
+        // (chunked/streamed uploads carry no Content-Length, so the header-based figure
+        // is 0). The tunnel protocol buffers the whole request downstream anyway, so this
+        // does not lose streaming we did not already lose. Preview reuses the same buffer.
+        //
+        // TODO(memory-bound): this materializes the full body in memory. It is NOT a new
+        // vector — the localhop/QUIC tunnel path already buffers the entire body (see the
+        // known "uncapped response-body buffering over QUIC" item) — but the correct fix is
+        // a single max-body-size cap enforced at the tunnel-protocol layer for BOTH
+        // directions (reject with 413 rather than truncate; truncating here would corrupt
+        // the forwarded body). Metering already reads the true length from this buffer, so
+        // that cap can be added without touching the accounting below.
+        let (req_parts, req_body) = req.into_parts();
+        // Fix: bound the buffered request body at max_body_size and reject with 413 instead of
+        // OOMing. The tower RequestBodyLimitLayer already enforces this at the edge; this is
+        // defense-in-depth for the manual buffering below.
+        let Ok(req_body_bytes) = axum::body::to_bytes(req_body, state.max_body_size).await else {
+            crate::metrics::ERROR_RATE
+                .with_label_values(&["request_body_too_large"])
+                .inc();
+            return build_payload_too_large_response();
+        };
+        let request_body_len = req_body_bytes.len() as u64;
+        let req_body_preview = if should_capture_body_preview(
+            &state.traffic_inspection,
             req_content_type.as_deref(),
-        )
-    } else {
-        None
-    };
-    req = Request::from_parts(req_parts, Body::from(req_body_bytes));
+            request_body_len,
+        ) {
+            preview_body(
+                &req_body_bytes,
+                state.traffic_inspection.max_body_preview_bytes,
+                req_content_type.as_deref(),
+            )
+        } else {
+            None
+        };
+        req = Request::from_parts(req_parts, Body::from(req_body_bytes));
 
-    let proxy_start = Instant::now();
+        let proxy_start = Instant::now();
 
-    if let Some(signature) = state
-        .registry
-        .abuse_detector
-        .check_malware_signature(req.uri().path().as_bytes())
-    {
-        state
+        if let Some(signature) = state
             .registry
             .abuse_detector
-            .log_abuse(crate::abuse::AbuseLogEntry {
-                timestamp: chrono::Utc::now(),
-                source_ip: Some(client_addr.ip()),
-                user_id: None,
-                tunnel_id: tunnel_entry.as_ref().map(|entry| entry.tunnel_id),
-                request_count_per_minute: None,
-                bandwidth_bytes: Some(request_body_len),
-                reason: format!("matched malware signature {signature}"),
-            });
-        return Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(Body::from("request blocked by malware signature"))
-            .unwrap_or_else(|_| Response::new(Body::from("blocked")));
-    }
+            .check_malware_signature(req.uri().path().as_bytes())
+        {
+            state
+                .registry
+                .abuse_detector
+                .log_abuse(crate::abuse::AbuseLogEntry {
+                    timestamp: chrono::Utc::now(),
+                    source_ip: Some(client_addr.ip()),
+                    user_id: None,
+                    tunnel_id: tunnel_entry.as_ref().map(|entry| entry.tunnel_id),
+                    request_count_per_minute: None,
+                    bandwidth_bytes: Some(request_body_len),
+                    reason: format!("matched malware signature {signature}"),
+                });
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from("request blocked by malware signature"))
+                .unwrap_or_else(|_| Response::new(Body::from("blocked")));
+        }
 
-    let mut response = match proxy_request(state.router, req).await {
-        Ok(response) => response,
-        Err(err) => {
+        let mut response = match proxy_request(state.router, req).await {
+            Ok(response) => response,
+            Err(err) => {
+                crate::metrics::ERROR_RATE
+                    .with_label_values(&["proxy_error"])
+                    .inc();
+                build_error_response(err, &state.domain)
+            }
+        };
+
+        if let Some(headers) = &rate_limit_headers {
+            apply_rate_limit_headers(response.headers_mut(), headers);
+        }
+
+        let response_time_ms = proxy_start.elapsed().as_millis() as u64;
+
+        // Capture response headers
+        let resp_content_type = content_type_str(response.headers());
+        let resp_headers_json =
+            maybe_capture_headers(response.headers(), &state.traffic_inspection);
+
+        // Fix #3: buffer the response body to meter the ACTUAL bytes returned. Chunked
+        // upstream responses may carry no Content-Length, so the header value defaults to
+        // 0 and would otherwise be billed as unmetered. Tunneled responses are already
+        // fully buffered by the localhop protocol, so this preserves current behavior.
+        let (resp_parts, resp_body) = response.into_parts();
+        // Fix: cap the buffered response body from the tunnel at max_body_size and reject with
+        // 413 rather than buffering an unbounded body into memory (OOM protection, both
+        // directions).
+        let Ok(resp_body_bytes) = axum::body::to_bytes(resp_body, state.max_body_size).await else {
             crate::metrics::ERROR_RATE
-                .with_label_values(&["proxy_error"])
+                .with_label_values(&["response_body_too_large"])
                 .inc();
-            build_error_response(err, &state.domain)
-        }
-    };
-
-    if let Some(headers) = &rate_limit_headers {
-        apply_rate_limit_headers(response.headers_mut(), headers);
-    }
-
-    let response_time_ms = proxy_start.elapsed().as_millis() as u64;
-
-    // Capture response headers
-    let resp_content_type = content_type_str(response.headers());
-    let resp_headers_json = maybe_capture_headers(response.headers(), &state.traffic_inspection);
-
-    // Fix #3: buffer the response body to meter the ACTUAL bytes returned. Chunked
-    // upstream responses may carry no Content-Length, so the header value defaults to
-    // 0 and would otherwise be billed as unmetered. Tunneled responses are already
-    // fully buffered by the localhop protocol, so this preserves current behavior.
-    let (resp_parts, resp_body) = response.into_parts();
-    // Fix: cap the buffered response body from the tunnel at max_body_size and reject with
-    // 413 rather than buffering an unbounded body into memory (OOM protection, both
-    // directions).
-    let Ok(resp_body_bytes) = axum::body::to_bytes(resp_body, state.max_body_size).await else {
-        crate::metrics::ERROR_RATE
-            .with_label_values(&["response_body_too_large"])
-            .inc();
-        return build_payload_too_large_response();
-    };
-    let response_body_len = resp_body_bytes.len() as u64;
-    let resp_body_preview = if should_capture_body_preview(
-        &state.traffic_inspection,
-        resp_content_type.as_deref(),
-        response_body_len,
-    ) {
-        preview_body(
-            &resp_body_bytes,
-            state.traffic_inspection.max_body_preview_bytes,
+            return build_payload_too_large_response();
+        };
+        let response_body_len = resp_body_bytes.len() as u64;
+        let resp_body_preview = if should_capture_body_preview(
+            &state.traffic_inspection,
             resp_content_type.as_deref(),
-        )
-    } else {
-        None
-    };
-    let response = Response::from_parts(resp_parts, Body::from(resp_body_bytes));
+            response_body_len,
+        ) {
+            preview_body(
+                &resp_body_bytes,
+                state.traffic_inspection.max_body_preview_bytes,
+                resp_content_type.as_deref(),
+            )
+        } else {
+            None
+        };
+        let response = Response::from_parts(resp_parts, Body::from(resp_body_bytes));
 
-    if let Some(tunnel) = tunnel_entry {
-        let status_code = response.status().as_u16();
-        state
-            .registry
-            .record_tunnel_request(tunnel.tunnel_id, status_code);
-        let response_content_length = response_body_len;
-        let total_bytes = request_body_len.saturating_add(response_content_length);
-        state
-            .registry
-            .track_bandwidth(tunnel.tunnel_id, request_body_len);
-        state
-            .registry
-            .track_bandwidth_out(tunnel.tunnel_id, response_content_length);
+        if let Some(tunnel) = tunnel_entry {
+            let status_code = response.status().as_u16();
+            state
+                .registry
+                .record_tunnel_request(tunnel.tunnel_id, status_code);
+            let response_content_length = response_body_len;
+            let total_bytes = request_body_len.saturating_add(response_content_length);
+            state
+                .registry
+                .track_bandwidth(tunnel.tunnel_id, request_body_len);
+            state
+                .registry
+                .track_bandwidth_out(tunnel.tunnel_id, response_content_length);
 
-        crate::metrics::BYTES_TRANSFERRED
-            .with_label_values(&["in"])
-            .inc_by(request_body_len as f64);
-        crate::metrics::BYTES_TRANSFERRED
-            .with_label_values(&["out"])
-            .inc_by(response_content_length as f64);
-        crate::metrics::REQUEST_LATENCY
-            .with_label_values(&["http"])
-            .observe(response_time_ms as f64 / 1000.0);
+            crate::metrics::BYTES_TRANSFERRED
+                .with_label_values(&["in"])
+                .inc_by(request_body_len as f64);
+            crate::metrics::BYTES_TRANSFERRED
+                .with_label_values(&["out"])
+                .inc_by(response_content_length as f64);
+            crate::metrics::REQUEST_LATENCY
+                .with_label_values(&["http"])
+                .observe(response_time_ms as f64 / 1000.0);
 
-        // Log request for per-tunnel request log API
-        {
-            let log_entry = crate::request_log::RequestLogEntry {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                method: req_method.clone(),
-                path: req_path.clone(),
-                status_code,
-                duration_ms: response_time_ms,
-                request_size: request_body_len,
-                response_size: response_content_length,
-                tunnel_id: tunnel.tunnel_id.to_string(),
-            };
-            let store = state.request_log_store.clone();
-            tokio::spawn(async move {
-                store.log(log_entry).await;
-            });
-        }
-
-        {
-            let store = state.tunnel_metrics_store.clone();
-            let tunnel_id = tunnel.tunnel_id.to_string();
-            tokio::spawn(async move {
-                store
-                    .record(
-                        &tunnel_id,
-                        status_code,
-                        response_time_ms,
-                        request_body_len,
-                        response_content_length,
-                    )
-                    .await;
-            });
-        }
-
-        // Broadcast live request to dashboard subscribers
-        if let Some(user_id) = state.registry.user_id_for_connection(&tunnel.connection_id) {
-            let timestamp = chrono::Utc::now().to_rfc3339();
-            let event = DashboardEvent::LiveRequest {
-                tunnel_id: tunnel.tunnel_id.to_string(),
-                subdomain: subdomain.clone(),
-                method: req_method.clone(),
-                path: req_path.clone(),
-                status_code,
-                response_time_ms,
-                bytes: total_bytes,
-                client_ip: client_addr.ip().to_string(),
-                timestamp: timestamp.clone(),
-                request_headers: req_headers_json.clone(),
-                request_body: req_body_preview.clone(),
-                response_headers: resp_headers_json.clone(),
-                response_body: resp_body_preview.clone(),
-                request_content_type: req_content_type.clone(),
-                response_content_type: resp_content_type.clone(),
-            };
-            if let Ok(json) = serde_json::to_string(&event) {
-                state.broadcaster.broadcast(&user_id, &json);
+            // Log request for per-tunnel request log API
+            {
+                let log_entry = crate::request_log::RequestLogEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    method: req_method.clone(),
+                    path: req_path.clone(),
+                    status_code,
+                    duration_ms: response_time_ms,
+                    request_size: request_body_len,
+                    response_size: response_content_length,
+                    tunnel_id: tunnel.tunnel_id.to_string(),
+                };
+                let store = state.request_log_store.clone();
+                tokio::spawn(async move {
+                    store.log(log_entry).await;
+                });
             }
 
-            // Push to ingest buffer for D1 persistence
-            let entry = IngestEntry {
-                user_id,
-                tunnel_id: tunnel.tunnel_id.to_string(),
-                subdomain: subdomain.clone(),
-                method: req_method,
-                path: req_path,
-                status_code,
-                response_time_ms,
-                bytes_transferred: total_bytes,
-                client_ip: client_addr.ip().to_string(),
-                timestamp,
-                request_headers: req_headers_json,
-                request_body: req_body_preview,
-                response_headers: resp_headers_json,
-                response_body: resp_body_preview,
-                request_content_type: req_content_type,
-                response_content_type: resp_content_type,
-            };
-            let buffer = state.ingest_buffer.clone();
-            tokio::spawn(async move {
-                buffer.push(entry).await;
-            });
+            {
+                let store = state.tunnel_metrics_store.clone();
+                let tunnel_id = tunnel.tunnel_id.to_string();
+                tokio::spawn(async move {
+                    store
+                        .record(
+                            &tunnel_id,
+                            status_code,
+                            response_time_ms,
+                            request_body_len,
+                            response_content_length,
+                        )
+                        .await;
+                });
+            }
+
+            // Broadcast live request to dashboard subscribers
+            if let Some(user_id) = state.registry.user_id_for_connection(&tunnel.connection_id) {
+                let timestamp = chrono::Utc::now().to_rfc3339();
+                let event = DashboardEvent::LiveRequest {
+                    tunnel_id: tunnel.tunnel_id.to_string(),
+                    subdomain: subdomain.clone(),
+                    method: req_method.clone(),
+                    path: req_path.clone(),
+                    status_code,
+                    response_time_ms,
+                    bytes: total_bytes,
+                    client_ip: client_addr.ip().to_string(),
+                    timestamp: timestamp.clone(),
+                    request_headers: req_headers_json.clone(),
+                    request_body: req_body_preview.clone(),
+                    response_headers: resp_headers_json.clone(),
+                    response_body: resp_body_preview.clone(),
+                    request_content_type: req_content_type.clone(),
+                    response_content_type: resp_content_type.clone(),
+                };
+                if let Ok(json) = serde_json::to_string(&event) {
+                    state.broadcaster.broadcast(&user_id, &json);
+                }
+
+                // Push to ingest buffer for D1 persistence
+                let entry = IngestEntry {
+                    user_id,
+                    tunnel_id: tunnel.tunnel_id.to_string(),
+                    subdomain: subdomain.clone(),
+                    method: req_method,
+                    path: req_path,
+                    status_code,
+                    response_time_ms,
+                    bytes_transferred: total_bytes,
+                    client_ip: client_addr.ip().to_string(),
+                    timestamp,
+                    request_headers: req_headers_json,
+                    request_body: req_body_preview,
+                    response_headers: resp_headers_json,
+                    response_body: resp_body_preview,
+                    request_content_type: req_content_type,
+                    response_content_type: resp_content_type,
+                };
+                let buffer = state.ingest_buffer.clone();
+                tokio::spawn(async move {
+                    buffer.push(entry).await;
+                });
+            }
         }
-    }
 
         response
     };
