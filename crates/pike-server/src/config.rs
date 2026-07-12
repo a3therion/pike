@@ -36,8 +36,10 @@ const DEFAULT_DEPLOYMENT_TOPOLOGY: &str = "single-node";
 /// read; WebSocket upgrades are exempt (long-lived by design).
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Maximum buffered request/response body size, both directions. Bodies larger than this are
-/// rejected with 413 instead of being buffered into memory (OOM protection).
-const DEFAULT_MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
+/// rejected with 413 instead of being buffered into memory (OOM protection). Kept modest because
+/// the proxy buffers whole bodies in memory per in-flight request; raise via `max_body_size` in
+/// server.toml if a deployment needs larger uploads and has the headroom.
+const DEFAULT_MAX_BODY_SIZE: usize = 32 * 1024 * 1024;
 /// When false (default), the enforced per-IP identity is the real connection peer IP and any
 /// client-supplied `X-Forwarded-For` is ignored (non-spoofable). Set true ONLY when the relay
 /// sits behind Cloudflare, in which case the validated `CF-Connecting-IP` header is trusted.
@@ -278,7 +280,8 @@ impl ServerConfig {
             })
             .context("internal_token is required when not running in --dev-mode")?;
 
-        if !dev_mode && (internal_token == DEFAULT_INTERNAL_TOKEN || is_placeholder_secret(&internal_token))
+        if !dev_mode
+            && (internal_token == DEFAULT_INTERNAL_TOKEN || is_placeholder_secret(&internal_token))
         {
             anyhow::bail!(
                 "internal_token cannot be the default/placeholder value in production mode. \

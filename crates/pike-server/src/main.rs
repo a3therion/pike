@@ -513,6 +513,20 @@ async fn spawn_accept_loop(
                                                         ControlMessage::RegisterTunnel { config } => {
                                                             let tunnel_id = config.id;
                                                             info!(tunnel_id = %tunnel_id, "RegisterTunnel message received");
+                                                            // No TCP data plane exists yet: a TCP registration would be
+                                                            // acknowledged with a remote_port that nothing binds, giving the
+                                                            // user a silently dead endpoint. Reject until the forwarder ships.
+                                                            if matches!(&config.tunnel_type, TunnelType::Tcp { .. }) {
+                                                                warn!(tunnel_id = %tunnel_id, "Rejecting TCP tunnel registration: no TCP data plane");
+                                                                let _ = outbound_tx
+                                                                    .send(PikeOutboundMessage::Control(ControlMessage::TunnelError {
+                                                                        tunnel_id,
+                                                                        reason: "TCP tunnels are not yet available on this relay"
+                                                                            .to_string(),
+                                                                    }))
+                                                                    .await;
+                                                                continue;
+                                                            }
                                                             let api_key = registry_for_conn
                                                                 .clients
                                                                 .get(&connection_id)
@@ -644,6 +658,10 @@ async fn spawn_accept_loop(
                                                                 let ws_relays = ws_relays.clone();
                                                                 let tunnel_metrics_store = tunnel_metrics_store_for_conn.clone();
                                                                 let registry_ws_forwarder = registry_for_conn.clone();
+                                                                // Same limit the HTTP edge enforces (413 layer); keeps the
+                                                                // inner encode cap from silently rejecting bodies the edge
+                                                                // already accepted.
+                                                                let max_body_size = server_config.max_body_size;
                                                                 http_forwarders.push(tokio::spawn(async move {
                                                                     while let Some(tunnel_req) = http_rx.recv().await {
                                                                         match tunnel_req {
@@ -655,7 +673,7 @@ async fn spawn_accept_loop(
                                                                                     ..
                                                                                 } = *http_request;
 
-                                                                                let encoded_request = match encode_http_request(request).await {
+                                                                                let encoded_request = match encode_http_request(request, max_body_size).await {
                                                                                     Ok(encoded) => encoded,
                                                                                     Err(error) => {
                                                                                         let _ = response_tx.send(Err(error));
@@ -1048,6 +1066,7 @@ async fn revalidate_connections(
                 // path's own validation rejects any reconnect, and not touching the
                 // revoked set means a later false-positive can never persist.
                 warn!("revalidation: api key no longer valid; disconnecting");
+                auth_cache.remove(&api_key);
                 disconnect_connections(registry, vhost_router, &conn_ids);
                 pike_server::metrics::REVALIDATION_DISCONNECTS.inc();
             }
@@ -1056,6 +1075,7 @@ async fn revalidate_connections(
                 let banned = registry.abuse_detector.is_banned(&user.user_id);
                 if !user.status.is_active() || banned {
                     warn!(user_id = %user.user_id, banned, "revalidation: user suspended/banned; disconnecting");
+                    auth_cache.remove(&api_key);
                     disconnect_connections(registry, vhost_router, &conn_ids);
                     pike_server::metrics::REVALIDATION_DISCONNECTS.inc();
                     continue;
@@ -1332,9 +1352,12 @@ fn duration_micros_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
-async fn encode_http_request(request: Request<Body>) -> Result<Vec<u8>, ProxyError> {
+async fn encode_http_request(
+    request: Request<Body>,
+    max_body_size: usize,
+) -> Result<Vec<u8>, ProxyError> {
     let (parts, body) = request.into_parts();
-    let body_bytes = to_bytes(body, 10 * 1024 * 1024)
+    let body_bytes = to_bytes(body, max_body_size)
         .await
         .map_err(|error| ProxyError::Upstream(format!("failed to read request body: {error}")))?;
 
@@ -1543,9 +1566,7 @@ fn decode_chunked_body(payload: &[u8]) -> Result<(Vec<u8>, usize), ProxyError> {
             .checked_add(line_end)
             .and_then(|c| c.checked_add(2))
             .filter(|c| *c <= payload.len())
-            .ok_or_else(|| {
-                ProxyError::Upstream("invalid upstream chunk framing".to_string())
-            })?;
+            .ok_or_else(|| ProxyError::Upstream("invalid upstream chunk framing".to_string()))?;
 
         if size == 0 {
             loop {
@@ -1585,9 +1606,9 @@ fn decode_chunked_body(payload: &[u8]) -> Result<(Vec<u8>, usize), ProxyError> {
             ProxyError::Upstream("upstream chunk shorter than declared size".to_string())
         })?;
         decoded.extend_from_slice(chunk);
-        let terminator = payload.get(chunk_end..terminator_end).ok_or_else(|| {
-            ProxyError::Upstream("invalid upstream chunk terminator".to_string())
-        })?;
+        let terminator = payload
+            .get(chunk_end..terminator_end)
+            .ok_or_else(|| ProxyError::Upstream("invalid upstream chunk terminator".to_string()))?;
         if terminator != b"\r\n" {
             return Err(ProxyError::Upstream(
                 "invalid upstream chunk terminator".to_string(),
@@ -1686,7 +1707,7 @@ mod tests {
             .body(Body::from("password=admin123"))
             .expect("request should build");
 
-        let encoded = encode_http_request(request)
+        let encoded = encode_http_request(request, 32 * 1024 * 1024)
             .await
             .expect("request should encode");
         let encoded = String::from_utf8(encoded).expect("request bytes should be utf-8");
@@ -1760,8 +1781,8 @@ mod tests {
     #[test]
     fn decode_chunked_body_short_chunk_does_not_panic() {
         // Declares 100 bytes but only supplies 2.
-        let err = super::decode_chunked_body(b"64\r\nhi")
-            .expect_err("short chunk must be rejected");
+        let err =
+            super::decode_chunked_body(b"64\r\nhi").expect_err("short chunk must be rejected");
         assert!(matches!(err, ProxyError::Upstream(_)));
     }
 

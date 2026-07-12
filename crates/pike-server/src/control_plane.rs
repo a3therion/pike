@@ -428,6 +428,15 @@ impl AuthCache {
             },
         );
     }
+
+    /// Evict a key so the next login must re-validate against the control plane.
+    /// Must be called on every definitive negative from revalidation — otherwise a
+    /// just-revoked/suspended credential could reconnect from this cache (with its
+    /// stale `Active` status) until the TTL expires.
+    pub fn remove(&self, api_key: &str) {
+        let key_hash = Self::hash_key(api_key);
+        self.cache.remove(&key_hash);
+    }
 }
 
 #[cfg(test)]
@@ -722,6 +731,29 @@ internal_token = "custom-internal-token"
         let cached = cache.get("pk_test");
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().user_id, "u1");
+    }
+
+    #[tokio::test]
+    async fn test_auth_cache_remove_forces_revalidation() {
+        let mock_server = MockServer::start().await;
+        let _guard = Mock::given(method("POST"))
+            .and(path("/api/v1/auth/validate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(success_auth_body()))
+            .expect(1)
+            .mount_as_scoped(&mock_server)
+            .await;
+
+        let client = make_client(&mock_server.uri(), false);
+        let cache = AuthCache::new(Duration::from_secs(60));
+
+        let user = client.validate_api_key("pk_test").await.unwrap();
+        cache.insert("pk_test", user);
+        assert!(cache.get("pk_test").is_some());
+
+        // Revalidation evicts on a definitive negative; the next login must
+        // then miss the cache and hit the control plane again.
+        cache.remove("pk_test");
+        assert!(cache.get("pk_test").is_none());
     }
 
     #[tokio::test]

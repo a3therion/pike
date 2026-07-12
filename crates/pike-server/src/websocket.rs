@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use axum::extract::ws::{Message, WebSocket};
 use pike_core::proto::{ControlMessage, MAX_FRAME_SIZE};
-use pike_core::types::RelayInfo;
+use pike_core::types::{RelayInfo, TunnelType};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -15,6 +15,17 @@ use crate::registry::ClientRegistry;
 use crate::transport::{decode_multiplexed_frame, encode_multiplexed_frame};
 
 const CONTROL_STREAM_ID: u64 = 0;
+
+/// The WS fallback transport is not production-ready: no route mounts it
+/// (`http.rs::websocket_handler` is dead code), no released client implements
+/// a WS transport, its login path skips control-plane validation entirely,
+/// and `RegisterTunnel` answers with a hardcoded public URL that has no
+/// VhostRouter wiring — so it could authenticate nobody correctly and serve
+/// no traffic. Refuse logins (mirroring the TCP gate) so mounting the route
+/// can never silently expose an unauthenticated transport. Before flipping
+/// this to true: validate logins against the control plane + auth cache like
+/// the QUIC path in `main.rs`, and wire registrations into the VhostRouter.
+const WS_FALLBACK_AVAILABLE: bool = false;
 
 pub struct WebSocketTunnel {
     socket: WebSocket,
@@ -130,6 +141,17 @@ async fn run_session(tunnel: &mut WebSocketTunnel, registry: Arc<ClientRegistry>
         return Err(anyhow!("first control message must be login"));
     };
 
+    if !WS_FALLBACK_AVAILABLE {
+        let failure = ControlMessage::LoginFailure {
+            reason: "websocket fallback transport is not yet available on this relay".to_string(),
+        };
+        let frame = encode_postcard_frame(&failure)?;
+        tunnel
+            .send_multiplexed_frame(CONTROL_STREAM_ID, &frame)
+            .await?;
+        return Ok(());
+    }
+
     if api_key.trim().is_empty() {
         let failure = ControlMessage::LoginFailure {
             reason: "empty api key".to_string(),
@@ -224,6 +246,16 @@ async fn handle_control_message(message: ControlMessage) -> Result<Option<Contro
             timestamp,
             server_time: now_unix_secs(),
         }),
+        // No TCP data plane exists yet — reject instead of acknowledging a
+        // registration whose public port nothing will ever bind.
+        ControlMessage::RegisterTunnel { config }
+            if matches!(config.tunnel_type, TunnelType::Tcp { .. }) =>
+        {
+            Some(ControlMessage::TunnelError {
+                tunnel_id: config.id,
+                reason: "TCP tunnels are not yet available on this relay".to_string(),
+            })
+        }
         ControlMessage::RegisterTunnel { config } => Some(ControlMessage::TunnelRegistered {
             tunnel_id: config.id,
             public_url: "https://ws-fallback.pike.life".to_string(),
@@ -296,12 +328,14 @@ mod tests {
 
     use std::sync::Arc;
 
-    use super::{decode_postcard_frame, encode_postcard_frame, handle_control_message, RegisteredClientGuard};
-    use uuid::Uuid;
+    use super::{
+        decode_postcard_frame, encode_postcard_frame, handle_control_message, RegisteredClientGuard,
+    };
     use crate::config::AbuseConfig;
     use crate::connection::{ClientConnection, ConnectionState};
     use crate::registry::ClientRegistry;
     use crate::transport::{decode_multiplexed_frame, encode_multiplexed_frame};
+    use uuid::Uuid;
 
     fn register_activated_client(registry: &ClientRegistry, id: u128) -> Uuid {
         let connection_id = Uuid::from_u128(id);
@@ -320,7 +354,11 @@ mod tests {
 
         for i in 0..10u128 {
             let connection_id = register_activated_client(&registry, i);
-            assert_eq!(registry.clients.len(), 1, "one live client while session runs");
+            assert_eq!(
+                registry.clients.len(),
+                1,
+                "one live client while session runs"
+            );
             {
                 let _guard = RegisteredClientGuard {
                     registry: Arc::clone(&registry),

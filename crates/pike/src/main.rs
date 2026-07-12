@@ -91,7 +91,7 @@ enum Commands {
         #[arg(long)]
         max_reconnects: Option<u32>,
     },
-    /// Start a TCP tunnel.
+    /// Start a TCP tunnel (not yet available: the relay does not forward TCP traffic yet).
     Tcp {
         /// Local port to expose.
         port: u16,
@@ -142,6 +142,11 @@ enum Commands {
 }
 
 // ─── Display Constants ──────────────────────────────────────
+
+/// TCP tunnels are registered by the relay but have no server-side data plane
+/// yet, so the CLI refuses to start one. Flip to true when the relay forwards
+/// TCP traffic end-to-end.
+const TCP_TUNNELS_AVAILABLE: bool = false;
 
 const BOX_WIDTH: usize = 45;
 const BOX_INNER: usize = BOX_WIDTH - 2;
@@ -878,6 +883,16 @@ async fn main() -> anyhow::Result<()> {
             remote_port,
             max_reconnects,
         } => {
+            // Gate: the relay has no TCP data plane yet — a registration would
+            // succeed and report a public port that nothing listens on. Refuse
+            // up front instead of handing the user a dead endpoint. Flip
+            // TCP_TUNNELS_AVAILABLE once the server-side forwarder ships.
+            if !TCP_TUNNELS_AVAILABLE {
+                anyhow::bail!(
+                    "TCP tunnels are not yet available: the relay does not forward TCP traffic yet. \
+                     Use `pike http <port>` for HTTP/WebSocket tunnels."
+                );
+            }
             let cfg = config::load_or_create_config(&config_path).await?;
             warn_if_local_service_unreachable(&cfg.tunnel.bind_addr, port, "TCP upstream").await;
             let tunnel_config = cfg.as_tcp_tunnel_config(port, remote_port)?;
@@ -1052,7 +1067,9 @@ mod tests {
     fn parses_login_command() {
         let cli = Cli::try_parse_from(["pike", "login", "pk_test_123"])
             .expect("cli parse should succeed");
-        assert!(matches!(cli.command, Commands::Login { api_key } if api_key.as_deref() == Some("pk_test_123")));
+        assert!(
+            matches!(cli.command, Commands::Login { api_key } if api_key.as_deref() == Some("pk_test_123"))
+        );
     }
 
     #[test]
