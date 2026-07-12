@@ -2464,7 +2464,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pike"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "pike-core"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "dashmap 6.1.0",
@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "pike-server"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
