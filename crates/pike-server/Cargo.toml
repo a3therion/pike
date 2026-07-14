@@ -36,7 +36,7 @@ toml = { workspace = true }
 uuid = { workspace = true }
 postcard = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
-prometheus = "0.13"
+prometheus = "0.14"
 lazy_static = "1.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 md5 = "0.7"
