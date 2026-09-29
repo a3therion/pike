@@ -27,6 +27,11 @@ pub struct AuthConfig {
 pub struct RelayConfig {
     pub addr: String,
     pub ws_fallback: bool,
+    /// Optional WebSocket URL; defaults to wss://<relay host>/ws/tunnel.
+    #[serde(default)]
+    pub ws_url: Option<String>,
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
     pub quic_timeout_ms: u64,
     #[serde(default = "default_api_url")]
     pub api_url: String,
@@ -55,6 +60,10 @@ pub struct AdvancedConfig {
     pub heartbeat_interval: u64,
 }
 
+fn default_connect_timeout_ms() -> u64 {
+    5000
+}
+
 fn default_api_url() -> String {
     "https://api.pike.life".to_string()
 }
@@ -66,6 +75,8 @@ impl Default for Config {
             relay: RelayConfig {
                 addr: "relay.pike.life:443".to_string(),
                 ws_fallback: true,
+                ws_url: None,
+                connect_timeout_ms: default_connect_timeout_ms(),
                 quic_timeout_ms: 60000,
                 api_url: default_api_url(),
                 tls_server_name: None,
@@ -92,21 +103,18 @@ impl Default for Config {
 impl Config {
     pub fn as_http_tunnel_config(
         &self,
-        local_host: &str,
-        local_port: u16,
+        local_addr: SocketAddr,
         subdomain: Option<String>,
-    ) -> Result<TunnelConfig> {
-        let local_addr = SocketAddr::from_str(&format!("{local_host}:{local_port}"))
-            .with_context(|| format!("invalid bind addr '{local_host}':{local_port}"))?;
-
-        Ok(TunnelConfig {
+    ) -> TunnelConfig {
+        TunnelConfig {
+            cloud: None,
             id: TunnelId::new(),
             tunnel_type: TunnelType::Http {
-                local_port,
+                local_port: local_addr.port(),
                 subdomain,
             },
             local_addr,
-        })
+        }
     }
 
     pub fn as_tcp_tunnel_config(
@@ -114,12 +122,17 @@ impl Config {
         local_port: u16,
         remote_port: Option<u16>,
     ) -> Result<TunnelConfig> {
-        let local_addr = SocketAddr::from_str(&format!("{}:{local_port}", self.tunnel.bind_addr))
+        let local_addr = self
+            .tunnel
+            .bind_addr
+            .parse::<std::net::IpAddr>()
+            .map(|ip| SocketAddr::new(ip, local_port))
             .with_context(|| {
-            format!("invalid bind addr '{}':{local_port}", self.tunnel.bind_addr)
-        })?;
+                format!("invalid bind addr '{}':{local_port}", self.tunnel.bind_addr)
+            })?;
 
         Ok(TunnelConfig {
+            cloud: None,
             id: TunnelId::new(),
             tunnel_type: TunnelType::Tcp {
                 local_port,
@@ -344,9 +357,7 @@ heartbeat_interval = 15
         cfg.tunnel.subdomain_prefix = "sticky".to_string();
         cfg.tunnel.bind_addr = "0.0.0.0".to_string();
 
-        let tunnel = cfg
-            .as_http_tunnel_config("127.0.0.1", 3000, None)
-            .expect("http tunnel config");
+        let tunnel = cfg.as_http_tunnel_config("127.0.0.1:3000".parse().unwrap(), None);
 
         assert_eq!(tunnel.local_addr, "127.0.0.1:3000".parse().unwrap());
         assert!(matches!(

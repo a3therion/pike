@@ -1,9 +1,7 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::connection::{UserLimits, UserStatus, ValidatedUser};
 use anyhow::{anyhow, Result};
-use dashmap::DashMap;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,18 +10,22 @@ use tracing::error;
 
 /// Outcome of validating an API key against the control plane.
 ///
-/// Distinguishes a DEFINITIVE negative (`Invalid` — the key is genuinely bad, the user
-/// is gone, or the control plane explicitly said `valid: false`) from a TRANSIENT failure
-/// (`Unavailable` — network error, timeout, or 5xx after retry). Callers that take
-/// destructive action on a negative (e.g. the revalidation loop disconnecting live
-/// sessions) MUST act only on `Invalid`, never on `Unavailable`, so a momentary
-/// control-plane blip can't disconnect every connected user.
+/// Distinguishes a DEFINITIVE negative (`Invalid` — the key is genuinely bad, lacks the
+/// tunnel scope, the user is gone, or the control plane explicitly said `valid: false`)
+/// from a TRANSIENT failure (`Unavailable` — network error, timeout, 5xx after retry, or
+/// a relay/Workers version mismatch). Callers that take destructive action on a negative
+/// (the session revalidation tick disconnecting a live connection) MUST act only on
+/// `Invalid`, never on `Unavailable`, so a momentary control-plane blip can't disconnect
+/// every connected user.
 #[derive(Debug)]
 pub enum ApiKeyValidation {
     Valid(Box<ValidatedUser>),
-    Invalid,
+    Invalid(String),
     Unavailable(String),
 }
+
+/// Version of the Worker public-port reservation contract.
+pub const PORT_PROTOCOL: u8 = 1;
 
 pub struct ControlPlaneClient {
     http_client: reqwest::Client,
@@ -33,7 +35,7 @@ pub struct ControlPlaneClient {
     local_api_keys: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct TunnelRegistrationResponse {
     pub id: String,
     pub subdomain: String,
@@ -41,7 +43,11 @@ pub struct TunnelRegistrationResponse {
 
 #[derive(Deserialize)]
 struct ValidateApiKeyResponse {
+    #[serde(default)]
+    quota_protocol: Option<u8>,
     valid: bool,
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
     user_id: String,
     email: String,
     plan: String,
@@ -93,6 +99,7 @@ impl From<ControlPlaneLimits> for UserLimits {
 struct RegisterTunnelRequest<'a> {
     subdomain: &'a str,
     tunnel_type: &'a str,
+    config: &'a serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -100,9 +107,35 @@ struct CreateTunnelResponse {
     tunnel: TunnelRegistrationResponse,
 }
 
+#[derive(Clone, Serialize)]
+pub struct EndpointLease {
+    pub quota_protocol: u8,
+    pub policy_protocol: u8,
+    pub domain_protocol: u8,
+    #[serde(skip)]
+    pub tunnel_id: String,
+    pub lease_id: String,
+    pub endpoint_url: String,
+    pub remote_port: Option<u16>,
+    pub transport: String,
+    pub config: serde_json::Value,
+}
+
+#[derive(Serialize)]
+pub struct EndpointRenewal<'a> {
+    pub lease_id: &'a str,
+    pub quota_protocol: u8,
+    pub policy_protocol: u8,
+    pub policy_revision: u64,
+    pub domain_protocol: u8,
+    pub domain_revision: u64,
+    pub certificates: Vec<crate::certificates::CertificateStatus>,
+}
+
 #[derive(Deserialize)]
-struct ListTunnelsResponse {
-    tunnels: Vec<TunnelRegistrationResponse>,
+pub struct EndpointAdmission {
+    pub visitor: crate::visitor_policy::PolicyRecord,
+    pub domains: crate::domain_grants::DomainSet,
 }
 
 #[derive(Deserialize)]
@@ -128,17 +161,56 @@ impl ControlPlaneClient {
         }
     }
 
-    /// Validate an API key, classifying the result as valid / definitively-invalid /
-    /// transiently-unavailable. Prefer this over [`Self::validate_api_key`] whenever a
-    /// negative result triggers destructive action (see [`ApiKeyValidation`]).
+    pub async fn validate_api_key(&self, api_key: &str) -> Result<ValidatedUser> {
+        self.validate_relay_api_key(api_key, None).await
+    }
+
+    /// Relay session validation (login, registration, live revocation checks).
+    /// The configured server token identifies relay traffic to the Worker so
+    /// steady revalidation is not throttled as interactive validation; the API
+    /// key itself is still validated live in full.
+    ///
+    /// Collapses the outcome to a `Result`: at login a transient failure and a bad
+    /// key are both simply "reject" (fail-closed). Use
+    /// [`Self::validate_relay_api_key_status`] where a negative would tear down an
+    /// established session.
+    pub async fn validate_relay_api_key(
+        &self,
+        api_key: &str,
+        server_token: Option<&str>,
+    ) -> Result<ValidatedUser> {
+        match self
+            .validate_relay_api_key_status(api_key, server_token)
+            .await
+        {
+            ApiKeyValidation::Valid(user) => Ok(*user),
+            ApiKeyValidation::Invalid(reason) | ApiKeyValidation::Unavailable(reason) => {
+                Err(anyhow!(reason))
+            }
+        }
+    }
+
+    /// Classified validation without a server token (see [`ApiKeyValidation`]).
     pub async fn validate_api_key_status(&self, api_key: &str) -> ApiKeyValidation {
+        self.validate_relay_api_key_status(api_key, None).await
+    }
+
+    /// Validate an API key, classifying the result as valid / definitively-invalid /
+    /// transiently-unavailable. Prefer this over [`Self::validate_relay_api_key`]
+    /// whenever a negative result triggers destructive action.
+    pub async fn validate_relay_api_key_status(
+        &self,
+        api_key: &str,
+        server_token: Option<&str>,
+    ) -> ApiKeyValidation {
         if let Some(local_keys) = &self.local_api_keys {
             if !local_keys.iter().any(|key| key == api_key) {
-                return ApiKeyValidation::Invalid;
+                return ApiKeyValidation::Invalid("invalid API key".into());
             }
 
-            let key_hash = AuthCache::hash_key(api_key);
+            let key_hash = hash_api_key(api_key);
             return ApiKeyValidation::Valid(Box::new(ValidatedUser {
+                tunnel_limit: None,
                 user_id: format!("local-{key_hash}"),
                 email: "local@self-hosted".into(),
                 plan: "self-hosted".into(),
@@ -160,13 +232,17 @@ impl ControlPlaneClient {
         );
 
         for attempt in 0..2 {
-            let response = self
+            let mut request = self
                 .http_client
                 .post(&url)
-                .header("Authorization", format!("Bearer {api_key}"))
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await;
+                .header("Authorization", format!("Bearer {api_key}"));
+            // The server token is only ever sent to the Workers API it is issued for.
+            let same_worker = self.control_plane_url.trim_end_matches('/')
+                == self.workers_api_url.trim_end_matches('/');
+            if let Some(token) = server_token.filter(|token| same_worker && !token.is_empty()) {
+                request = request.header("X-Server-Token", token);
+            }
+            let response = request.timeout(Duration::from_secs(5)).send().await;
 
             let response = match response {
                 Ok(response) => response,
@@ -189,7 +265,7 @@ impl ControlPlaneClient {
             let status = response.status();
             if status == StatusCode::UNAUTHORIZED {
                 // Definitive: the control plane rejected the key.
-                return ApiKeyValidation::Invalid;
+                return ApiKeyValidation::Invalid("invalid API key".into());
             }
 
             if status.is_server_error() {
@@ -220,32 +296,36 @@ impl ControlPlaneClient {
             if !body.valid {
                 // Definitive: the control plane says this key/user is not valid
                 // (includes the suspended case, which sets valid: false).
-                return ApiKeyValidation::Invalid;
+                return ApiKeyValidation::Invalid("invalid API key".into());
             }
-
+            if !self.dev_mode && body.quota_protocol != Some(crate::quota::QUOTA_PROTOCOL) {
+                // A relay/Workers version mismatch, not a verdict on the key: login must
+                // fail, but an established session is not torn down for it.
+                return ApiKeyValidation::Unavailable(
+                    "control plane quota protocol 1 required; upgrade Workers before this relay"
+                        .into(),
+                );
+            }
+            if !body
+                .scopes
+                .as_ref()
+                .is_some_and(|scopes| scopes.iter().any(|scope| scope == "tunnels:write"))
+            {
+                return ApiKeyValidation::Invalid("API key requires tunnels:write scope".into());
+            }
+            let limits = body.limits.map(UserLimits::from).unwrap_or_default();
             return ApiKeyValidation::Valid(Box::new(ValidatedUser {
+                tunnel_limit: limits.max_tunnels.map(u64::from),
                 user_id: body.user_id,
                 email: body.email,
                 plan: body.plan,
                 plan_expires_at: body.plan_expires_at,
                 status: UserStatus::from_name(body.status.as_deref()),
-                limits: body.limits.map(UserLimits::from).unwrap_or_default(),
+                limits,
             }));
         }
 
         ApiKeyValidation::Unavailable("auth validation failed after retry".into())
-    }
-
-    /// Validate an API key, collapsing the outcome to a `Result`. Suitable for the login
-    /// path, where a transient failure and a bad key are both simply "reject this login"
-    /// (fail-closed at login is safe — it's disconnecting *established* sessions on a
-    /// transient blip that is not; use [`Self::validate_api_key_status`] there).
-    pub async fn validate_api_key(&self, api_key: &str) -> Result<ValidatedUser> {
-        match self.validate_api_key_status(api_key).await {
-            ApiKeyValidation::Valid(user) => Ok(*user),
-            ApiKeyValidation::Invalid => Err(anyhow!("invalid API key")),
-            ApiKeyValidation::Unavailable(message) => Err(anyhow!(message)),
-        }
     }
 
     pub async fn register_tunnel(
@@ -253,6 +333,7 @@ impl ControlPlaneClient {
         api_key: &str,
         subdomain: &str,
         tunnel_type: &str,
+        config: &serde_json::Value,
     ) -> Result<TunnelRegistrationResponse> {
         if self.dev_mode || self.should_skip_remote_tunnel_registration() {
             return Ok(TunnelRegistrationResponse {
@@ -274,6 +355,7 @@ impl ControlPlaneClient {
                 .json(&RegisterTunnelRequest {
                     subdomain,
                     tunnel_type,
+                    config,
                 })
                 .timeout(Duration::from_secs(5))
                 .send()
@@ -301,7 +383,10 @@ impl ControlPlaneClient {
             }
 
             if status == StatusCode::CONFLICT {
-                if let Some(existing) = self.find_tunnel_by_subdomain(api_key, subdomain).await? {
+                if let Some(existing) = self
+                    .find_tunnel_by_subdomain(api_key, subdomain, tunnel_type)
+                    .await?
+                {
                     return Ok(existing);
                 }
                 return Err(anyhow!("subdomain already in use by another user"));
@@ -341,6 +426,183 @@ impl ControlPlaneClient {
         anyhow::bail!("tunnel registration retry loop exhausted without result")
     }
 
+    /// Atomic public-port reservation for a TCP or UDP profile, taken before
+    /// the relay binds anything. The Worker returns the profile's one reserved
+    /// number: the configured `remote_port`, or a stable number it chose for a
+    /// profile without one. Every relay and connector of the profile receives
+    /// the same number; a number reserved by another profile is refused.
+    pub async fn reserve_public_port(
+        &self,
+        api_key: &str,
+        server_token: &str,
+        tunnel_id: &str,
+        requested_port: Option<u16>,
+    ) -> Result<u16> {
+        let response = self
+            .http_client
+            .post(format!(
+                "{}/api/v1/tunnels/{tunnel_id}/reserve-port",
+                self.workers_api_url.trim_end_matches('/')
+            ))
+            .bearer_auth(api_key)
+            .header("X-Server-Token", server_token)
+            .json(&serde_json::json!({"port_protocol": PORT_PROTOCOL, "requested_port": requested_port}))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let reason = response
+                .json::<ApiErrorResponse>()
+                .await
+                .ok()
+                .and_then(|body| body.error)
+                .unwrap_or_default();
+            anyhow::bail!("public port reservation failed: {status} {reason}");
+        }
+        let body: serde_json::Value = response.json().await?;
+        anyhow::ensure!(
+            body["port_protocol"].as_u64() == Some(u64::from(PORT_PROTOCOL)),
+            "public port protocol 1 acknowledgement required; upgrade Workers"
+        );
+        let port = body["port"]
+            .as_u64()
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| (10_000..=65_000).contains(port))
+            .ok_or_else(|| anyhow!("public port reservation returned an invalid port"))?;
+        anyhow::ensure!(
+            requested_port.is_none_or(|requested| requested == port),
+            "public port reservation {port} differs from the requested port"
+        );
+        Ok(port)
+    }
+
+    pub async fn publish_endpoint(
+        &self,
+        api_key: &str,
+        server_token: &str,
+        lease: &EndpointLease,
+    ) -> Result<EndpointAdmission> {
+        let acknowledgement = self
+            .lease_request(
+                api_key,
+                server_token,
+                &format!("{}/connect", lease.tunnel_id),
+                &serde_json::to_value(lease)?,
+            )
+            .await?;
+        Ok(serde_json::from_value(acknowledgement)?)
+    }
+
+    pub async fn publish_origin_health(
+        &self,
+        api_key: &str,
+        server_token: &str,
+        tunnel_id: &str,
+        lease_id: &str,
+        report: Option<&pike_core::proto::origin_health::OriginHealthReport>,
+    ) -> Result<()> {
+        let response = self.http_client.post(format!("{}/api/v1/tunnels/{tunnel_id}/health", self.workers_api_url.trim_end_matches('/')))
+            .bearer_auth(api_key).header("X-Server-Token", server_token)
+            .json(&serde_json::json!({ "health_protocol": 1, "lease_id": lease_id, "report": report, "sent_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }))
+            .timeout(Duration::from_secs(5)).send().await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "origin health publication rejected"
+        );
+        Ok(())
+    }
+
+    pub async fn renew_endpoint(
+        &self,
+        api_key: &str,
+        server_token: &str,
+        tunnel_id: &str,
+        renewal: &EndpointRenewal<'_>,
+    ) -> Result<crate::domain_grants::DomainSet> {
+        let acknowledgement = self
+            .lease_request(
+                api_key,
+                server_token,
+                &format!("{tunnel_id}/heartbeat"),
+                &serde_json::to_value(renewal)?,
+            )
+            .await?;
+        anyhow::ensure!(
+            acknowledgement["policy_revision"].as_u64() == Some(renewal.policy_revision),
+            "visitor policy revision changed"
+        );
+        Ok(serde_json::from_value(acknowledgement["domains"].clone())?)
+    }
+
+    async fn lease_request(
+        &self,
+        api_key: &str,
+        server_token: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http_client
+            .post(format!(
+                "{}/api/v1/tunnels/{path}",
+                self.workers_api_url.trim_end_matches('/')
+            ))
+            .bearer_auth(api_key)
+            .header("X-Server-Token", server_token)
+            .json(body)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let reason = response
+                .json::<ApiErrorResponse>()
+                .await
+                .ok()
+                .and_then(|body| body.error)
+                .unwrap_or_default();
+            anyhow::bail!("cloud endpoint lease failed: {status} {reason}");
+        }
+        let acknowledgement: serde_json::Value = response.json().await?;
+        anyhow::ensure!(
+            acknowledgement["quota_protocol"].as_u64()
+                == Some(u64::from(crate::quota::QUOTA_PROTOCOL)),
+            "endpoint lease requires quota protocol 1 acknowledgement"
+        );
+        anyhow::ensure!(
+            acknowledgement["policy_protocol"].as_u64()
+                == Some(u64::from(crate::visitor_policy::POLICY_PROTOCOL)),
+            "visitor policy protocol 4 acknowledgement required; upgrade Workers"
+        );
+        anyhow::ensure!(
+            acknowledgement["domain_protocol"].as_u64()
+                == Some(u64::from(crate::domain_grants::DOMAIN_PROTOCOL)),
+            "domain protocol 1 acknowledgement required; upgrade Workers"
+        );
+        Ok(acknowledgement)
+    }
+
+    pub async fn release_endpoint(
+        &self,
+        server_token: &str,
+        tunnel_id: &str,
+        lease_id: &str,
+    ) -> Result<()> {
+        self.http_client
+            .post(format!(
+                "{}/api/v1/tunnels/internal/release",
+                self.workers_api_url.trim_end_matches('/')
+            ))
+            .header("X-Server-Token", server_token)
+            .json(&serde_json::json!({"tunnel_id": tunnel_id, "lease_id": lease_id}))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     fn should_skip_remote_tunnel_registration(&self) -> bool {
         self.local_api_keys.is_some() && self.workers_api_url.trim().is_empty()
     }
@@ -349,105 +611,45 @@ impl ControlPlaneClient {
         &self,
         api_key: &str,
         subdomain: &str,
+        tunnel_type: &str,
     ) -> Result<Option<TunnelRegistrationResponse>> {
-        if self.dev_mode {
-            return Ok(None);
-        }
-
-        let url = format!(
-            "{}/api/v1/tunnels",
-            self.workers_api_url.trim_end_matches('/')
-        );
         let response = self
             .http_client
-            .get(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
+            .post(format!(
+                "{}/api/v1/tunnels/resolve",
+                self.workers_api_url.trim_end_matches('/')
+            ))
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({"subdomain": subdomain, "tunnel_type": tunnel_type}))
             .timeout(Duration::from_secs(5))
             .send()
-            .await
-            .map_err(|error| anyhow!("tunnel list request failed: {error}"))?;
-
-        let status = response.status();
-        if status != StatusCode::OK {
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-
-        let body: ListTunnelsResponse = response
-            .json()
-            .await
-            .map_err(|error| anyhow!("failed to parse tunnel list response: {error}"))?;
-
-        Ok(body.tunnels.into_iter().find(|t| t.subdomain == subdomain))
-    }
-}
-
-struct CachedAuth {
-    user: ValidatedUser,
-    cached_at: Instant,
-}
-
-pub struct AuthCache {
-    cache: DashMap<String, CachedAuth>,
-    ttl: Duration,
-}
-
-impl AuthCache {
-    pub fn new(ttl: Duration) -> Arc<Self> {
-        Arc::new(Self {
-            cache: DashMap::new(),
-            ttl,
-        })
-    }
-
-    fn hash_key(api_key: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(api_key.as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
-
-    pub fn get(&self, api_key: &str) -> Option<ValidatedUser> {
-        let key_hash = Self::hash_key(api_key);
-        let entry = self.cache.get(&key_hash)?;
-        if entry.cached_at.elapsed() > self.ttl {
-            drop(entry);
-            self.cache.remove(&key_hash);
-            return None;
+        if !response.status().is_success() {
+            anyhow::bail!("owned tunnel resolution failed: {}", response.status());
         }
-        Some(entry.user.clone())
+        Ok(Some(response.json::<CreateTunnelResponse>().await?.tunnel))
     }
+}
 
-    pub fn insert(&self, api_key: &str, user: ValidatedUser) {
-        let key_hash = Self::hash_key(api_key);
-        self.cache.insert(
-            key_hash,
-            CachedAuth {
-                user,
-                cached_at: Instant::now(),
-            },
-        );
-    }
-
-    /// Evict a key so the next login must re-validate against the control plane.
-    /// Must be called on every definitive negative from revalidation — otherwise a
-    /// just-revoked/suspended credential could reconnect from this cache (with its
-    /// stale `Active` status) until the TTL expires.
-    pub fn remove(&self, api_key: &str) {
-        let key_hash = Self::hash_key(api_key);
-        self.cache.remove(&key_hash);
-    }
+fn hash_api_key(api_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(api_key.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::Duration;
 
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{ApiKeyValidation, AuthCache, ControlPlaneClient};
+    use super::{ApiKeyValidation, ControlPlaneClient};
     use crate::config::ServerConfig;
     use crate::connection::UserStatus;
 
@@ -456,11 +658,13 @@ mod tests {
     fn success_auth_body() -> serde_json::Value {
         json!({
             "valid": true,
+            "quota_protocol": 1,
+                "scopes": ["tunnels:read", "tunnels:write"],
             "user_id": "u1",
             "email": "test@example.com",
             "plan": "free",
             "plan_expires_at": null,
-            "auth_type": "api_key"
+            "auth_type": "apikey"
         })
     }
 
@@ -582,7 +786,7 @@ mod tests {
         let client = make_client(&mock_server.uri(), false);
         assert!(matches!(
             client.validate_api_key_status("bad_key").await,
-            ApiKeyValidation::Invalid
+            ApiKeyValidation::Invalid(_)
         ));
     }
 
@@ -603,8 +807,43 @@ mod tests {
         let client = make_client(&mock_server.uri(), false);
         assert!(matches!(
             client.validate_api_key_status("pk_test").await,
-            ApiKeyValidation::Invalid
+            ApiKeyValidation::Invalid(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_status_missing_scope_is_invalid_and_stale_quota_contract_is_unavailable() {
+        for (body, definitive) in [
+            (
+                json!({
+                    "valid": true, "quota_protocol": 1, "scopes": ["tunnels:read"],
+                    "user_id": "u1", "email": "test@example.com", "plan": "free"
+                }),
+                true,
+            ),
+            (
+                json!({
+                    "valid": true, "quota_protocol": 0, "scopes": ["tunnels:write"],
+                    "user_id": "u1", "email": "test@example.com", "plan": "free"
+                }),
+                false,
+            ),
+        ] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/v1/auth/validate"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&mock_server)
+                .await;
+            let client = make_client(&mock_server.uri(), false);
+            let outcome = client.validate_api_key_status("pk_test").await;
+            assert_eq!(
+                matches!(outcome, ApiKeyValidation::Invalid(_)),
+                definitive,
+                "unexpected classification: {outcome:?}"
+            );
+            assert!(client.validate_api_key("pk_test").await.is_err());
+        }
     }
 
     #[tokio::test]
@@ -614,10 +853,13 @@ mod tests {
             .and(path("/api/v1/auth/validate"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "valid": true,
+                "quota_protocol": 1,
+                "scopes": ["tunnels:write"],
                 "user_id": "u1",
                 "email": "test@example.com",
                 "plan": "free",
-                "status": "suspended"
+                "status": "suspended",
+                "limits": { "tunnels": 3, "bandwidth_gb": 1, "requests_per_day": 10 }
             })))
             .mount(&mock_server)
             .await;
@@ -629,9 +871,88 @@ mod tests {
             ApiKeyValidation::Valid(user) => {
                 assert_eq!(user.status, UserStatus::Suspended);
                 assert!(!user.status.is_active());
+                // The hosted tunnel cap and the plan limits come from one `limits` object.
+                assert_eq!(user.tunnel_limit, Some(3));
+                assert_eq!(user.limits.max_tunnels, Some(3));
+                assert_eq!(user.limits.bandwidth_bytes_per_month, Some(1 << 30));
+                assert_eq!(user.limits.requests_per_day, Some(10));
             }
             other => panic!("expected Valid(suspended), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn relay_validation_identifies_the_relay_and_ordinary_validation_does_not() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/validate"))
+            .and(header("Authorization", "Bearer pk_revoked"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/validate"))
+            .and(header("Authorization", "Bearer pk_test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(success_auth_body()))
+            .mount(&mock_server)
+            .await;
+
+        let client = make_client(&mock_server.uri(), false);
+        let user = client
+            .validate_relay_api_key("pk_test", Some("relay-secret"))
+            .await
+            .unwrap();
+        assert_eq!(user.user_id, "u1");
+        client.validate_api_key("pk_test").await.unwrap();
+        // The server token never substitutes for a valid API key.
+        let err = client
+            .validate_relay_api_key("pk_revoked", Some("relay-secret"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid API key"));
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let tokens: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get("X-Server-Token")
+                    .map(|value| value.to_str().unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                Some("relay-secret".to_string()),
+                None,
+                Some("relay-secret".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_validation_keeps_the_token_off_a_separate_auth_host() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/validate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(success_auth_body()))
+            .mount(&mock_server)
+            .await;
+
+        let client = ControlPlaneClient::new(
+            reqwest::Client::new(),
+            mock_server.uri(),
+            "http://workers.invalid".to_string(),
+            false,
+            None,
+        );
+        client
+            .validate_relay_api_key("pk_test", Some("relay-secret"))
+            .await
+            .unwrap();
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(requests[0].headers.get("X-Server-Token").is_none());
     }
 
     #[tokio::test]
@@ -710,74 +1031,6 @@ internal_token = "custom-internal-token"
     }
 
     #[tokio::test]
-    async fn test_auth_cache_hit() {
-        let mock_server = MockServer::start().await;
-        let _guard = Mock::given(method("POST"))
-            .and(path("/api/v1/auth/validate"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(success_auth_body()))
-            .expect(1)
-            .mount_as_scoped(&mock_server)
-            .await;
-
-        let client = make_client(&mock_server.uri(), false);
-        let cache = AuthCache::new(Duration::from_secs(60));
-
-        assert!(cache.get("pk_test").is_none());
-        let user = client.validate_api_key("pk_test").await.unwrap();
-        cache.insert("pk_test", user);
-
-        let cached = cache.get("pk_test");
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap().user_id, "u1");
-    }
-
-    #[tokio::test]
-    async fn test_auth_cache_remove_forces_revalidation() {
-        let mock_server = MockServer::start().await;
-        let _guard = Mock::given(method("POST"))
-            .and(path("/api/v1/auth/validate"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(success_auth_body()))
-            .expect(1)
-            .mount_as_scoped(&mock_server)
-            .await;
-
-        let client = make_client(&mock_server.uri(), false);
-        let cache = AuthCache::new(Duration::from_secs(60));
-
-        let user = client.validate_api_key("pk_test").await.unwrap();
-        cache.insert("pk_test", user);
-        assert!(cache.get("pk_test").is_some());
-
-        // Revalidation evicts on a definitive negative; the next login must
-        // then miss the cache and hit the control plane again.
-        cache.remove("pk_test");
-        assert!(cache.get("pk_test").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_auth_cache_expiry() {
-        let mock_server = MockServer::start().await;
-        let _guard = Mock::given(method("POST"))
-            .and(path("/api/v1/auth/validate"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(success_auth_body()))
-            .expect(2)
-            .mount_as_scoped(&mock_server)
-            .await;
-
-        let client = make_client(&mock_server.uri(), false);
-        let cache = AuthCache::new(Duration::from_millis(1));
-
-        let user = client.validate_api_key("pk_test").await.unwrap();
-        cache.insert("pk_test", user);
-
-        tokio::time::sleep(Duration::from_millis(5)).await;
-
-        assert!(cache.get("pk_test").is_none());
-        let user = client.validate_api_key("pk_test").await.unwrap();
-        cache.insert("pk_test", user);
-    }
-
-    #[tokio::test]
     async fn test_register_tunnel_success() {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -794,7 +1047,7 @@ internal_token = "custom-internal-token"
 
         let client = make_client(&mock_server.uri(), false);
         let resp = client
-            .register_tunnel("pk_test", "myapp", "http")
+            .register_tunnel("pk_test", "myapp", "http", &serde_json::json!({}))
             .await
             .unwrap();
         assert_eq!(resp.id, "tun_123");
@@ -812,7 +1065,7 @@ internal_token = "custom-internal-token"
 
         let client = make_client(&mock_server.uri(), false);
         let err = client
-            .register_tunnel("pk_test", "taken", "http")
+            .register_tunnel("pk_test", "taken", "http", &serde_json::json!({}))
             .await
             .err()
             .unwrap();
@@ -830,7 +1083,7 @@ internal_token = "custom-internal-token"
 
         let client = make_client(&mock_server.uri(), false);
         let err = client
-            .register_tunnel("pk_test", "another", "http")
+            .register_tunnel("pk_test", "another", "http", &serde_json::json!({}))
             .await
             .err()
             .unwrap();
@@ -861,7 +1114,7 @@ internal_token = "custom-internal-token"
 
         let client = make_client(&mock_server.uri(), false);
         let resp = client
-            .register_tunnel("pk_test", "myapp", "http")
+            .register_tunnel("pk_test", "myapp", "http", &serde_json::json!({}))
             .await
             .expect("register_tunnel should retry once after 5xx and succeed");
         assert_eq!(resp.id, "tun_retry");
@@ -880,14 +1133,14 @@ internal_token = "custom-internal-token"
             .await;
 
         let client = make_client(&mock_server.uri(), false);
-        let result = client.register_tunnel("pk_test", "another", "http").await;
+        let result = client
+            .register_tunnel("pk_test", "another", "http", &serde_json::json!({}))
+            .await;
         assert!(
             result.is_err(),
             "plan-limit response should not be retried and must fail"
         );
-        let err = result
-            .err()
-            .expect("error should be present for plan-limit response");
+        let err = result.expect_err("error should be present for plan-limit response");
         assert!(err.to_string().contains("tunnel limit reached"));
     }
 
@@ -895,7 +1148,7 @@ internal_token = "custom-internal-token"
     async fn test_register_tunnel_dev_mode() {
         let client = make_client("http://localhost:1", true);
         let resp = client
-            .register_tunnel("anything", "myapp", "http")
+            .register_tunnel("anything", "myapp", "http", &serde_json::json!({}))
             .await
             .unwrap();
         assert_eq!(resp.subdomain, "myapp");
@@ -913,10 +1166,141 @@ internal_token = "custom-internal-token"
         );
 
         let resp = client
-            .register_tunnel(TEST_KEY, "myapp", "http")
+            .register_tunnel(TEST_KEY, "myapp", "http", &serde_json::json!({}))
             .await
             .expect("local self-hosted registration should not require workers");
         assert_eq!(resp.subdomain, "myapp");
         assert!(!resp.id.is_empty());
+    }
+    #[tokio::test]
+    async fn port_reservation_requires_protocol_agreement_and_a_pool_port() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/tunnels/profile-1/reserve-port"))
+            .and(header("X-Server-Token", "relay-secret"))
+            .and(wiremock::matchers::body_json(
+                json!({"port_protocol": 1, "requested_port": null}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"port_protocol": 1, "port": 30555})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/tunnels/profile-2/reserve-port"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"port_protocol": 1, "port": 30555})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/tunnels/profile-3/reserve-port"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(json!({"error": "Public port is reserved by another tunnel"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/tunnels/profile-4/reserve-port"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"port": 30555})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/tunnels/profile-5/reserve-port"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"port_protocol": 1, "port": 80})),
+            )
+            .mount(&server)
+            .await;
+        let client = make_client(&server.uri(), false);
+        assert_eq!(
+            client
+                .reserve_public_port("pk_test", "relay-secret", "profile-1", None)
+                .await
+                .unwrap(),
+            30555
+        );
+        // The Worker's number is authoritative; a disagreeing explicit request fails.
+        let error = client
+            .reserve_public_port("pk_test", "relay-secret", "profile-2", Some(30556))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("differs"), "{error}");
+        assert_eq!(
+            client
+                .reserve_public_port("pk_test", "relay-secret", "profile-2", Some(30555))
+                .await
+                .unwrap(),
+            30555
+        );
+        let error = client
+            .reserve_public_port("pk_test", "relay-secret", "profile-3", None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("reserved by another tunnel"),
+            "{error}"
+        );
+        assert!(client
+            .reserve_public_port("pk_test", "relay-secret", "profile-4", None)
+            .await
+            .is_err());
+        assert!(client
+            .reserve_public_port("pk_test", "relay-secret", "profile-5", None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn owned_conflict_resolves_with_write_scope_without_reactivating() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/tunnels"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/tunnels/resolve"))
+            .and(header("Authorization", "Bearer pk_owner"))
+            .and(wiremock::matchers::body_json(
+                json!({"subdomain":"myapp","tunnel_type":"http"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"tunnel":{"id":"canonical-id","subdomain":"myapp"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = make_client(&server.uri(), false)
+            .register_tunnel("pk_owner", "myapp", "http", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result.id, "canonical-id");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_or_changed_owned_tunnel_is_not_reactivated() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/tunnels"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/tunnels/resolve"))
+            .respond_with(ResponseTemplate::new(409))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = make_client(&server.uri(), false)
+            .register_tunnel("pk_owner", "myapp", "http", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("resolution failed: 409"));
     }
 }

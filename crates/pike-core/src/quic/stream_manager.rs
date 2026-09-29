@@ -67,6 +67,8 @@ impl Clone for StreamInfo {
 pub struct StreamManager {
     active_streams: DashMap<u64, StreamInfo>,
     next_stream_id: AtomicU64,
+    completed_bytes_in: AtomicU64,
+    completed_bytes_out: AtomicU64,
 }
 
 impl Default for StreamManager {
@@ -81,6 +83,8 @@ impl StreamManager {
         Self {
             active_streams: DashMap::new(),
             next_stream_id: AtomicU64::new(4),
+            completed_bytes_in: AtomicU64::new(0),
+            completed_bytes_out: AtomicU64::new(0),
         }
     }
 
@@ -110,8 +114,12 @@ impl StreamManager {
     }
 
     pub fn close_stream(&self, stream_id: u64) {
-        if let Some(mut stream) = self.active_streams.get_mut(&stream_id) {
-            stream.state = StreamState::Closed;
+        if let Some((_, stream)) = self.active_streams.remove(&stream_id) {
+            let (bytes_in, bytes_out) = stream.bytes();
+            self.completed_bytes_in
+                .fetch_add(bytes_in, Ordering::Relaxed);
+            self.completed_bytes_out
+                .fetch_add(bytes_out, Ordering::Relaxed);
         }
     }
 
@@ -146,14 +154,18 @@ impl StreamManager {
 
     #[must_use]
     pub fn total_bytes(&self) -> (u64, u64) {
-        self.active_streams
-            .iter()
-            .fold((0, 0), |(in_total, out_total), entry| {
+        self.active_streams.iter().fold(
+            (
+                self.completed_bytes_in.load(Ordering::Relaxed),
+                self.completed_bytes_out.load(Ordering::Relaxed),
+            ),
+            |(in_total, out_total), entry| {
                 (
                     in_total + entry.bytes_in.load(Ordering::Relaxed),
                     out_total + entry.bytes_out.load(Ordering::Relaxed),
                 )
-            })
+            },
+        )
     }
 }
 
@@ -249,5 +261,20 @@ mod tests {
 
         assert_eq!(manager.active_count(), 1000);
         assert_eq!(manager.tunnel_stream_count(tunnel_id), 1000);
+    }
+    #[test]
+    fn closed_streams_are_removed_but_byte_totals_are_retained() {
+        let manager = StreamManager::new();
+        let tunnel_id = TunnelId::new();
+        for _ in 0..10000 {
+            let stream_id = manager.next_stream_id();
+            manager.register_stream(stream_id, tunnel_id);
+            manager.update_bytes(stream_id, 10, 20);
+            manager.close_stream(stream_id);
+            manager.close_stream(stream_id);
+            assert!(manager.get_stream_info(stream_id).is_none());
+        }
+        assert!(manager.active_streams.is_empty());
+        assert_eq!(manager.total_bytes(), (100_000, 200_000));
     }
 }

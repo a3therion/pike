@@ -7,44 +7,52 @@
     clippy::match_same_arms
 )]
 
-use std::collections::HashMap;
+mod public_tls;
+mod relay_endpoints;
+mod relay_http;
+mod relay_ingress;
+mod relay_session;
+mod relay_streams;
+mod relay_tcp;
+mod relay_udp;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::body::{to_bytes, Body};
-use axum::http::header::{CONNECTION, CONTENT_LENGTH, HOST};
-use axum::http::{Request, Response};
+#[cfg(test)]
+use axum::body::Body;
+#[cfg(test)]
+use axum::http::header::CONTENT_LENGTH;
+#[cfg(test)]
+use axum::http::Response;
 use clap::Parser;
-use pike_core::proto::{ControlMessage, ALPN_PROTOCOL, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION};
-use pike_core::quic::server::{
-    InboundData, OutboundData, PikeMessage, PikeOutboundMessage, PikeTunnelApp,
-};
-use pike_core::types::{RelayInfo, SubdomainSpec, TunnelType};
+use pike_core::proto::{ALPN_PROTOCOL, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION};
+use pike_core::quic::server::PikeTunnelApp;
 use pike_server::admin::run_admin_command;
 use pike_server::config::{CliArgs, ServerConfig};
-use pike_server::connection::{ClientConnection, ConnectionState, ValidatedUser};
-use pike_server::control_plane::{ApiKeyValidation, AuthCache, ControlPlaneClient};
-use pike_server::dashboard_ws::{DashboardBroadcaster, DashboardEvent};
+use pike_server::connection::{ClientConnection, ConnectionState};
+use pike_server::control_plane::ControlPlaneClient;
+use pike_server::dashboard_ws::DashboardBroadcaster;
 use pike_server::http::run_http_server;
 use pike_server::ingest::RequestBuffer;
 use pike_server::management::run_management_server;
-use pike_server::proxy::{HttpRequest, ProxyError, TunnelRequest, WebSocketRequest};
+#[cfg(test)]
+use pike_server::proxy::ProxyError;
 use pike_server::registry::ClientRegistry;
 use pike_server::request_log::RequestLogStore;
-use pike_server::router::{TunnelEntry, VhostRouter};
+use pike_server::router::VhostRouter;
 use pike_server::state_store::{
     FallbackStateStore, InMemoryStateStore, RedisStateStore, StateStore,
 };
 use pike_server::tunnel_metrics::TunnelMetricsStore;
 use pike_server::usage_reporter::UsageReporter;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, watch};
 use tokio_quiche::listen;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::ConnectionParams;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Initialize Sentry when a non-empty DSN is provided. Returns `None` (a complete no-op)
 /// when `dsn` is `None`, so the relay builds and runs identically without `SENTRY_DSN`.
@@ -110,7 +118,7 @@ async fn main() -> Result<()> {
             config.max_tunnels_per_connection,
             state_store.clone(),
         ));
-        run_admin_command(command, registry).await?;
+        run_admin_command(command, registry)?;
         return Ok(());
     }
 
@@ -150,31 +158,62 @@ async fn main() -> Result<()> {
         config.server_token.clone().unwrap_or_default(),
     ));
     let request_log_store = Arc::new(RequestLogStore::with_state_store(state_store.clone()));
-    let tunnel_metrics_store = Arc::new(TunnelMetricsStore::with_state_store(state_store));
+    let usage_journal = if config.workers_api_url.is_some()
+        && config
+            .server_token
+            .as_ref()
+            .is_some_and(|token| !token.trim().is_empty())
+    {
+        Some(Arc::new(pike_server::usage_journal::UsageJournal::open(
+            &config.usage_journal_path,
+            config.workers_api_url.as_deref().unwrap_or_default(),
+        )?))
+    } else {
+        None
+    };
+    let quota = if config.dev_mode {
+        None
+    } else if let Some(journal) = &usage_journal {
+        Some(Arc::new(
+            pike_server::quota::QuotaManager::new(
+                journal.clone(),
+                config.workers_api_url.clone().unwrap_or_default(),
+                config.server_token.clone().unwrap_or_default(),
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
+    let tunnel_metrics_store = Arc::new(
+        TunnelMetricsStore::with_state_store(state_store)
+            .with_usage_journal(usage_journal.clone())
+            .with_quota(quota.clone()),
+    );
 
     let server_token_configured = config
         .server_token
         .as_ref()
         .is_some_and(|token| !token.trim().is_empty());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let quota_maintenance = quota
+        .as_ref()
+        .map(|quota| quota.spawn_maintenance(shutdown_rx.clone()));
     if config.workers_api_url.is_some() && server_token_configured {
         ingest_buffer.spawn_flush_loop();
         let usage_reporter = Arc::new(UsageReporter::new(
             config.workers_api_url.clone().unwrap_or_default(),
             config.server_token.clone().unwrap_or_default(),
-            tunnel_metrics_store.clone(),
-            registry.clone(),
+            usage_journal.expect("configured cloud reporting has a journal"),
         ));
         usage_reporter.spawn_flush_loop(shutdown_rx.clone());
     }
 
-    // Build the control-plane client + auth cache once and share them between the
-    // accept loop and the periodic revalidation loop (fix #5).
-    let control_plane_http_client = reqwest::Client::builder()
+    let http_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let control_plane = Arc::new(ControlPlaneClient::new(
-        control_plane_http_client,
+        http_client,
         config.control_plane_url.clone().unwrap_or_default(),
         config
             .workers_api_url
@@ -184,27 +223,106 @@ async fn main() -> Result<()> {
         config.dev_mode,
         config.local_api_keys.clone(),
     ));
-    let auth_cache = AuthCache::new(Duration::from_secs(300));
-
-    let accept_loop = spawn_accept_loop(
-        registry.clone(),
-        vhost_router.clone(),
-        broadcaster.clone(),
-        tunnel_metrics_store.clone(),
-        control_plane.clone(),
-        auth_cache.clone(),
-        config.clone(),
+    let manual_certificates = config
+        .public_https
+        .iter()
+        .chain(config.public_tls.iter())
+        .flat_map(|listener| listener.certificates.iter().cloned())
+        .collect::<Vec<_>>();
+    let certificates = pike_server::certificates::Certificates::new(
+        manual_certificates,
+        config.acme.clone(),
         shutdown_rx.clone(),
     )
     .await?;
-    let revalidation_loop = spawn_revalidation_loop(
-        registry.clone(),
-        vhost_router.clone(),
-        control_plane.clone(),
-        auth_cache.clone(),
-        config.clone(),
-        shutdown_rx.clone(),
-    );
+    // Cross-relay ingress: hop trust is loaded before any public listener so a
+    // misconfigured relay never starts half-way into the topology.
+    let hop_tls = match &config.ingress {
+        Some(ingress) => Some(pike_server::ingress::HopTls::load(ingress).await?),
+        None => None,
+    };
+    let frontend = match (&config.ingress, &hop_tls) {
+        (Some(ingress), Some(tls)) if !ingress.peers.is_empty() => {
+            Some(pike_server::ingress::Frontend::spawn(
+                ingress,
+                config.public_bind_ip,
+                tls.client.clone(),
+                registry.ingress.clone(),
+                shutdown_rx.clone(),
+            )?)
+        }
+        _ => None,
+    };
+    let (hop_http_tx, hop_http_rx) = mpsc::channel(16);
+    let (hop_https_tx, hop_https_rx) = mpsc::channel(16);
+    let tls_endpoints = if let Some(tls) = &config.public_tls {
+        Some(
+            public_tls::TlsEndpoints::bind(
+                tls,
+                certificates.clone(),
+                frontend.clone(),
+                shutdown_rx.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let session_context = relay_session::SessionContext {
+        certificates: certificates.clone(),
+        tls_endpoints,
+        registry: registry.clone(),
+        vhost_router: vhost_router.clone(),
+        broadcaster: broadcaster.clone(),
+        tunnel_metrics_store: tunnel_metrics_store.clone(),
+        control_plane,
+        tcp_manager: Arc::new(
+            pike_server::tcp::TcpTunnelManager::new(Arc::new(
+                pike_core::quic::stream_manager::StreamManager::new(),
+            ))
+            .with_bind_ip(config.public_bind_ip),
+        ),
+        server_config: config.clone(),
+        lifecycle_locks: Arc::default(),
+        endpoints: Arc::default(),
+        frontend: frontend.clone(),
+    };
+    let owner_loop = match (&config.ingress, &hop_tls) {
+        (Some(ingress), Some(tls)) => ingress.hop_bind_addr.map(|bind| {
+            let handles = relay_ingress::OwnerHandles {
+                registry: registry.clone(),
+                vhost_router: vhost_router.clone(),
+                endpoints: session_context.endpoints.clone(),
+                tls_endpoints: session_context.tls_endpoints.clone(),
+                certificates: session_context.certificates.clone(),
+                http: hop_http_tx,
+                https: hop_https_tx,
+            };
+            let server = tls.server.clone();
+            let shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(error) = relay_ingress::run_owner(bind, server, handles, shutdown).await
+                {
+                    warn!(error = %error, "ingress hop listener exited with error");
+                }
+                info!("ingress hop loop stopped");
+            })
+        }),
+        _ => None,
+    };
+    let http_ingress = if config.ingress.is_some() {
+        Some(pike_server::ingress::HttpIngress {
+            frontend: frontend.clone(),
+            http: hop_http_rx,
+            https: hop_https_rx,
+        })
+    } else {
+        None
+    };
+
+    let accept_loop = spawn_accept_loop(session_context.clone(), shutdown_rx.clone()).await?;
+    let (ws_accept_tx, ws_accept_rx) = mpsc::channel(16);
+    let websocket_loop = spawn_websocket_loop(session_context, ws_accept_rx, shutdown_rx.clone());
     let heartbeat_loop = spawn_half_open_monitor(
         registry.clone(),
         vhost_router.clone(),
@@ -212,6 +330,7 @@ async fn main() -> Result<()> {
         shutdown_rx.clone(),
     );
     let http_loop = spawn_http_loop(
+        certificates,
         vhost_router.clone(),
         registry.clone(),
         broadcaster.clone(),
@@ -220,6 +339,8 @@ async fn main() -> Result<()> {
         tunnel_metrics_store,
         config.clone(),
         shutdown_rx.clone(),
+        ws_accept_tx,
+        http_ingress,
     );
     let management_loop =
         spawn_management_loop(registry.clone(), config.clone(), shutdown_rx.clone());
@@ -244,8 +365,16 @@ async fn main() -> Result<()> {
     let _ = heartbeat_loop.await;
     let _ = http_loop.await;
     let _ = management_loop.await;
-    let _ = revalidation_loop.await;
     let _ = accept_loop.await;
+    let _ = websocket_loop.await;
+    if let Some(task) = owner_loop {
+        let _ = task.await;
+    }
+    if let Some(task) = quota_maintenance {
+        // If the control plane is down, durable seals/pending IDs remain for
+        // startup recovery; shutdown must not wait indefinitely on the network.
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    }
 
     info!("shutdown complete");
     Ok(())
@@ -294,7 +423,7 @@ async fn build_rate_limit_store(
 
 fn check_protocol_version(protocol_version: Option<u32>) -> std::result::Result<(), String> {
     let Some(version) = protocol_version else {
-        return Ok(());
+        return Err("protocol version required; upgrade Pike client to protocol 8".into());
     };
 
     if version > PROTOCOL_VERSION {
@@ -314,6 +443,7 @@ fn check_protocol_version(protocol_version: Option<u32>) -> std::result::Result<
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_http_loop(
+    certificates: Arc<pike_server::certificates::Certificates>,
     router: Arc<VhostRouter>,
     registry: Arc<ClientRegistry>,
     broadcaster: Arc<DashboardBroadcaster>,
@@ -322,6 +452,8 @@ fn spawn_http_loop(
     tunnel_metrics_store: Arc<TunnelMetricsStore>,
     config: ServerConfig,
     shutdown_rx: watch::Receiver<bool>,
+    ws_accept_tx: mpsc::Sender<pike_server::websocket::AcceptedWebSocket>,
+    ingress: Option<pike_server::ingress::HttpIngress>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = run_http_server(
@@ -336,11 +468,15 @@ fn spawn_http_loop(
             config.local_api_keys.clone(),
             config.dev_mode,
             config.traffic_inspection.clone(),
+            config.max_request_body_bytes,
             config.domain.clone(),
-            std::time::Duration::from_secs(config.request_timeout_secs),
-            config.max_body_size,
+            config.trusted_http_proxies.clone(),
             config.trust_cloudflare,
+            config.public_https.clone(),
+            certificates,
             shutdown_rx,
+            Some(ws_accept_tx),
+            ingress,
         )
         .await
         {
@@ -372,17 +508,12 @@ fn spawn_management_loop(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn spawn_accept_loop(
-    registry: Arc<ClientRegistry>,
-    vhost_router: Arc<VhostRouter>,
-    broadcaster: Arc<DashboardBroadcaster>,
-    tunnel_metrics_store: Arc<TunnelMetricsStore>,
-    control_plane: Arc<ControlPlaneClient>,
-    auth_cache: Arc<AuthCache>,
-    config: ServerConfig,
+    session_context: relay_session::SessionContext,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<tokio::task::JoinHandle<()>> {
+    let registry = session_context.registry.clone();
+    let config = session_context.server_config.clone();
     let socket = tokio::net::UdpSocket::bind(config.bind_addr)
         .await
         .with_context(|| format!("failed to bind QUIC socket on {}", config.bind_addr))?;
@@ -393,6 +524,12 @@ async fn spawn_accept_loop(
 
     let mut settings = QuicSettings::default();
     settings.alpn = vec![ALPN_PROTOCOL.to_vec()];
+    settings.initial_max_data = config.quic_config.max_connection_data;
+    settings.initial_max_stream_data_bidi_local = config.quic_config.max_stream_data;
+    settings.initial_max_stream_data_bidi_remote = config.quic_config.max_stream_data;
+    settings.initial_max_streams_bidi = config.quic_config.max_concurrent_streams;
+    settings.initial_max_streams_uni = 0;
+    settings.enable_dgram = false;
     settings.max_idle_timeout = Some(Duration::from_millis(config.quic_config.idle_timeout_ms));
 
     let cert_path = config
@@ -454,480 +591,24 @@ async fn spawn_accept_loop(
                             }
 
                             // Enforce the connection cap BEFORE spawning any per-connection
-                            // tasks. Previously the Result was discarded, so `max_connections`
-                            // was soft-tracking only and a flood of QUIC connections could spawn
-                            // unbounded tasks (reachable DoS). On rejection we warn, count it, and
-                            // drop `conn` (closing it) without registering — so the disconnect
-                            // path never runs for an unregistered client and the gauge stays
-                            // balanced.
+                            // tasks; a flood of QUIC connections must not spawn unbounded
+                            // sessions. Dropping `conn` without registering closes it, so the
+                            // session cleanup path never runs for an unregistered client.
                             if let Err(error) = registry.register_client(client) {
-                                warn!(
-                                    %connection_id,
-                                    error = %error,
-                                    "refusing QUIC connection: at max_connections"
-                                );
+                                warn!(%connection_id, error = %error, "refusing QUIC connection: at max_connections");
                                 pike_server::metrics::CONNECTION_LIMIT_REJECTIONS.inc();
                                 drop(conn);
                                 continue;
                             }
 
-                            let registry_for_conn = registry.clone();
-                            let vhost_router_for_conn = vhost_router.clone();
-                            let broadcaster_for_conn = broadcaster.clone();
-                            let tunnel_metrics_store_for_conn = tunnel_metrics_store.clone();
-                            let control_plane_for_conn = control_plane.clone();
-                            let auth_cache_for_conn = auth_cache.clone();
-                            let mut conn_shutdown_rx = shutdown_rx.clone();
-                            let server_config = config.clone();
+                            let session_context = session_context.clone();
+                            let conn_shutdown_rx = shutdown_rx.clone();
                             tokio::spawn(async move {
-                                let (data_tx, mut data_rx) = mpsc::channel(256);
-                                let (outbound_tx, outbound_rx) = mpsc::channel(256);
-                                let app = PikeTunnelApp::new(data_tx, outbound_rx)
-                                    .with_max_body_size(server_config.max_body_size);
+                                let (data_tx, data_rx) = mpsc::channel(4);
+                                let (outbound_tx, outbound_rx) = mpsc::channel(4);
+                                let app = PikeTunnelApp::new(data_tx, outbound_rx);
                                 conn.start(app);
-                                let pending_http = Arc::new(Mutex::new(HashMap::<
-                                    u64,
-                                    oneshot::Sender<Result<Response<Body>, ProxyError>>,
-                                >::new()));
-                                let ws_relays: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>> =
-                                    Arc::new(Mutex::new(HashMap::new()));
-                                let mut http_forwarders = Vec::new();
-                                let mut registered_hosts = Vec::new();
-
-                                loop {
-                                    tokio::select! {
-                                        changed = conn_shutdown_rx.changed() => {
-                                            if changed.is_ok() && *conn_shutdown_rx.borrow() {
-                                                break;
-                                            }
-                                        }
-                                        inbound = data_rx.recv() => {
-                                            let Some(inbound) = inbound else {
-                                                warn!(connection_id = %connection_id, "QUIC connection lost: tunnel app channel closed (likely QUIC idle timeout or peer disconnect)");
-                                                break;
-                                            };
-
-                                            match inbound {
-                                                PikeMessage::Control(control_msg) => {
-                                                    match control_msg {
-                                                        ControlMessage::RegisterTunnel { config } => {
-                                                            let tunnel_id = config.id;
-                                                            info!(tunnel_id = %tunnel_id, "RegisterTunnel message received");
-                                                            // No TCP data plane exists yet: a TCP registration would be
-                                                            // acknowledged with a remote_port that nothing binds, giving the
-                                                            // user a silently dead endpoint. Reject until the forwarder ships.
-                                                            if matches!(&config.tunnel_type, TunnelType::Tcp { .. }) {
-                                                                warn!(tunnel_id = %tunnel_id, "Rejecting TCP tunnel registration: no TCP data plane");
-                                                                let _ = outbound_tx
-                                                                    .send(PikeOutboundMessage::Control(ControlMessage::TunnelError {
-                                                                        tunnel_id,
-                                                                        reason: "TCP tunnels are not yet available on this relay"
-                                                                            .to_string(),
-                                                                    }))
-                                                                    .await;
-                                                                continue;
-                                                            }
-                                                            let api_key = registry_for_conn
-                                                                .clients
-                                                                .get(&connection_id)
-                                                                .and_then(|client| client.info.api_key.clone())
-                                                                .unwrap_or_default();
-                                                            let (subdomain, remote_port) = match &config.tunnel_type {
-                                                                TunnelType::Http { subdomain, .. } => {
-                                                                    let host = match subdomain {
-                                                                        Some(candidate) => {
-                                                                            match SubdomainSpec::new(candidate.to_lowercase()) {
-                                                                                Ok(spec) => spec.0,
-                                                                                Err(e) => {
-                                                                                    warn!(tunnel_id = %tunnel_id, error = %e, "Subdomain validation failed");
-                                                                                    let reason = format!("Invalid subdomain: {}", e);
-                                                                                    let _ = outbound_tx
-                                                                                        .send(PikeOutboundMessage::Control(ControlMessage::TunnelError {
-                                                                                            tunnel_id,
-                                                                                            reason,
-                                                                                        }))
-                                                                                        .await;
-                                                                                    continue;
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                        None => tunnel_id.to_string(),
-                                                                    };
-                                                                    (format!("{host}.{}", server_config.domain), None)
-                                                                }
-                                                                TunnelType::Tcp { remote_port, .. } => {
-                                                                    (format!("{}.{}", tunnel_id, server_config.domain), *remote_port)
-                                                                }
-                                                            };
-                                                            info!(subdomain = %subdomain, "Registering tunnel with subdomain");
-
-                                                            // Fix #2: register EVERY tunnel type with the control plane (not
-                                                            // just HTTP) so tunnel-count limits are durably enforced in D1 and
-                                                            // TCP tunnels are visible/suspendable, not just tracked in memory.
-                                                            {
-                                                                let tunnel_type_str = match &config.tunnel_type {
-                                                                    TunnelType::Http { .. } => "http",
-                                                                    TunnelType::Tcp { .. } => "tcp",
-                                                                };
-                                                                let requested_subdomain =
-                                                                    subdomain.trim_end_matches(&format!(".{}", server_config.domain));
-                                                                if let Err(error) = control_plane_for_conn
-                                                                    .register_tunnel(
-                                                                        &api_key,
-                                                                        requested_subdomain,
-                                                                        tunnel_type_str,
-                                                                    )
-                                                                    .await
-                                                                {
-                                                                    let workers_reason = error.to_string();
-                                                                    warn!(tunnel_id = %tunnel_id, subdomain = %subdomain, error = %workers_reason, "Workers API rejected tunnel registration");
-                                                                    let reason = if workers_reason
-                                                                        == "subdomain already in use by another user"
-                                                                    {
-                                                                        format!(
-                                                                            "Subdomain '{}' is owned by another user",
-                                                                            requested_subdomain
-                                                                        )
-                                                                    } else if workers_reason.contains("tunnel limit reached") {
-                                                                        format!("Tunnel limit reached for your plan. Upgrade at {}", server_config.domain)
-                                                                    } else {
-                                                                        workers_reason
-                                                                    };
-                                                                    let _ = outbound_tx
-                                                                        .send(PikeOutboundMessage::Control(ControlMessage::TunnelError {
-                                                                            tunnel_id,
-                                                                            reason,
-                                                                        }))
-                                                                        .await;
-                                                                    continue;
-                                                                }
-                                                            }
-
-                                                            if let Err(error) = registry_for_conn.register_tunnel(
-                                                                connection_id,
-                                                                subdomain.clone(),
-                                                                tunnel_id,
-                                                            ) {
-                                                                warn!(error = %error, "failed to register tunnel");
-                                                                let _ = outbound_tx
-                                                                    .send(PikeOutboundMessage::Control(ControlMessage::TunnelError {
-                                                                        tunnel_id,
-                                                                        reason: error.to_string(),
-                                                                    }))
-                                                                    .await;
-                                                                continue;
-                                                            }
-                                                            info!("Tunnel registered in registry");
-
-                                                            // Reconcile this tunnel's suspension state from the durable store
-                                                            // once, at registration (off the request hot path). This is what
-                                                            // lets `is_suspended` stay a non-blocking in-memory check while
-                                                            // still honoring a suspension persisted by a previous run.
-                                                            registry_for_conn
-                                                                .abuse_detector
-                                                                .refresh_tunnel_suspension(tunnel_id)
-                                                                .await;
-
-                                                            if let Some(user_id) = registry_for_conn
-                                                                .user_id_for_connection(&connection_id)
-                                                            {
-                                                                tunnel_metrics_store_for_conn
-                                                                    .remember_tunnel(
-                                                                        &tunnel_id.to_string(),
-                                                                        &user_id,
-                                                                    )
-                                                                    .await;
-                                                            }
-
-                                                            if matches!(&config.tunnel_type, TunnelType::Http { .. }) {
-                                                                info!("Registering HTTP tunnel in VhostRouter");
-                                                                let (http_tx, mut http_rx) = mpsc::channel::<TunnelRequest>(256);
-                                                                vhost_router_for_conn.register(
-                                                                    &subdomain,
-                                                                    TunnelEntry {
-                                                                        tunnel_id,
-                                                                        connection_id,
-                                                                        stream_tx: http_tx,
-                                                                        active: true,
-                                                                    },
-                                                                );
-                                                                registered_hosts.push(subdomain.clone());
-
-                                                                let outbound_tx = outbound_tx.clone();
-                                                                let pending_http = pending_http.clone();
-                                                                let ws_relays = ws_relays.clone();
-                                                                let tunnel_metrics_store = tunnel_metrics_store_for_conn.clone();
-                                                                let registry_ws_forwarder = registry_for_conn.clone();
-                                                                // Same limit the HTTP edge enforces (413 layer); keeps the
-                                                                // inner encode cap from silently rejecting bodies the edge
-                                                                // already accepted.
-                                                                let max_body_size = server_config.max_body_size;
-                                                                http_forwarders.push(tokio::spawn(async move {
-                                                                    while let Some(tunnel_req) = http_rx.recv().await {
-                                                                        match tunnel_req {
-                                                                            TunnelRequest::Http(http_request) => {
-                                                                                let HttpRequest {
-                                                                                    stream_header,
-                                                                                    request,
-                                                                                    response_tx,
-                                                                                    ..
-                                                                                } = *http_request;
-
-                                                                                let encoded_request = match encode_http_request(request, max_body_size).await {
-                                                                                    Ok(encoded) => encoded,
-                                                                                    Err(error) => {
-                                                                                        let _ = response_tx.send(Err(error));
-                                                                                        continue;
-                                                                                    }
-                                                                                };
-
-                                                                                let request_key = stream_header.connection_id;
-                                                                                pending_http.lock().await.insert(request_key, response_tx);
-
-                                                                                let send_result = outbound_tx
-                                                                                    .send(PikeOutboundMessage::Data(OutboundData {
-                                                                                        stream_id: None,
-                                                                                        tunnel_id: stream_header.tunnel_id,
-                                                                                        connection_id: stream_header.connection_id,
-                                                                                        source_addr: stream_header.source_addr,
-                                                                                        payload: encoded_request,
-                                                                                        fin: true,
-                                                                                        streaming: false,
-                                                                                    }))
-                                                                                    .await;
-
-                                                                                if send_result.is_err() {
-                                                                                    if let Some(tx) = pending_http.lock().await.remove(&request_key) {
-                                                                                        let _ = tx.send(Err(ProxyError::DispatchFailed));
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                            TunnelRequest::WebSocket(ws_request) => {
-                                                                                handle_websocket_tunnel_request(
-                                                                                    ws_request,
-                                                                                    outbound_tx.clone(),
-                                                                                    ws_relays.clone(),
-                                                                                    tunnel_metrics_store.clone(),
-                                                                                    registry_ws_forwarder.clone(),
-                                                                                )
-                                                                                .await;
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }));
-                                                            }
-
-                                                            // Broadcast tunnel connected event
-                                                            if let Some(uid) = registry_for_conn.user_id_for_connection(&connection_id) {
-                                                                let event = DashboardEvent::TunnelStatus {
-                                                                    tunnel_id: tunnel_id.to_string(),
-                                                                    subdomain: subdomain.clone(),
-                                                                    status: "connected".to_string(),
-                                                                };
-                                                                if let Ok(json) = serde_json::to_string(&event) {
-                                                                    broadcaster_for_conn.broadcast(&uid, &json);
-                                                                }
-                                                            }
-
-                                                            let response = ControlMessage::TunnelRegistered {
-                                                                tunnel_id,
-                                                                public_url: format!("https://{subdomain}"),
-                                                                remote_port,
-                                                            };
-                                                            let _ = outbound_tx
-                                                                .send(PikeOutboundMessage::Control(response))
-                                                                .await;
-                                                        }
-                                                        ControlMessage::Heartbeat { seq, timestamp } => {
-                                                            registry_for_conn.heartbeat(&connection_id);
-                                                            let response = ControlMessage::HeartbeatAck {
-                                                                seq,
-                                                                timestamp,
-                                                                server_time: std::time::SystemTime::now()
-                                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                                    .unwrap_or_default()
-                                                                    .as_secs(),
-                                                            };
-                                                            let _ = outbound_tx
-                                                                .send(PikeOutboundMessage::Control(response))
-                                                                .await;
-                                                        }
-                                                        ControlMessage::Login { api_key, client_version: _, protocol_version } => {
-                                                            info!(connection_id = %connection_id, api_key_len = api_key.len(), "Login received, validating API key");
-
-                                                            if let Err(reason) = check_protocol_version(protocol_version) {
-                                                                warn!(connection_id = %connection_id, %reason, "client protocol version rejected");
-                                                                let _ = outbound_tx
-                                                                    .send(PikeOutboundMessage::Control(ControlMessage::LoginFailure {
-                                                                        reason,
-                                                                    }))
-                                                                    .await;
-                                                                continue;
-                                                            }
-
-                                                            if let Some(version) = protocol_version {
-                                                                info!(connection_id = %connection_id, version, "client connected with protocol version");
-                                                            } else {
-                                                                warn!(connection_id = %connection_id, "client connected without protocol version (legacy client)");
-                                                            }
-
-                                                            let auth_result: Result<ValidatedUser> =
-                                                                if let Some(cached_user) = auth_cache_for_conn.get(&api_key) {
-                                                                    info!(connection_id = %connection_id, "auth cache hit");
-                                                                    Ok(cached_user)
-                                                                } else {
-                                                                    control_plane_for_conn.validate_api_key(&api_key).await
-                                                                };
-
-                                                            match auth_result {
-                                                                Ok(user) => {
-                                                                    // Fix #6d/#8: the primary QUIC login path previously never
-                                                                    // checked bans. Reject revoked keys, banned users (by
-                                                                    // user_id, the identifier bans are stored under), and
-                                                                    // control-plane-suspended accounts here.
-                                                                    if !registry_for_conn.is_api_key_allowed(&api_key)
-                                                                        || registry_for_conn
-                                                                            .abuse_detector
-                                                                            .is_banned(&user.user_id)
-                                                                        || !user.status.is_active()
-                                                                    {
-                                                                        warn!(connection_id = %connection_id, user_id = %user.user_id, "login rejected: user banned/suspended or api key revoked");
-                                                                        let _ = outbound_tx
-                                                                            .send(PikeOutboundMessage::Control(ControlMessage::LoginFailure {
-                                                                                reason: "account suspended or banned".to_string(),
-                                                                            }))
-                                                                            .await;
-                                                                        continue;
-                                                                    }
-
-                                                                    auth_cache_for_conn.insert(&api_key, user.clone());
-
-                                                                    if let Some(mut client) =
-                                                                        registry_for_conn.clients.get_mut(&connection_id)
-                                                                    {
-                                                                        client.info.api_key = Some(api_key.clone());
-                                                                        client.set_validated_user(user);
-                                                                        let _ = client.transition_to(ConnectionState::Authenticated);
-                                                                    }
-
-                                                                    let session_id =
-                                                                        format!("session-{}", uuid::Uuid::new_v4().simple());
-                                                                    let response = ControlMessage::LoginSuccess {
-                                                                        session_id,
-                                                                        relay_info: RelayInfo {
-                                                                            addr: config.bind_addr,
-                                                                            region: "global".to_string(),
-                                                                            version: env!("CARGO_PKG_VERSION").to_string(),
-                                                                        },
-                                                                    };
-                                                                    let _ = outbound_tx
-                                                                        .send(PikeOutboundMessage::Control(response))
-                                                                        .await;
-                                                                }
-                                                                Err(e) => {
-                                                                    warn!(connection_id = %connection_id, error = %e, "API key validation failed");
-                                                                    let response = ControlMessage::LoginFailure {
-                                                                        reason: e.to_string(),
-                                                                    };
-                                                                    let _ = outbound_tx
-                                                                        .send(PikeOutboundMessage::Control(response))
-                                                                        .await;
-                                                                }
-                                                            }
-                                                        }
-                                                        ControlMessage::UnregisterTunnel { .. }
-                                                        | ControlMessage::LoginSuccess { .. }
-                                                        | ControlMessage::LoginFailure { .. }
-                                                        | ControlMessage::TunnelRegistered { .. }
-                                                        | ControlMessage::TunnelError { .. }
-                                                        | ControlMessage::HeartbeatAck { .. } => {}
-                                                    }
-                                                }
-                                                PikeMessage::Data(data) => {
-                                                    if data.streaming {
-                                                        handle_streaming_pike_data(
-                                                            data,
-                                                            ws_relays.clone(),
-                                                            tunnel_metrics_store_for_conn.clone(),
-                                                            registry_for_conn.clone(),
-                                                        )
-                                                        .await;
-                                                    } else if let Some(response_tx) =
-                                                        pending_http.lock().await.remove(&data.connection_id)
-                                                    {
-                                                        let _ = response_tx
-                                                            .send(parse_http_response(&data.payload));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                for forwarder in http_forwarders {
-                                    forwarder.abort();
-                                }
-
-                                // Broadcast disconnected status for each tunnel
-                                if let Some(uid) = registry_for_conn.user_id_for_connection(&connection_id) {
-                                    for host in &registered_hosts {
-                                        let event = DashboardEvent::TunnelStatus {
-                                            tunnel_id: String::new(),
-                                            subdomain: host.clone(),
-                                            status: "disconnected".to_string(),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&event) {
-                                            broadcaster_for_conn.broadcast(&uid, &json);
-                                        }
-                                    }
-                                }
-
-                                // Fire-and-forget: update tunnel status to inactive in Workers API
-                                if let (Some(api_url), Some(token)) = (
-                                    &server_config.workers_api_url,
-                                    &server_config.server_token,
-                                ) {
-                                    if !token.trim().is_empty() {
-                                        let url = format!("{}/api/v1/tunnels/internal/status-bulk", api_url);
-                                        let subdomains: Vec<String> = registered_hosts
-                                            .iter()
-                                            .map(|h| h.trim_end_matches(".pike.life").to_string())
-                                            .collect();
-                                        let token = token.clone();
-                                        tokio::spawn(async move {
-                                            let client = reqwest::Client::new();
-                                            match client
-                                                .post(&url)
-                                                .header("X-Server-Token", &token)
-                                                .json(&serde_json::json!({
-                                                    "subdomains": subdomains,
-                                                    "status": "inactive"
-                                                }))
-                                                .send()
-                                                .await
-                                            {
-                                                Ok(resp) => {
-                                                    tracing::info!(
-                                                        status = %resp.status(),
-                                                        "tunnel status bulk update sent"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        error = %e,
-                                                        "failed to update tunnel status in Workers API"
-                                                    );
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-
-                                for host in registered_hosts {
-                                    vhost_router_for_conn.unregister_if_owner(&host, &connection_id);
-                                }
-
-                                registry_for_conn.remove_client(&connection_id);
+                                relay_session::run_session(session_context, connection_id, data_rx, outbound_tx, conn_shutdown_rx, "quic").await;
                             });
                         }
                         Err(error) => {
@@ -942,182 +623,85 @@ async fn spawn_accept_loop(
     }))
 }
 
+fn spawn_websocket_loop(
+    context: relay_session::SessionContext,
+    mut sockets: mpsc::Receiver<pike_server::websocket::AcceptedWebSocket>,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let socket = tokio::select! {
+                _ = shutdown.changed() => break,
+                socket = sockets.recv() => match socket { Some(socket) => socket, None => break },
+            };
+            let connection_id = uuid::Uuid::new_v4();
+            let mut client = ClientConnection::new(connection_id, Some(socket.peer_addr));
+            client.info.transport = "WebSocket";
+            if client.transition_to(ConnectionState::Handshaking).is_err() {
+                continue;
+            }
+            // The WebSocket transport shares the same registry and connection cap.
+            if let Err(error) = context.registry.register_client(client) {
+                warn!(%connection_id, error = %error, "refusing WebSocket connection: at max_connections");
+                pike_server::metrics::CONNECTION_LIMIT_REJECTIONS.inc();
+                continue;
+            }
+            let context = context.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let (data_tx, data_rx) = mpsc::channel(4);
+                let (outbound_tx, outbound_rx) = mpsc::channel(4);
+                let transport = tokio::spawn(pike_server::websocket::run_transport(
+                    socket.socket,
+                    socket.login_permit,
+                    data_tx,
+                    outbound_rx,
+                ));
+                relay_session::run_session(
+                    context,
+                    connection_id,
+                    data_rx,
+                    outbound_tx,
+                    shutdown,
+                    "websocket",
+                )
+                .await;
+                transport.abort();
+                let _ = transport.await;
+            });
+        }
+    })
+}
+
 fn spawn_half_open_monitor(
     registry: Arc<ClientRegistry>,
-    vhost_router: Arc<VhostRouter>,
+    _vhost_router: Arc<VhostRouter>,
     config: ServerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
-    let workers_api_url = config.workers_api_url.clone();
-    let server_token = config.server_token.clone();
     tokio::spawn(async move {
         let timeout = Duration::from_secs(config.heartbeat_timeout_secs);
         loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
-                    if changed.is_ok() && *shutdown_rx.borrow() {
-                        break;
-                    }
+                    if changed.is_ok() && *shutdown_rx.borrow() { break; }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                    for conn_id in registry.mark_dead_connections(timeout) {
-                        warn!(connection_id = %conn_id, "Client presumed dead, marking tunnels inactive");
-                        let removed_hosts = vhost_router.unregister_by_connection_id(&conn_id);
-                        if !removed_hosts.is_empty() {
-                            if let (Some(api_url), Some(token)) = (&workers_api_url, &server_token) {
-                                if !token.trim().is_empty() {
-                                    let url = format!("{}/api/v1/tunnels/internal/status-bulk", api_url);
-                                    let subdomains: Vec<String> = removed_hosts
-                                        .iter()
-                                        .map(|h| h.trim_end_matches(".pike.life").to_string())
-                                        .collect();
-                                    let token = token.clone();
-                                    info!(subdomains = ?subdomains, "Updating tunnel status to inactive via Workers API");
-                                    tokio::spawn(async move {
-                                        let client = reqwest::Client::new();
-                                        match client
-                                            .post(&url)
-                                            .header("X-Server-Token", &token)
-                                            .json(&serde_json::json!({
-                                                "subdomains": subdomains,
-                                                "status": "inactive"
-                                            }))
-                                            .send()
-                                            .await
-                                        {
-                                            Ok(resp) => info!(status = %resp.status(), "Workers API status-bulk response"),
-                                            Err(e) => error!(error = %e, "Failed to update tunnel status via Workers API"),
-                                        }
-                                    });
-                                }
+                    for attribution in registry.usage_tunnels() {
+                        if let Some(finished) = attribution.finished_at {
+                            if finished.elapsed() >= Duration::from_secs(60) {
+                                registry.forget_finished_usage_tunnel(attribution.runtime_id, finished);
                             }
                         }
                     }
+                    for conn_id in registry.mark_dead_connections(timeout) {
+                        // The owning session serializes unregister/status updates with reconnects.
+                        warn!(connection_id = %conn_id, "Client presumed dead; session will clean up tunnels");
+                    }
                 }
             }
         }
     })
-}
-
-/// Periodically re-query the control plane for each live connection's current plan,
-/// limits, and status (fix #5). This closes the gap where the relay snapshotted the
-/// plan at registration and only checked ban/plan at login (cached ~300s): a
-/// suspended/banned user or downgraded plan now takes effect within one poll interval
-/// instead of persisting for the life of the connection.
-fn spawn_revalidation_loop(
-    registry: Arc<ClientRegistry>,
-    vhost_router: Arc<VhostRouter>,
-    control_plane: Arc<ControlPlaneClient>,
-    auth_cache: Arc<AuthCache>,
-    config: ServerConfig,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if config.dev_mode {
-            info!("revalidation loop disabled in dev mode");
-            return;
-        }
-        // Every 45s: within the auth-cache TTL window so revocations take effect promptly.
-        let interval = Duration::from_secs(45);
-        loop {
-            tokio::select! {
-                changed = shutdown_rx.changed() => {
-                    if changed.is_ok() && *shutdown_rx.borrow() {
-                        break;
-                    }
-                }
-                _ = tokio::time::sleep(interval) => {
-                    revalidate_connections(&registry, &vhost_router, &control_plane, &auth_cache).await;
-                }
-            }
-        }
-        info!("revalidation loop stopped");
-    })
-}
-
-async fn revalidate_connections(
-    registry: &Arc<ClientRegistry>,
-    vhost_router: &Arc<VhostRouter>,
-    control_plane: &Arc<ControlPlaneClient>,
-    auth_cache: &Arc<AuthCache>,
-) {
-    // Group live connections by api key so each key is validated once per pass.
-    let mut by_key: HashMap<String, Vec<uuid::Uuid>> = HashMap::new();
-    for entry in &registry.clients {
-        if let Some(api_key) = entry.info.api_key.clone() {
-            by_key.entry(api_key).or_default().push(*entry.key());
-        }
-    }
-
-    for (api_key, conn_ids) in by_key {
-        match control_plane.validate_api_key_status(&api_key).await {
-            ApiKeyValidation::Unavailable(error) => {
-                // Transient control-plane failure (network/timeout/5xx). Do NOTHING this
-                // pass: leave the live connections intact. Acting here would let a
-                // momentary blip disconnect every connected user; previously it also
-                // added the key to the permanent revoked set, permanently bricking every
-                // key until a relay restart. The QUIC login path re-validates on any
-                // future reconnect, so a genuinely-bad key is still caught there.
-                warn!(error = %error, "revalidation: control plane unavailable; leaving connections intact this pass");
-            }
-            ApiKeyValidation::Invalid => {
-                // Definitive negative: the key/user is genuinely invalid. Disconnect the
-                // live sessions. We do NOT add to the permanent revoked set — the login
-                // path's own validation rejects any reconnect, and not touching the
-                // revoked set means a later false-positive can never persist.
-                warn!("revalidation: api key no longer valid; disconnecting");
-                auth_cache.remove(&api_key);
-                disconnect_connections(registry, vhost_router, &conn_ids);
-                pike_server::metrics::REVALIDATION_DISCONNECTS.inc();
-            }
-            ApiKeyValidation::Valid(user) => {
-                let user = *user;
-                let banned = registry.abuse_detector.is_banned(&user.user_id);
-                if !user.status.is_active() || banned {
-                    warn!(user_id = %user.user_id, banned, "revalidation: user suspended/banned; disconnecting");
-                    auth_cache.remove(&api_key);
-                    disconnect_connections(registry, vhost_router, &conn_ids);
-                    pike_server::metrics::REVALIDATION_DISCONNECTS.inc();
-                    continue;
-                }
-
-                // Refresh the stored plan ceilings and per-user limit overrides.
-                let max_tunnels = registry.rate_limiter.update_user_plan(
-                    &user.user_id,
-                    Some(&user.plan),
-                    &user.limits,
-                );
-
-                // Refresh the cached validated user (plan/status/limits) on each conn.
-                for conn_id in &conn_ids {
-                    if let Some(mut client) = registry.clients.get_mut(conn_id) {
-                        client.set_validated_user(user.clone());
-                    }
-                }
-                auth_cache.insert(&api_key, user.clone());
-
-                // Tear down tunnels beyond the (possibly reduced) plan cap.
-                if let Some(max_tunnels) = max_tunnels {
-                    let removed = registry.enforce_tunnel_cap(&user.user_id, max_tunnels);
-                    for (subdomain, conn_id) in removed {
-                        warn!(user_id = %user.user_id, subdomain = %subdomain, "revalidation: tearing down tunnel over new plan cap");
-                        vhost_router.unregister_if_owner(&subdomain, &conn_id);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn disconnect_connections(
-    registry: &Arc<ClientRegistry>,
-    vhost_router: &Arc<VhostRouter>,
-    conn_ids: &[uuid::Uuid],
-) {
-    for conn_id in conn_ids {
-        vhost_router.unregister_by_connection_id(conn_id);
-        registry.remove_client(conn_id);
-    }
 }
 
 fn spawn_signal_handler(shutdown_tx: watch::Sender<bool>) -> tokio::task::JoinHandle<()> {
@@ -1159,502 +743,55 @@ async fn wait_for_all_connections_closed(registry: Arc<ClientRegistry>) {
     }
 }
 
-async fn handle_websocket_tunnel_request(
-    ws_request: WebSocketRequest,
-    outbound_tx: mpsc::Sender<PikeOutboundMessage>,
-    ws_relays: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
-    tunnel_metrics_store: Arc<TunnelMetricsStore>,
-    registry: Arc<ClientRegistry>,
-) {
-    let WebSocketRequest {
-        stream_header,
-        request_id: _,
-        raw_upgrade_request,
-        mut ws_to_quic_rx,
-        quic_to_ws_tx,
-    } = ws_request;
-
-    let conn_id = stream_header.connection_id;
-    let tunnel_id_string = stream_header.tunnel_id.to_string();
-    tunnel_metrics_store
-        .record_wss_open(&tunnel_id_string)
-        .await;
-
-    ws_relays.lock().await.insert(conn_id, quic_to_ws_tx);
-
-    let upgrade_send_result = outbound_tx
-        .send(PikeOutboundMessage::Data(OutboundData {
-            stream_id: None,
-            tunnel_id: stream_header.tunnel_id,
-            connection_id: conn_id,
-            source_addr: stream_header.source_addr,
-            payload: raw_upgrade_request,
-            fin: false,
-            streaming: true,
-        }))
-        .await;
-
-    if upgrade_send_result.is_err() {
-        tunnel_metrics_store
-            .record_wss_dropped_frames(&tunnel_id_string, 1, "upgrade_dispatch_failed")
-            .await;
-        tunnel_metrics_store
-            .record_wss_close(&tunnel_id_string, "upgrade_dispatch_failed")
-            .await;
-        ws_relays.lock().await.remove(&conn_id);
-        return;
-    }
-
-    let outbound_tx_ws = outbound_tx.clone();
-    let ws_relays_cleanup = ws_relays.clone();
-    let tunnel_metrics_store_ws = tunnel_metrics_store.clone();
-    let tunnel_id_for_ws = tunnel_id_string.clone();
-    let registry_ws = registry.clone();
-    let ws_tunnel_id = stream_header.tunnel_id;
-
-    tokio::spawn(async move {
-        while let Some(bytes) = ws_to_quic_rx.recv().await {
-            if bytes.is_empty() {
-                continue;
-            }
-
-            let frame_stats = pike_server::ws_proxy::websocket_frame_stats(&bytes);
-            let frames = frame_stats.frames.max(1);
-            let bytes_len = bytes.len() as u64;
-            // Fix #4: meter browser -> upstream WebSocket bytes into the bandwidth
-            // quota accounting, not just frame-count observability.
-            registry_ws.track_bandwidth(ws_tunnel_id, bytes_len);
-            let dispatch_started = Instant::now();
-            let send_result = outbound_tx_ws
-                .send(PikeOutboundMessage::Data(OutboundData {
-                    stream_id: None,
-                    tunnel_id: stream_header.tunnel_id,
-                    connection_id: conn_id,
-                    source_addr: stream_header.source_addr,
-                    payload: bytes,
-                    fin: false,
-                    streaming: true,
-                }))
-                .await;
-            let relay_latency_us = duration_micros_u64(dispatch_started.elapsed());
-
-            if send_result.is_err() {
-                tunnel_metrics_store_ws
-                    .record_wss_dropped_frames(
-                        &tunnel_id_for_ws,
-                        frames,
-                        "browser_to_quic_dispatch_failed",
-                    )
-                    .await;
-                break;
-            }
-
-            tunnel_metrics_store_ws
-                .record_wss_inbound_frames(&tunnel_id_for_ws, frames, bytes_len, relay_latency_us)
-                .await;
-        }
-
-        let fin_send_result = outbound_tx_ws
-            .send(PikeOutboundMessage::Data(OutboundData {
-                stream_id: None,
-                tunnel_id: stream_header.tunnel_id,
-                connection_id: conn_id,
-                source_addr: stream_header.source_addr,
-                payload: vec![],
-                fin: true,
-                streaming: true,
-            }))
-            .await;
-        let close_reason = if fin_send_result.is_err() {
-            "client_closed_quic_dispatch_failed"
-        } else {
-            "client_closed"
-        };
-        tunnel_metrics_store_ws
-            .record_wss_close(&tunnel_id_for_ws, close_reason)
-            .await;
-        ws_relays_cleanup.lock().await.remove(&conn_id);
-    });
-}
-
-async fn handle_streaming_pike_data(
-    data: InboundData,
-    ws_relays: Arc<Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>>,
-    tunnel_metrics_store: Arc<TunnelMetricsStore>,
-    registry: Arc<ClientRegistry>,
-) {
-    let InboundData {
-        connection_id: conn_id,
-        tunnel_id,
-        payload,
-        fin,
-        ..
-    } = data;
-    let tunnel_id_string = tunnel_id.to_string();
-    let payload_len = payload.len() as u64;
-    // Fix #4: meter upstream -> browser WebSocket/streaming bytes into the bandwidth
-    // quota accounting.
-    if payload_len > 0 {
-        registry.track_bandwidth_out(tunnel_id, payload_len);
-    }
-    let frames = if payload.is_empty() {
-        0
-    } else {
-        pike_server::ws_proxy::websocket_frame_stats(&payload)
-            .frames
-            .max(1)
-    };
-    let relay_tx = {
-        let relays = ws_relays.lock().await;
-        relays.get(&conn_id).cloned()
-    };
-
-    if let Some(relay_tx) = relay_tx {
-        let dispatch_started = Instant::now();
-        let send_result = relay_tx.send(payload).await;
-        let relay_latency_us = duration_micros_u64(dispatch_started.elapsed());
-
-        if send_result.is_ok() {
-            if frames > 0 {
-                tunnel_metrics_store
-                    .record_wss_outbound_frames(
-                        &tunnel_id_string,
-                        frames,
-                        payload_len,
-                        relay_latency_us,
-                    )
-                    .await;
-            }
-        } else if frames > 0 {
-            tunnel_metrics_store
-                .record_wss_dropped_frames(
-                    &tunnel_id_string,
-                    frames,
-                    "quic_to_browser_dispatch_failed",
-                )
-                .await;
-        }
-    } else if frames > 0 {
-        tunnel_metrics_store
-            .record_wss_dropped_frames(&tunnel_id_string, frames, "relay_missing")
-            .await;
-    }
-
-    if fin {
-        tunnel_metrics_store
-            .record_wss_close(&tunnel_id_string, "tunnel_closed")
-            .await;
-        ws_relays.lock().await.remove(&conn_id);
-    }
-}
-
-fn duration_micros_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-async fn encode_http_request(
-    request: Request<Body>,
-    max_body_size: usize,
-) -> Result<Vec<u8>, ProxyError> {
-    let (parts, body) = request.into_parts();
-    let body_bytes = to_bytes(body, max_body_size)
-        .await
-        .map_err(|error| ProxyError::Upstream(format!("failed to read request body: {error}")))?;
-
-    let target = parts
-        .uri
-        .path_and_query()
-        .map_or("/", |value| value.as_str());
-    let mut encoded = format!("{} {} HTTP/1.1\r\n", parts.method.as_str(), target).into_bytes();
-    let mut has_host = false;
-
-    for (name, value) in &parts.headers {
-        if is_hop_by_hop_header(name.as_str()) || name == CONTENT_LENGTH {
-            continue;
-        }
-        if let Ok(header_value) = value.to_str() {
-            if name == HOST {
-                has_host = true;
-            }
-            encoded.extend_from_slice(name.as_str().as_bytes());
-            encoded.extend_from_slice(b": ");
-            encoded.extend_from_slice(header_value.as_bytes());
-            encoded.extend_from_slice(b"\r\n");
-        }
-    }
-
-    if !has_host {
-        if let Some(authority) = parts.uri.authority() {
-            encoded.extend_from_slice(b"Host: ");
-            encoded.extend_from_slice(authority.as_str().as_bytes());
-            encoded.extend_from_slice(b"\r\n");
-        }
-    }
-
-    encoded.extend_from_slice(format!("Content-Length: {}\r\n", body_bytes.len()).as_bytes());
-    encoded.extend_from_slice(CONNECTION.as_str().as_bytes());
-    encoded.extend_from_slice(b": close\r\n\r\n");
-    encoded.extend_from_slice(&body_bytes);
-    Ok(encoded)
-}
-
+#[cfg(test)]
 fn parse_http_response(payload: &[u8]) -> Result<Response<Body>, ProxyError> {
-    let normalized = normalize_http_response(payload)?;
-    let mut builder = Response::builder().status(normalized.status_code);
-    let has_content_length = normalized
-        .headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str()));
-
-    for (name, value) in &normalized.headers {
-        builder = builder.header(name.as_str(), value.as_str());
-    }
-
-    if !has_content_length {
-        builder = builder.header(CONTENT_LENGTH, normalized.body.len().to_string());
-    }
-
-    builder
-        .body(Body::from(normalized.body))
-        .map_err(|error| ProxyError::Upstream(format!("failed to build response: {error}")))
-}
-
-struct NormalizedHttpResponse {
-    status_code: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-fn normalize_http_response(payload: &[u8]) -> Result<NormalizedHttpResponse, ProxyError> {
-    let mut offset = 0;
-
-    loop {
-        let header_end = find_header_end(&payload[offset..]).ok_or_else(|| {
-            ProxyError::Upstream("invalid upstream HTTP response framing".to_string())
-        })?;
-        let header_end_abs = offset + header_end;
-        let header_bytes = &payload[offset..header_end_abs];
-        let header_text = std::str::from_utf8(header_bytes).map_err(|error| {
-            ProxyError::Upstream(format!("invalid upstream header encoding: {error}"))
-        })?;
-        let mut lines = header_text.split("\r\n");
-
-        let status_line = lines
-            .next()
-            .ok_or_else(|| ProxyError::Upstream("missing upstream status line".to_string()))?;
-        let mut status_parts = status_line.splitn(3, ' ');
-        let _http_version = status_parts.next();
-        let status_code = status_parts
-            .next()
-            .ok_or_else(|| ProxyError::Upstream("missing upstream status code".to_string()))?
-            .parse::<u16>()
-            .map_err(|error| {
-                ProxyError::Upstream(format!("invalid upstream status code: {error}"))
-            })?;
-
-        let mut headers = Vec::new();
-        let mut content_length = None;
-        let mut chunked = false;
-        let mut body_allowed =
-            !matches!(status_code, 204 | 304) && !(100..200).contains(&status_code);
-
-        for header_line in lines {
-            if header_line.is_empty() {
-                continue;
-            }
-
-            let Some((name, value)) = header_line.split_once(':') else {
-                continue;
-            };
-
-            let name = name.trim();
-            let value = value.trim();
-
-            if name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str()) {
-                content_length = Some(value.parse::<usize>().map_err(|error| {
-                    ProxyError::Upstream(format!("invalid upstream content-length: {error}"))
-                })?);
-                continue;
-            }
-
-            if name.eq_ignore_ascii_case("transfer-encoding") {
-                chunked = value
-                    .split(',')
-                    .any(|part| part.trim().eq_ignore_ascii_case("chunked"));
-                continue;
-            }
-
-            if is_hop_by_hop_header(name) {
-                continue;
-            }
-
-            headers.push((name.to_string(), value.to_string()));
-        }
-
-        if status_code == 101 {
-            body_allowed = false;
-        }
-
-        let body_start = header_end_abs + 4;
-        let (body, body_len) = if !body_allowed {
-            (Vec::new(), 0)
-        } else if chunked {
-            decode_chunked_body(&payload[body_start..])?
-        } else if let Some(length) = content_length {
-            let end = body_start.checked_add(length).ok_or_else(|| {
-                ProxyError::Upstream("upstream response body length overflow".to_string())
-            })?;
-            if end > payload.len() {
-                return Err(ProxyError::Upstream(
-                    "upstream response body shorter than declared content-length".to_string(),
-                ));
-            }
-            (payload[body_start..end].to_vec(), length)
-        } else {
-            (
-                payload[body_start..].to_vec(),
-                payload.len().saturating_sub(body_start),
-            )
-        };
-
-        let next_offset = body_start + body_len;
-        if (100..200).contains(&status_code) && status_code != 101 {
-            if next_offset >= payload.len() {
-                return Err(ProxyError::Upstream(
-                    "upstream returned only an interim response".to_string(),
-                ));
-            }
-            offset = next_offset;
-            continue;
-        }
-
-        return Ok(NormalizedHttpResponse {
-            status_code,
-            headers,
-            body,
-        });
-    }
-}
-
-fn decode_chunked_body(payload: &[u8]) -> Result<(Vec<u8>, usize), ProxyError> {
-    // Attacker-controlled input (a malicious tunnel client or upstream can craft this
-    // response). Every index and every arithmetic op below is bounds-/overflow-checked so
-    // that malformed framing returns a decode error (surfaced as 502) instead of panicking
-    // with a slice-out-of-bounds or an integer overflow (fix: reachable DoS panic).
-    let mut decoded = Vec::new();
-    let mut cursor = 0usize;
-
-    loop {
-        // `cursor` is maintained <= payload.len() on every iteration; the guard keeps that
-        // invariant explicit so `payload[cursor..]` can never panic.
-        let rest = payload
-            .get(cursor..)
-            .ok_or_else(|| ProxyError::Upstream("invalid upstream chunk framing".to_string()))?;
-        let line_end = find_crlf(rest)
-            .ok_or_else(|| ProxyError::Upstream("invalid upstream chunk framing".to_string()))?;
-        let line_bytes = rest
-            .get(..line_end)
-            .ok_or_else(|| ProxyError::Upstream("invalid upstream chunk framing".to_string()))?;
-        let line = std::str::from_utf8(line_bytes).map_err(|error| {
-            ProxyError::Upstream(format!("invalid chunk size encoding: {error}"))
-        })?;
-        let size_text = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|error| ProxyError::Upstream(format!("invalid chunk size: {error}")))?;
-        // Advance past "<size>\r\n"; saturating/checked so a crafted length cannot overflow.
-        cursor = cursor
-            .checked_add(line_end)
-            .and_then(|c| c.checked_add(2))
-            .filter(|c| *c <= payload.len())
-            .ok_or_else(|| ProxyError::Upstream("invalid upstream chunk framing".to_string()))?;
-
-        if size == 0 {
-            loop {
-                let rest = payload.get(cursor..).ok_or_else(|| {
-                    ProxyError::Upstream("invalid upstream trailer framing".to_string())
-                })?;
-                let trailer_end = find_crlf(rest).ok_or_else(|| {
-                    ProxyError::Upstream("invalid upstream trailer framing".to_string())
-                })?;
-                cursor = cursor
-                    .checked_add(trailer_end)
-                    .and_then(|c| c.checked_add(2))
-                    .filter(|c| *c <= payload.len())
-                    .ok_or_else(|| {
-                        ProxyError::Upstream("invalid upstream trailer framing".to_string())
-                    })?;
-                if trailer_end == 0 {
-                    return Ok((decoded, cursor));
+    use pike_core::http_response::{Event, ResponseDecoder};
+    let mut decoder = ResponseDecoder::new(false);
+    let events = decoder
+        .feed(payload, true)
+        .map_err(|error| ProxyError::Upstream(error.to_string()))?;
+    let mut response = Response::builder();
+    let mut body = Vec::new();
+    for event in events {
+        match event {
+            Event::Head(head) => {
+                response = response.status(head.status);
+                for (name, value) in head
+                    .end_to_end_headers()
+                    .filter(|(name, _)| !name.eq_ignore_ascii_case("content-length"))
+                {
+                    response = response.header(name, value);
                 }
             }
+            Event::Body(bytes) => body.extend(bytes),
+            Event::End => {}
         }
-
-        let chunk_end = cursor
-            .checked_add(size)
-            .ok_or_else(|| ProxyError::Upstream("upstream chunk length overflow".to_string()))?;
-        // `chunk_end + 2` (the trailing CRLF) must fit in the payload; overflow-checked.
-        let terminator_end = chunk_end
-            .checked_add(2)
-            .ok_or_else(|| ProxyError::Upstream("upstream chunk length overflow".to_string()))?;
-        if terminator_end > payload.len() {
-            return Err(ProxyError::Upstream(
-                "upstream chunk shorter than declared size".to_string(),
-            ));
-        }
-
-        let chunk = payload.get(cursor..chunk_end).ok_or_else(|| {
-            ProxyError::Upstream("upstream chunk shorter than declared size".to_string())
-        })?;
-        decoded.extend_from_slice(chunk);
-        let terminator = payload
-            .get(chunk_end..terminator_end)
-            .ok_or_else(|| ProxyError::Upstream("invalid upstream chunk terminator".to_string()))?;
-        if terminator != b"\r\n" {
-            return Err(ProxyError::Upstream(
-                "invalid upstream chunk terminator".to_string(),
-            ));
-        }
-        cursor = terminator_end;
     }
+    response
+        .header(CONTENT_LENGTH, body.len())
+        .body(Body::from(body))
+        .map_err(|error| ProxyError::Upstream(error.to_string()))
 }
-
-fn find_header_end(payload: &[u8]) -> Option<usize> {
-    payload.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn find_crlf(payload: &[u8]) -> Option<usize> {
-    payload.windows(2).position(|window| window == b"\r\n")
-}
-
-fn is_hop_by_hop_header(name: &str) -> bool {
-    matches!(
-        name.trim().to_ascii_lowercase().as_str(),
-        "connection"
-            | "proxy-connection"
-            | "keep-alive"
-            | "transfer-encoding"
-            | "te"
-            | "trailer"
-            | "upgrade"
-            | "expect"
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use axum::body::{to_bytes, Body};
+    use axum::body::to_bytes;
     use axum::http::header::CONTENT_LENGTH;
-    use axum::http::{Request, Version};
 
     use super::{
-        build_rate_limit_store, check_protocol_version, encode_http_request, parse_http_response,
-        ProxyError, PROTOCOL_VERSION,
+        build_rate_limit_store, check_protocol_version, parse_http_response, PROTOCOL_VERSION,
     };
 
     #[test]
-    fn test_legacy_client_accepted() {
+    fn test_legacy_client_rejected() {
         let result = check_protocol_version(None);
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(check_protocol_version(Some(1)).is_err());
+        assert!(check_protocol_version(Some(2)).is_err());
+        assert!(check_protocol_version(Some(3)).is_err());
+        assert!(check_protocol_version(Some(4)).is_err());
+        assert!(check_protocol_version(Some(5)).is_err());
+        assert!(check_protocol_version(Some(6)).is_err());
+        assert!(check_protocol_version(Some(7)).is_err());
     }
 
     #[test]
@@ -1696,33 +833,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encode_http_request_normalizes_localhop_framing() {
-        let request = Request::builder()
-            .method("POST")
-            .uri("/login?next=%2Fdemo")
-            .version(Version::HTTP_2)
-            .header("Host", "chat.pike.life")
-            .header("Transfer-Encoding", "chunked")
-            .header("Expect", "100-continue")
-            .body(Body::from("password=admin123"))
-            .expect("request should build");
-
-        let encoded = encode_http_request(request, 32 * 1024 * 1024)
-            .await
-            .expect("request should encode");
-        let encoded = String::from_utf8(encoded).expect("request bytes should be utf-8");
-        let encoded_lower = encoded.to_ascii_lowercase();
-
-        assert!(encoded.starts_with("POST /login?next=%2Fdemo HTTP/1.1\r\n"));
-        assert!(encoded_lower.contains("host: chat.pike.life\r\n"));
-        assert!(encoded_lower.contains("content-length: 17\r\n"));
-        assert!(encoded_lower.contains("connection: close\r\n"));
-        assert!(!encoded.contains("Transfer-Encoding:"));
-        assert!(!encoded.contains("Expect:"));
-        assert!(!encoded.contains("HTTP/2.0"));
-    }
-
-    #[tokio::test]
     async fn parse_http_response_skips_interim_responses() {
         let raw = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 302 Found\r\nLocation: /demo\r\nContent-Length: 0\r\n\r\n";
         let response = parse_http_response(raw).expect("response should parse");
@@ -1760,51 +870,17 @@ mod tests {
         assert_eq!(content_length.as_deref(), Some("5"));
     }
 
+    // Malformed chunked framing from a tunnel client must decode to an error, never a
+    // panic. The decoder lives in pike-core; this pins the relay-facing contract.
     #[test]
-    fn decode_chunked_body_valid() {
-        let (decoded, consumed) =
-            super::decode_chunked_body(b"5\r\nhello\r\n0\r\n\r\n").expect("valid chunked body");
-        assert_eq!(&decoded[..], b"hello");
-        assert_eq!(consumed, b"5\r\nhello\r\n0\r\n\r\n".len());
-    }
-
-    // A crafted chunk header declaring a size far larger than the payload must NOT panic
-    // (the old `chunk_end + 2` arithmetic could overflow / index out of bounds → DoS).
-    #[test]
-    fn decode_chunked_body_oversized_size_does_not_panic() {
-        // Declares 0xFFFFFFFFFFFFFFFF bytes but supplies none.
-        let err = super::decode_chunked_body(b"ffffffffffffffff\r\nX")
-            .expect_err("oversized chunk must be rejected");
-        assert!(matches!(err, ProxyError::Upstream(_)));
-    }
-
-    #[test]
-    fn decode_chunked_body_short_chunk_does_not_panic() {
-        // Declares 100 bytes but only supplies 2.
-        let err =
-            super::decode_chunked_body(b"64\r\nhi").expect_err("short chunk must be rejected");
-        assert!(matches!(err, ProxyError::Upstream(_)));
-    }
-
-    #[test]
-    fn decode_chunked_body_missing_terminator_does_not_panic() {
-        // Chunk body present but no trailing CRLF and no room for it.
-        let err = super::decode_chunked_body(b"2\r\nhi")
-            .expect_err("missing terminator must be rejected");
-        assert!(matches!(err, ProxyError::Upstream(_)));
-    }
-
-    #[test]
-    fn decode_chunked_body_garbage_size_does_not_panic() {
-        let err = super::decode_chunked_body(b"zzzz\r\ndata\r\n")
-            .expect_err("non-hex chunk size must be rejected");
-        assert!(matches!(err, ProxyError::Upstream(_)));
-    }
-
-    #[test]
-    fn decode_chunked_body_no_framing_does_not_panic() {
-        let err = super::decode_chunked_body(b"no-crlf-anywhere")
-            .expect_err("missing framing must be rejected");
-        assert!(matches!(err, ProxyError::Upstream(_)));
+    fn malformed_chunked_upstream_responses_are_rejected_without_panicking() {
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nX"[..],
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n64\r\nhi",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzzzz\r\ndata\r\n",
+        ] {
+            assert!(parse_http_response(raw).is_err());
+        }
     }
 }

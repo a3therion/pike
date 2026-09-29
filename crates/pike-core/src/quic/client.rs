@@ -10,6 +10,9 @@ use tokio_quiche::socket::Socket;
 use tokio_quiche::QuicConnection;
 use tokio_quiche::{quiche, ApplicationOverQuic, ConnectionParams, QuicResult};
 
+use super::flow::{
+    Delivery, MAX_CONNECTION_BUFFER, MAX_STREAM_BUFFER, MAX_TRACKED_STREAMS, MAX_WRITE_ENTRIES,
+};
 use crate::proto::{ControlMessage, StreamHeader, ALPN_PROTOCOL, MAX_FRAME_SIZE};
 use crate::quic::config::PikeQuicConfig;
 use crate::types::{ApiKey, TunnelConfig, TunnelId};
@@ -20,6 +23,7 @@ const CONTROL_STREAM_ID: u64 = 0;
 const FIRST_DATA_STREAM_ID: u64 = 4;
 const WAIT_FOR_DATA_TIMEOUT: Duration = Duration::from_millis(100);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BACKOFF_SECS: u64 = 60;
@@ -43,6 +47,7 @@ pub struct LocalData {
     pub payload: Vec<u8>,
     pub fin: bool,
     pub streaming: bool,
+    pub mode: crate::proto::StreamMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +59,7 @@ pub struct ServerData {
     pub payload: Vec<u8>,
     pub fin: bool,
     pub streaming: bool,
+    pub mode: crate::proto::StreamMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,10 +69,18 @@ pub struct RegistrationResult {
 }
 
 #[derive(Debug)]
-enum ClientCommand {
+pub enum ClientCommand {
     RegisterTunnel {
         tunnel: TunnelConfig,
         result_tx: oneshot::Sender<RegistrationResult>,
+    },
+    UnregisterTunnel {
+        tunnel_id: TunnelId,
+        completed: oneshot::Sender<()>,
+    },
+    OriginHealthSource {
+        tunnel_id: TunnelId,
+        source: crate::proto::origin_health::OriginHealthSource,
     },
     Close,
 }
@@ -76,16 +90,34 @@ struct StreamReadState {
     header: Option<StreamHeader>,
     buf: Vec<u8>,
     streaming: bool,
+    mode: crate::proto::StreamMode,
+    recv_closed: bool,
+    send_closed: bool,
 }
 
 pub struct PikeConnection {
     control_tx: mpsc::Sender<ClientCommand>,
     pub data_tx: mpsc::Sender<LocalData>,
     pub data_rx: mpsc::Receiver<ServerData>,
-    _quic_conn: QuicConnection, // Keep connection alive
+    _quic_conn: Option<QuicConnection>, // Keep connection alive
 }
 
 impl PikeConnection {
+    /// Adapt another authenticated transport to the same application channels.
+    #[must_use]
+    pub fn from_channels(
+        control_tx: mpsc::Sender<ClientCommand>,
+        data_tx: mpsc::Sender<LocalData>,
+        data_rx: mpsc::Receiver<ServerData>,
+    ) -> Self {
+        Self {
+            control_tx,
+            data_tx,
+            data_rx,
+            _quic_conn: None,
+        }
+    }
+
     pub async fn request_tunnel_registration(
         &self,
         tunnel: TunnelConfig,
@@ -97,6 +129,45 @@ impl PikeConnection {
             .await
             .map_err(|_| anyhow!("connection control channel closed"))?;
         Ok((tunnel_id, result_rx))
+    }
+
+    /// Wait for relay resource cleanup before allowing the process to exit.
+    pub async fn unregister_tunnel(&mut self, tunnel_id: TunnelId) -> Result<()> {
+        let (completed, mut received) = oneshot::channel();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            self.control_tx
+                .send(ClientCommand::UnregisterTunnel {
+                    tunnel_id,
+                    completed,
+                })
+                .await
+                .map_err(|_| anyhow!("connection control channel closed"))?;
+            // Shutdown cancels application work; drain its bounded receive queue
+            // so in-flight traffic cannot block the control acknowledgement.
+            loop {
+                tokio::select! {
+                    result = &mut received => return result.map_err(|_| anyhow!("relay closed before unregister acknowledgement")),
+                    data = self.data_rx.recv() => {
+                        if data.is_none() {
+                            return received.await.map_err(|_| anyhow!("relay closed before unregister acknowledgement"));
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("unregister acknowledgement timed out"))?
+    }
+
+    pub async fn set_origin_health_source(
+        &self,
+        tunnel_id: TunnelId,
+        source: crate::proto::origin_health::OriginHealthSource,
+    ) -> Result<()> {
+        self.control_tx
+            .send(ClientCommand::OriginHealthSource { tunnel_id, source })
+            .await
+            .map_err(|_| anyhow!("connection control channel closed"))
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -146,12 +217,18 @@ impl PikeClient {
         settings.alpn = vec![ALPN_PROTOCOL.to_vec()];
         settings.verify_peer = self.verify_peer;
         settings.max_idle_timeout = Some(Duration::from_millis(self.config.idle_timeout_ms));
+        settings.initial_max_data = self.config.max_connection_data;
+        settings.initial_max_stream_data_bidi_local = self.config.max_stream_data;
+        settings.initial_max_stream_data_bidi_remote = self.config.max_stream_data;
+        settings.initial_max_streams_bidi = self.config.max_concurrent_streams;
+        settings.initial_max_streams_uni = 0;
+        settings.enable_dgram = false;
 
         let params = ConnectionParams::new_client(settings, None, Hooks::default());
 
         let (control_tx, control_rx) = mpsc::channel(256);
-        let (local_data_tx, local_data_rx) = mpsc::channel(1024);
-        let (server_data_tx, server_data_rx) = mpsc::channel(1024);
+        let (local_data_tx, local_data_rx) = mpsc::channel(4);
+        let (server_data_tx, server_data_rx) = mpsc::channel(4);
 
         let app = PikeClientApp::new(
             self.api_key.clone(),
@@ -175,11 +252,11 @@ impl PikeClient {
             control_tx,
             data_tx: local_data_tx,
             data_rx: server_data_rx,
-            _quic_conn: quic_conn,
+            _quic_conn: Some(quic_conn),
         })
     }
 
-    pub async fn register_tunnel(&self, tunnel: TunnelConfig) -> Result<TunnelId> {
+    pub fn register_tunnel(&self, tunnel: TunnelConfig) -> Result<TunnelId> {
         let message = ControlMessage::RegisterTunnel { config: tunnel };
         let encoded = postcard::to_allocvec(&message)?;
         let _: ControlMessage = postcard::from_bytes(&encoded)?;
@@ -238,15 +315,21 @@ pub struct PikeClientApp {
     pub data_tx: mpsc::Sender<ServerData>,
     pub write_queue: VecDeque<(u64, Vec<u8>, bool)>,
     pub pending_registrations: HashMap<String, oneshot::Sender<RegistrationResult>>,
+    pending_unregistrations: HashMap<TunnelId, oneshot::Sender<()>>,
+    health_sources: crate::proto::origin_health::OriginHealthSources,
     pub buf: Vec<u8>,
     control_rx: mpsc::Receiver<ClientCommand>,
     control_stream_buf: Vec<u8>,
     data_streams: HashMap<u64, StreamReadState>,
     next_data_stream_id: u64,
     heartbeat_seq: u64,
+    last_heartbeat_ack: Option<u64>,
+    heartbeat_deadline: Option<tokio::time::Instant>,
     heartbeat_interval: tokio::time::Interval,
     last_keepalive: std::time::Instant,
     close_requested: bool,
+    delivery: Delivery<ServerData>,
+    login_deadline: Option<tokio::time::Instant>,
 }
 
 impl PikeClientApp {
@@ -266,15 +349,21 @@ impl PikeClientApp {
             data_tx,
             write_queue: VecDeque::new(),
             pending_registrations: HashMap::new(),
+            pending_unregistrations: HashMap::new(),
+            health_sources: crate::proto::origin_health::OriginHealthSources::default(),
             buf: vec![0; SCRATCH_BUFFER_SIZE],
             control_rx,
             control_stream_buf: Vec::new(),
             data_streams: HashMap::new(),
             next_data_stream_id: FIRST_DATA_STREAM_ID,
             heartbeat_seq: 0,
+            last_heartbeat_ack: None,
+            heartbeat_deadline: None,
             heartbeat_interval: tokio::time::interval(HEARTBEAT_INTERVAL),
             last_keepalive: Instant::now(),
             close_requested: false,
+            delivery: Delivery::default(),
+            login_deadline: None,
         }
     }
 
@@ -293,6 +382,7 @@ impl PikeClientApp {
 
     fn queue_control_message(&mut self, message: &ControlMessage) -> Result<()> {
         let payload = encode_frame(message)?;
+        self.check_write_budget(payload.len(), 1)?;
         self.write_queue
             .push_back((CONTROL_STREAM_ID, payload, false));
         Ok(())
@@ -300,12 +390,14 @@ impl PikeClientApp {
 
     fn queue_stream_header(&mut self, stream_id: u64, header: &StreamHeader) -> Result<()> {
         let payload = encode_frame(header)?;
+        self.check_write_budget(payload.len(), 1)?;
         self.write_queue.push_back((stream_id, payload, false));
         Ok(())
     }
 
     fn queue_login(&mut self) -> Result<()> {
         self.state = ClientState::LoggingIn;
+        self.login_deadline = Some(tokio::time::Instant::now() + LOGIN_TIMEOUT);
         self.queue_control_message(&ControlMessage::Login {
             api_key: self.api_key.as_str().to_string(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -340,25 +432,92 @@ impl PikeClientApp {
         })
     }
 
+    fn writes_have_capacity(&self) -> bool {
+        self.write_queue.len() < MAX_WRITE_ENTRIES - 2
+            && self
+                .write_queue
+                .iter()
+                .map(|(_, bytes, _)| bytes.len())
+                .sum::<usize>()
+                <= MAX_CONNECTION_BUFFER - MAX_STREAM_BUFFER - MAX_FRAME_SIZE - 4
+    }
+
+    fn check_write_budget(&self, bytes: usize, entries: usize) -> Result<()> {
+        if bytes > MAX_STREAM_BUFFER + MAX_FRAME_SIZE + 4
+            || self.write_queue.len() + entries > MAX_WRITE_ENTRIES
+            || self
+                .write_queue
+                .iter()
+                .map(|(_, bytes, _)| bytes.len())
+                .sum::<usize>()
+                + bytes
+                > MAX_CONNECTION_BUFFER
+        {
+            return Err(anyhow!("outbound buffering limit exceeded"));
+        }
+        Ok(())
+    }
+
     fn queue_local_data(&mut self, local: LocalData) -> Result<()> {
+        if local.payload.len() > MAX_STREAM_BUFFER {
+            return Err(anyhow!("outbound payload limit exceeded"));
+        }
+        self.check_write_budget(local.payload.len() + MAX_FRAME_SIZE + 4, 2)?;
         let stream_id = local
             .stream_id
             .unwrap_or_else(|| self.alloc_data_stream_id());
-
-        // Only send header for new streams (stream_id was None)
         if local.stream_id.is_none() {
+            if self.data_streams.len() >= MAX_TRACKED_STREAMS {
+                return Err(anyhow!("too many active data streams"));
+            }
             let header = StreamHeader {
                 tunnel_id: local.tunnel_id,
                 connection_id: local.connection_id,
                 source_addr: local.source_addr,
                 streaming: local.streaming,
+                mode: local.mode,
             };
             self.queue_stream_header(stream_id, &header)?;
+            self.data_streams.insert(
+                stream_id,
+                StreamReadState {
+                    header: Some(header),
+                    buf: Vec::new(),
+                    streaming: local.streaming,
+                    mode: local.mode,
+                    recv_closed: false,
+                    send_closed: false,
+                },
+            );
+        } else if self
+            .data_streams
+            .get(&stream_id)
+            .is_none_or(|state| state.send_closed)
+        {
+            return Err(anyhow!("outbound data for unknown or closed stream"));
         }
-
         self.write_queue
             .push_back((stream_id, local.payload, local.fin));
         Ok(())
+    }
+
+    fn finish_write(&mut self, stream_id: u64, fin: bool) {
+        if fin {
+            if let Some(stream) = self.data_streams.get_mut(&stream_id) {
+                stream.send_closed = true;
+            }
+            self.cleanup_stream(stream_id);
+        }
+    }
+
+    fn cleanup_stream(&mut self, stream_id: u64) {
+        if self
+            .data_streams
+            .get(&stream_id)
+            .is_some_and(|stream| stream.recv_closed && stream.send_closed)
+        {
+            self.data_streams.remove(&stream_id);
+        }
     }
 
     fn handle_client_command(&mut self, cmd: ClientCommand) -> Result<()> {
@@ -381,6 +540,19 @@ impl PikeClientApp {
 
                 self.queue_control_message(&ControlMessage::RegisterTunnel { config: tunnel })
             }
+            ClientCommand::UnregisterTunnel {
+                tunnel_id,
+                completed,
+            } => {
+                if self.pending_unregistrations.len() >= MAX_TRACKED_STREAMS {
+                    return Err(anyhow!("too many pending unregistrations"));
+                }
+                self.pending_unregistrations.insert(tunnel_id, completed);
+                self.queue_control_message(&ControlMessage::UnregisterTunnel { tunnel_id })
+            }
+            ClientCommand::OriginHealthSource { tunnel_id, source } => {
+                self.health_sources.insert(tunnel_id, source)
+            }
             ClientCommand::Close => {
                 self.close_requested = true;
                 self.state = ClientState::Closed;
@@ -392,6 +564,8 @@ impl PikeClientApp {
     fn handle_control_message(&mut self, message: ControlMessage) -> Result<()> {
         match message {
             ControlMessage::LoginSuccess { .. } => {
+                self.login_deadline = None;
+                self.heartbeat_deadline = Some(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
                 self.queue_register_tunnels()?;
             }
             ControlMessage::TunnelRegistered {
@@ -429,16 +603,51 @@ impl PikeClientApp {
                     self.state = ClientState::Active;
                 }
             }
-            ControlMessage::HeartbeatAck { .. } => {}
+            ControlMessage::TunnelUnregistered { tunnel_id } => {
+                self.health_sources.remove(tunnel_id);
+                self.registered_tunnels.remove(&tunnel_id);
+                self.tunnels_to_register
+                    .retain(|config| config.id != tunnel_id);
+                if let Some(completed) = self.pending_unregistrations.remove(&tunnel_id) {
+                    let _ = completed.send(());
+                }
+            }
+            ControlMessage::OriginHealthRequest { tunnel_id, nonce } => {
+                if let Some(report) = self.health_sources.snapshot(tunnel_id) {
+                    self.queue_control_message(&ControlMessage::OriginHealthResponse {
+                        tunnel_id,
+                        nonce,
+                        report,
+                    })?;
+                }
+            }
+            ControlMessage::HeartbeatAck { seq, .. } => {
+                if self.heartbeat_deadline.is_some()
+                    && seq < self.heartbeat_seq
+                    && self
+                        .last_heartbeat_ack
+                        .is_none_or(|previous| seq > previous)
+                {
+                    self.last_heartbeat_ack = Some(seq);
+                    self.heartbeat_deadline = Some(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
+                }
+            }
             ControlMessage::LoginFailure { reason }
             | ControlMessage::TunnelError { reason, .. } => {
                 tracing::error!("Received error from server: {}", reason);
+                // A terminal control rejection must also end pending API
+                // waiters. Merely changing state leaves registration awaiting
+                // its full deadline before the caller can reconnect.
+                self.pending_registrations.clear();
+                self.pending_unregistrations.clear();
+                self.close_requested = true;
                 self.state = ClientState::Closed;
             }
             ControlMessage::Login { .. }
             | ControlMessage::RegisterTunnel { .. }
             | ControlMessage::UnregisterTunnel { .. }
-            | ControlMessage::Heartbeat { .. } => {
+            | ControlMessage::Heartbeat { .. }
+            | ControlMessage::OriginHealthResponse { .. } => {
                 return Err(anyhow!("received client-originated message from server"));
             }
         }
@@ -447,6 +656,9 @@ impl PikeClientApp {
     }
 
     fn process_control_chunk(&mut self, chunk: &[u8], fin: bool) -> Result<()> {
+        if self.control_stream_buf.len() + chunk.len() > MAX_FRAME_SIZE + SCRATCH_BUFFER_SIZE + 4 {
+            return Err(anyhow!("control stream buffering limit exceeded"));
+        }
         self.control_stream_buf.extend_from_slice(chunk);
         let frames = drain_frames(&mut self.control_stream_buf)?;
 
@@ -463,77 +675,121 @@ impl PikeClientApp {
     }
 
     fn process_data_chunk(&mut self, stream_id: u64, chunk: &[u8], fin: bool) -> Result<()> {
-        let stream_state = self
+        if !matches!(
+            self.state,
+            ClientState::RegisteringTunnels | ClientState::Active
+        ) {
+            return Err(anyhow!("data received before authentication"));
+        }
+        if self.delivery.is_pending() {
+            return Err(anyhow!("application delivery is backpressured"));
+        }
+        if !self.data_streams.contains_key(&stream_id)
+            && self.data_streams.len() >= MAX_TRACKED_STREAMS
+        {
+            return Err(anyhow!("too many active data streams"));
+        }
+        if self
+            .data_streams
+            .values()
+            .map(|stream| stream.buf.len())
+            .sum::<usize>()
+            + chunk.len()
+            > MAX_CONNECTION_BUFFER
+        {
+            return Err(anyhow!("connection receive buffering limit exceeded"));
+        }
+        let stream = self
             .data_streams
             .entry(stream_id)
             .or_insert(StreamReadState {
                 header: None,
                 buf: Vec::new(),
                 streaming: false,
+                mode: crate::proto::StreamMode::Raw,
+                recv_closed: false,
+                send_closed: false,
             });
-        stream_state.buf.extend_from_slice(chunk);
-
-        if stream_state.header.is_none() {
-            if stream_state.buf.len() < 4 {
-                return Ok(());
-            }
-
-            let header_len = u32::from_be_bytes([
-                stream_state.buf[0],
-                stream_state.buf[1],
-                stream_state.buf[2],
-                stream_state.buf[3],
-            ]) as usize;
-
-            if header_len > MAX_FRAME_SIZE {
-                return Err(anyhow!(
-                    "header frame size {} exceeds max {}",
-                    header_len,
-                    MAX_FRAME_SIZE
-                ));
-            }
-
-            let total_header_size = 4 + header_len;
-            if stream_state.buf.len() < total_header_size {
-                return Ok(());
-            }
-
-            let header_bytes = &stream_state.buf[4..total_header_size];
-            let header: StreamHeader = postcard::from_bytes(header_bytes)
-                .map_err(|e| anyhow!("header parse error: {}", e))?;
-            stream_state.streaming = header.streaming;
-            stream_state.header = Some(header);
-
-            stream_state.buf.drain(0..total_header_size);
+        if stream.recv_closed || stream.buf.len() + chunk.len() > MAX_STREAM_BUFFER {
+            return Err(anyhow!("closed or oversized data stream"));
         }
-
-        // Streaming mode: dispatch every chunk immediately.
-        // Normal mode: buffer until fin.
-        let should_emit = stream_state.streaming || fin;
-        if let Some(header) = &stream_state.header {
-            if should_emit && !stream_state.buf.is_empty() {
-                let server_data = ServerData {
-                    stream_id,
-                    tunnel_id: header.tunnel_id,
-                    connection_id: header.connection_id,
-                    source_addr: header.source_addr,
-                    payload: std::mem::take(&mut stream_state.buf),
-                    fin,
-                    streaming: stream_state.streaming,
+        stream.buf.extend_from_slice(chunk);
+        let is_opening = stream.header.is_none();
+        if is_opening {
+            if stream.buf.len() < 4 {
+                return if fin {
+                    Err(anyhow!("truncated stream header"))
+                } else {
+                    Ok(())
                 };
-
-                let _ = self.data_tx.try_send(server_data);
             }
+            let header_len = u32::from_be_bytes(stream.buf[..4].try_into()?) as usize;
+            if header_len > MAX_FRAME_SIZE {
+                return Err(anyhow!("header frame size exceeds limit"));
+            }
+            if stream.buf.len() < 4 + header_len {
+                return if fin {
+                    Err(anyhow!("truncated stream header"))
+                } else {
+                    Ok(())
+                };
+            }
+            let header: StreamHeader = postcard::from_bytes(&stream.buf[4..4 + header_len])?;
+            stream.streaming = header.streaming;
+            stream.mode = header.mode;
+            stream.header = Some(header);
+            stream.buf.drain(..4 + header_len);
         }
-
-        if fin {
-            self.data_streams.remove(&stream_id);
+        if (stream.streaming && (!stream.buf.is_empty() || is_opening)) || fin {
+            let header = stream
+                .header
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing stream header"))?;
+            let message = ServerData {
+                stream_id,
+                tunnel_id: header.tunnel_id,
+                connection_id: header.connection_id,
+                source_addr: header.source_addr,
+                payload: std::mem::take(&mut stream.buf),
+                fin,
+                streaming: stream.streaming,
+                mode: stream.mode,
+            };
+            self.delivery
+                .send(&self.data_tx, message)
+                .map_err(|error| anyhow!(error))?;
         }
+        stream.recv_closed = fin;
+        self.cleanup_stream(stream_id);
+        Ok(())
+    }
 
+    fn check_login_timeout(&mut self) -> QuicResult<()> {
+        if !matches!(self.state, ClientState::Closed)
+            && self
+                .heartbeat_deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            warn!("QUIC heartbeat acknowledgement timed out");
+            self.pending_registrations.clear();
+            self.set_reconnecting(1);
+            return Err(quiche::Error::InvalidState.into());
+        }
+        if self.state == ClientState::LoggingIn
+            && self
+                .login_deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            warn!("Login timed out before the server authenticated the connection");
+            self.pending_registrations.clear();
+            self.set_reconnecting(1);
+            return Err(quiche::Error::InvalidState.into());
+        }
         Ok(())
     }
 
     fn set_reconnecting(&mut self, attempt: u32) {
+        self.login_deadline = None;
         self.state = ClientState::Reconnecting {
             attempt,
             backoff: reconnect_backoff(attempt),
@@ -562,35 +818,49 @@ impl ApplicationOverQuic for PikeClientApp {
     }
 
     async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.check_login_timeout()?;
         tokio::select! {
-            Some(cmd) = self.control_rx.recv() => {
+            result = self.delivery.wait(&self.data_tx), if self.delivery.is_pending() => {
+                result.map_err(|_| quiche::Error::InvalidState)?;
+            }
+            Some(cmd) = self.control_rx.recv(), if self.writes_have_capacity() => {
                 self.handle_client_command(cmd)
                     .map_err(|_| quiche::Error::InvalidState)?;
             }
-            Some(local_data) = self.data_rx.recv() => {
+            Some(local_data) = self.data_rx.recv(), if self.writes_have_capacity() => {
                 self.queue_local_data(local_data).map_err(|_| quiche::Error::InvalidState)?;
             }
-            _ = self.heartbeat_interval.tick() => {
+            _ = self.heartbeat_interval.tick(), if self.writes_have_capacity() => {
                 self.queue_heartbeat().map_err(|_| quiche::Error::InvalidState)?;
             }
             _ = tokio::time::sleep(WAIT_FOR_DATA_TIMEOUT) => {
                 // Timeout is normal, just continue
             }
-            _ = tokio::time::sleep(LOGIN_TIMEOUT), if self.state == ClientState::LoggingIn => {
-                warn!("Login timed out after 15s — server did not send LoginSuccess. Transitioning to Reconnecting.");
-                self.set_reconnecting(1);
-            }
+            _ = tokio::time::sleep_until(self.login_deadline.unwrap_or_else(tokio::time::Instant::now)), if self.state == ClientState::LoggingIn && self.login_deadline.is_some() => {}
+
         }
 
-        Ok(())
+        self.check_login_timeout()
     }
 
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        // Packet traffic can bypass wait_for_data, so enforce the same absolute
+        // deadline on the read/write path as well as the timer wakeup.
+        self.check_login_timeout()?;
         if qconn.is_closed() {
             return Err(quiche::Error::Done.into());
         }
+        self.delivery
+            .flush(&self.data_tx)
+            .map_err(|_| quiche::Error::InvalidState)?;
         for stream_id in qconn.readable().collect::<Vec<_>>() {
+            if stream_id % 4 > 1 {
+                return Err(quiche::Error::InvalidState.into());
+            }
             loop {
+                if self.delivery.is_pending() {
+                    return Ok(());
+                }
                 match qconn.stream_recv(stream_id, &mut self.buf) {
                     Ok((n, fin)) => {
                         let chunk = self.buf[..n].to_vec();
@@ -626,6 +896,9 @@ impl ApplicationOverQuic for PikeClientApp {
         if qconn.is_closed() {
             return Err(quiche::Error::Done.into());
         }
+        // tokio-quiche only invokes process_reads for fresh packets. Retry
+        // already-readable streams after application capacity becomes available.
+        self.process_reads(qconn)?;
         while let Some((stream_id, payload, fin)) = self.write_queue.pop_front() {
             match qconn.stream_send(stream_id, &payload, fin) {
                 Ok(written) if written < payload.len() => {
@@ -633,7 +906,7 @@ impl ApplicationOverQuic for PikeClientApp {
                         .push_front((stream_id, payload[written..].to_vec(), fin));
                     break;
                 }
-                Ok(_) => {}
+                Ok(_) => self.finish_write(stream_id, fin),
                 Err(quiche::Error::Done) => {
                     self.write_queue.push_front((stream_id, payload, fin));
                     break;
@@ -722,8 +995,51 @@ mod tests {
     use super::*;
     use crate::types::TunnelType;
 
+    #[tokio::test]
+    async fn unregister_waits_for_relay_ack_while_draining_inflight_data() {
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        let (server_tx, server_rx) = mpsc::channel(1);
+        let mut connection = PikeConnection::from_channels(control_tx, data_tx, server_rx);
+        let tunnel_id = TunnelId::new();
+        let task = tokio::spawn(async move { connection.unregister_tunnel(tunnel_id).await });
+        let Some(ClientCommand::UnregisterTunnel {
+            tunnel_id: received,
+            completed,
+        }) = control_rx.recv().await
+        else {
+            panic!("expected explicit unregister");
+        };
+        assert_eq!(received, tunnel_id);
+        for _ in 0..3 {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                server_tx.send(ServerData {
+                    stream_id: 4,
+                    tunnel_id,
+                    connection_id: 1,
+                    source_addr: "127.0.0.1:1234".parse().unwrap(),
+                    payload: vec![1],
+                    fin: false,
+                    streaming: true,
+                    mode: crate::proto::StreamMode::Http,
+                }),
+            )
+            .await
+            .expect("shutdown must drain bounded in-flight data")
+            .unwrap();
+        }
+        assert!(
+            !task.is_finished(),
+            "queuing unregister is not relay acknowledgement"
+        );
+        completed.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
     fn sample_tunnel(tunnel_id: TunnelId) -> TunnelConfig {
         TunnelConfig {
+            cloud: None,
             id: tunnel_id,
             tunnel_type: TunnelType::Http {
                 local_port: 3000,
@@ -745,6 +1061,43 @@ mod tests {
             local_rx,
             server_tx,
         )
+    }
+
+    #[tokio::test]
+    async fn heartbeat_requires_fresh_sent_ack_and_expires_with_a_full_write_queue() {
+        let mut app = make_app(vec![]);
+        app.state = ClientState::Active;
+        let deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
+        app.heartbeat_deadline = Some(deadline);
+        app.queue_heartbeat().unwrap(); // sent sequence 0
+        app.handle_control_message(ControlMessage::HeartbeatAck {
+            seq: 1,
+            timestamp: 0,
+            server_time: 0,
+        })
+        .unwrap();
+        assert_eq!(app.heartbeat_deadline, Some(deadline)); // unsolicited sequence
+        app.handle_control_message(ControlMessage::HeartbeatAck {
+            seq: 0,
+            timestamp: 0,
+            server_time: 0,
+        })
+        .unwrap();
+        let fresh = app.heartbeat_deadline;
+        app.handle_control_message(ControlMessage::HeartbeatAck {
+            seq: 0,
+            timestamp: 0,
+            server_time: 0,
+        })
+        .unwrap();
+        assert_eq!(app.heartbeat_deadline, fresh); // duplicate must not extend life
+        app.heartbeat_deadline = Some(tokio::time::Instant::now() - Duration::from_millis(1));
+        for _ in 0..MAX_WRITE_ENTRIES {
+            app.write_queue.push_back((4, vec![1], false));
+        }
+        assert!(!app.writes_have_capacity());
+        assert!(app.check_login_timeout().is_err());
+        assert!(matches!(app.state, ClientState::Reconnecting { .. }));
     }
 
     #[test]
@@ -831,6 +1184,39 @@ mod tests {
 
         assert!(matches!(app.state, ClientState::Active));
         assert!(app.pending_registrations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_control_rejections_release_registration_and_cleanup_waiters() {
+        let tunnel_id = TunnelId::new();
+        for message in [
+            ControlMessage::LoginFailure {
+                reason: "key revoked".into(),
+            },
+            ControlMessage::TunnelError {
+                tunnel_id,
+                reason: "endpoint policy changed".into(),
+            },
+        ] {
+            let mut app = make_app(vec![sample_tunnel(tunnel_id)]);
+            app.state = ClientState::RegisteringTunnels;
+            let (registered, mut registration) = oneshot::channel();
+            app.pending_registrations
+                .insert(tunnel_id.to_string(), registered);
+            let (unregistered, mut cleanup) = oneshot::channel();
+            app.pending_unregistrations.insert(tunnel_id, unregistered);
+            app.handle_control_message(message).unwrap();
+            assert_eq!(
+                registration.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            );
+            assert_eq!(
+                cleanup.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            );
+            assert_eq!(app.state, ClientState::Closed);
+            assert!(app.close_requested);
+        }
     }
 
     #[tokio::test]
@@ -973,5 +1359,236 @@ mod tests {
 
         // State should remain Active
         assert_eq!(app.state, ClientState::Active);
+    }
+    fn receive_app(capacity: usize) -> (PikeClientApp, mpsc::Receiver<ServerData>) {
+        let (_, control_rx) = mpsc::channel(4);
+        let (_, data_rx) = mpsc::channel(4);
+        let (data_tx, rx) = mpsc::channel(capacity);
+        let mut app = PikeClientApp::new(
+            ApiKey("test-key".into()),
+            Vec::new(),
+            control_rx,
+            data_rx,
+            data_tx,
+        );
+        app.state = ClientState::Active;
+        (app, rx)
+    }
+
+    fn receive_header(streaming: bool) -> StreamHeader {
+        StreamHeader {
+            tunnel_id: TunnelId::new(),
+            connection_id: 3,
+            source_addr: "127.0.0.1:3000".parse().unwrap(),
+            streaming,
+            mode: crate::proto::StreamMode::Raw,
+        }
+    }
+
+    #[tokio::test]
+    async fn full_channel_preserves_stream_chunks_and_empty_fin() {
+        let (mut app, mut rx) = receive_app(1);
+        let mut frame = encode_frame(&receive_header(true)).unwrap();
+        frame.extend_from_slice(b"hello");
+        app.process_data_chunk(1, &frame, false).unwrap();
+        assert_eq!(app.data_tx.capacity(), 0);
+        app.process_data_chunk(1, b" world", false).unwrap();
+        assert!(app.delivery.is_pending());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), app.delivery.wait(&app.data_tx))
+                .await
+                .is_err()
+        );
+        let first = rx.recv().await.unwrap();
+        app.delivery.wait(&app.data_tx).await.unwrap();
+        app.process_data_chunk(1, &[], true).unwrap();
+        let second = rx.recv().await.unwrap();
+        app.delivery.wait(&app.data_tx).await.unwrap();
+        let end = rx.recv().await.unwrap();
+        assert_eq!([first.payload, second.payload].concat(), b"hello world");
+        assert!(!first.fin && !second.fin);
+        assert!(end.payload.is_empty() && end.fin);
+        assert!(app.data_streams.contains_key(&1));
+        app.finish_write(1, true);
+        assert!(app.data_streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_channel_preserves_complete_normal_message() {
+        let (mut app, mut rx) = receive_app(1);
+        let mut frame = encode_frame(&receive_header(false)).unwrap();
+        frame.extend_from_slice(b"whole request");
+        app.process_data_chunk(1, &frame, true).unwrap();
+        app.process_data_chunk(5, &frame, true).unwrap();
+        assert!(app.delivery.is_pending());
+        assert_eq!(rx.recv().await.unwrap().payload, b"whole request");
+        app.delivery.wait(&app.data_tx).await.unwrap();
+        let message = rx.recv().await.unwrap();
+        assert_eq!(message.payload, b"whole request");
+        assert!(message.fin);
+    }
+
+    #[tokio::test]
+    async fn client_rejects_data_before_login_without_allocating() {
+        let (mut app, _rx) = receive_app(1);
+        app.state = ClientState::LoggingIn;
+        assert!(app
+            .process_data_chunk(1, &encode_frame(&receive_header(false)).unwrap(), true)
+            .is_err());
+        assert!(app.data_streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_receive_buffers_and_stream_count_are_bounded() {
+        let (mut app, _rx) = receive_app(1);
+        let header = encode_frame(&receive_header(false)).unwrap();
+        let bytes = vec![1; MAX_STREAM_BUFFER];
+        for index in 0..4 {
+            app.process_data_chunk(index * 4 + 1, &header, false)
+                .unwrap();
+            app.process_data_chunk(index * 4 + 1, &bytes, false)
+                .unwrap();
+        }
+        assert!(app.process_data_chunk(17, &header, false).is_err());
+        app.data_streams.remove(&13);
+        assert!(app.process_data_chunk(1, &[1], false).is_err());
+        app.data_streams.clear();
+        for index in 0..MAX_TRACKED_STREAMS {
+            app.process_data_chunk(index as u64 * 4 + 1, &header, false)
+                .unwrap();
+        }
+        assert!(app
+            .process_data_chunk(MAX_TRACKED_STREAMS as u64 * 4 + 1, &header, false)
+            .is_err());
+        assert_eq!(app.data_streams.len(), MAX_TRACKED_STREAMS);
+    }
+
+    #[tokio::test]
+    async fn client_half_closed_streams_live_until_reply_fin_then_are_removed() {
+        let (mut app, mut rx) = receive_app(1);
+        for index in 0..2000 {
+            let sid = index * 4 + 1;
+            let header = receive_header(true);
+            app.process_data_chunk(sid, &encode_frame(&header).unwrap(), true)
+                .unwrap();
+            assert!(rx.recv().await.unwrap().fin);
+            app.queue_local_data(LocalData {
+                stream_id: Some(sid),
+                tunnel_id: header.tunnel_id,
+                connection_id: header.connection_id,
+                source_addr: header.source_addr,
+                payload: b"response after request FIN".to_vec(),
+                fin: true,
+                streaming: true,
+                mode: crate::proto::StreamMode::Raw,
+            })
+            .unwrap();
+            assert_eq!(app.data_streams.len(), 1);
+            app.write_queue.clear();
+            app.finish_write(sid, true);
+            assert!(app.data_streams.is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn real_quic_partial_writes_keep_fin_and_half_closed_reply_direction() {
+        let (mut app, mut rx) = receive_app(1);
+        let mut pair = super::super::test_support::Pair::new();
+        let header = receive_header(true);
+        let request = encode_frame(&header).unwrap();
+        pair.server.stream_send(1, &request, true).unwrap();
+        pair.exchange();
+        app.process_reads(&mut pair.client).unwrap();
+        assert!(rx.recv().await.unwrap().fin);
+        let expected = (0..256 * 1024)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        app.queue_local_data(LocalData {
+            stream_id: Some(1),
+            tunnel_id: header.tunnel_id,
+            connection_id: header.connection_id,
+            source_addr: header.source_addr,
+            payload: expected.clone(),
+            fin: true,
+            streaming: true,
+            mode: crate::proto::StreamMode::Raw,
+        })
+        .unwrap();
+        let mut received = Vec::new();
+        let mut saw_partial = false;
+        let mut fin_count = 0;
+        for _ in 0..10000 {
+            app.process_writes(&mut pair.client).unwrap();
+            saw_partial |= !app.write_queue.is_empty();
+            pair.exchange();
+            let mut bytes = [0; 8192];
+            loop {
+                match pair.server.stream_recv(1, &mut bytes) {
+                    Ok((count, fin)) => {
+                        received.extend_from_slice(&bytes[..count]);
+                        fin_count += usize::from(fin);
+                        if fin {
+                            break;
+                        }
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(error) => panic!("recv: {error}"),
+                }
+            }
+            if fin_count == 1 {
+                break;
+            }
+        }
+        assert!(saw_partial);
+        assert_eq!(received, expected);
+        assert_eq!(fin_count, 1);
+        assert!(app.data_streams.is_empty());
+        assert!(app.write_queue.is_empty());
+    }
+    #[tokio::test]
+    async fn login_deadline_survives_frequent_application_wakeups() {
+        let mut app = make_app(Vec::new());
+        let mut pair = super::super::test_support::Pair::new();
+        app.queue_login().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+        app.login_deadline = Some(deadline);
+        app.heartbeat_interval = tokio::time::interval(Duration::from_millis(1));
+        let mut wakeups = 0;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if app.wait_for_data(&mut pair.client).await.is_err() {
+                    break;
+                }
+                wakeups += 1;
+                assert_eq!(app.login_deadline, Some(deadline));
+            }
+        })
+        .await
+        .expect("frequent wakeups must not postpone login timeout");
+        assert!(wakeups > 0);
+        assert!(matches!(app.state, ClientState::Reconnecting { .. }));
+    }
+
+    #[tokio::test]
+    async fn continuous_network_activity_cannot_bypass_login_deadline() {
+        let mut app = make_app(Vec::new());
+        let mut pair = super::super::test_support::Pair::new();
+        app.queue_login().unwrap();
+        app.login_deadline = Some(tokio::time::Instant::now() - Duration::from_millis(1));
+        assert!(app.process_reads(&mut pair.client).is_err());
+        assert!(matches!(app.state, ClientState::Reconnecting { .. }));
+    }
+
+    #[tokio::test]
+    async fn empty_streaming_open_is_delivered_once_before_payload_or_fin() {
+        let (mut app, mut rx) = receive_app(4);
+        let header = receive_header(true);
+        app.process_data_chunk(1, &encode_frame(&header).unwrap(), false)
+            .unwrap();
+        let open = rx.recv().await.unwrap();
+        assert!(open.payload.is_empty() && !open.fin && open.streaming);
+        app.process_data_chunk(1, &[], false).unwrap();
+        assert!(rx.try_recv().is_err());
+        app.process_data_chunk(1, &[], true).unwrap();
+        assert!(rx.recv().await.unwrap().fin);
     }
 }

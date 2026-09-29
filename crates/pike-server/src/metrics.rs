@@ -5,6 +5,28 @@ use prometheus::{
 use std::net::SocketAddr;
 use std::sync::LazyLock;
 
+pub static INGEST_DROPPED: LazyLock<prometheus::IntCounter> = LazyLock::new(|| {
+    prometheus::register_int_counter!(
+        "pike_ingest_dropped_total",
+        "Request logs dropped at the bounded queue limit"
+    )
+    .expect("register pike_ingest_dropped_total metric")
+});
+pub static INGEST_RETRIES: LazyLock<prometheus::IntCounter> = LazyLock::new(|| {
+    prometheus::register_int_counter!(
+        "pike_ingest_retries_total",
+        "Unacknowledged request log batches retained for retry"
+    )
+    .expect("register pike_ingest_retries_total metric")
+});
+pub static INGEST_QUEUED_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "pike_ingest_queued_bytes",
+        "Serialized request log bytes awaiting acknowledgement"
+    )
+    .expect("register pike_ingest_queued_bytes metric")
+});
+
 /// Number of active QUIC connections.
 pub static ACTIVE_CONNECTIONS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
@@ -81,12 +103,12 @@ pub static BAN_CHECK_ERRORS: LazyLock<Counter> = LazyLock::new(|| {
     .expect("register pike_ban_check_errors_total metric")
 });
 
-/// Incremented when the periodic control-plane revalidation loop disconnects a
+/// Incremented when a session's periodic control-plane revalidation ends the
 /// connection because the user is now suspended/banned or the key is invalid.
 pub static REVALIDATION_DISCONNECTS: LazyLock<Counter> = LazyLock::new(|| {
     prometheus::register_counter!(
         "pike_revalidation_disconnects_total",
-        "Connections dropped by the periodic control-plane revalidation loop"
+        "Connections dropped by the periodic control-plane revalidation check"
     )
     .expect("register pike_revalidation_disconnects_total metric")
 });

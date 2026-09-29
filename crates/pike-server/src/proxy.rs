@@ -13,7 +13,13 @@ use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
 use crate::router::{normalize_host, VhostRouter};
 
-pub const DEFAULT_PROXY_TIMEOUT: Duration = Duration::from_secs(30);
+#[derive(Clone, Copy)]
+pub struct ProxyDeadline(pub tokio::time::Instant);
+
+#[derive(Clone)]
+pub(crate) struct PinnedTunnel(pub crate::router::TunnelEntry);
+
+pub const DEFAULT_PROXY_TIMEOUT: Duration = pike_core::http_wire::RESPONSE_HEAD_TIMEOUT;
 
 #[derive(Debug, Clone)]
 pub struct ProxyContext {
@@ -50,9 +56,11 @@ pub struct WebSocketRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyError {
     BadRequest(&'static str),
+    PayloadTooLarge,
     NotFound,
     TunnelUnavailable,
     DispatchFailed,
+    Overloaded,
     Timeout,
     Upstream(String),
 }
@@ -62,10 +70,12 @@ impl ProxyError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::TunnelUnavailable | Self::DispatchFailed | Self::Upstream(_) => {
                 StatusCode::BAD_GATEWAY
             }
+            Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
         }
     }
@@ -75,9 +85,11 @@ impl fmt::Display for ProxyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadRequest(msg) => write!(f, "bad request: {msg}"),
+            Self::PayloadTooLarge => write!(f, "request body exceeds configured byte limit"),
             Self::NotFound => write!(f, "subdomain not registered"),
             Self::TunnelUnavailable => write!(f, "tunnel unavailable"),
             Self::DispatchFailed => write!(f, "failed to dispatch request to tunnel"),
+            Self::Overloaded => write!(f, "tunnel request concurrency limit reached"),
             Self::Timeout => write!(f, "upstream tunnel timeout"),
             Self::Upstream(msg) => write!(f, "upstream error: {msg}"),
         }
@@ -90,10 +102,19 @@ pub async fn proxy_request(
     router: std::sync::Arc<VhostRouter>,
     mut request: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
-    let host =
-        extract_host(request.headers()).ok_or(ProxyError::BadRequest("missing Host header"))?;
+    let deadline = request.extensions().get::<ProxyDeadline>().map_or_else(
+        || tokio::time::Instant::now() + DEFAULT_PROXY_TIMEOUT,
+        |value| value.0,
+    );
+    request.extensions_mut().insert(ProxyDeadline(deadline));
+    let host = canonicalize_authority(&mut request)?;
     let host_key = normalize_host(&host);
-    let tunnel = router.route(&host_key).ok_or(ProxyError::NotFound)?;
+    let tunnel = request
+        .extensions()
+        .get::<PinnedTunnel>()
+        .map(|pinned| pinned.0.clone())
+        .or_else(|| router.route(&host_key))
+        .ok_or(ProxyError::NotFound)?;
 
     if !tunnel.is_active() {
         return Err(ProxyError::TunnelUnavailable);
@@ -119,6 +140,7 @@ pub async fn proxy_request(
         connection_id: connection_id_from_uuid(),
         source_addr,
         streaming: false,
+        mode: pike_core::proto::StreamMode::Raw,
     };
 
     let (response_tx, response_rx) = oneshot::channel();
@@ -130,18 +152,60 @@ pub async fn proxy_request(
         response_tx,
     };
 
-    tunnel
-        .stream_tx
-        .send(TunnelRequest::Http(Box::new(envelope)))
-        .await
-        .map_err(|_| ProxyError::DispatchFailed)?;
-
-    let result = tokio::time::timeout(DEFAULT_PROXY_TIMEOUT, response_rx)
+    tokio::time::timeout_at(
+        deadline,
+        tunnel
+            .stream_tx
+            .send(TunnelRequest::Http(Box::new(envelope))),
+    )
+    .await
+    .map_err(|_| ProxyError::Timeout)?
+    .map_err(|_| ProxyError::DispatchFailed)?;
+    let result = tokio::time::timeout_at(deadline, response_rx)
         .await
         .map_err(|_| ProxyError::Timeout)?
         .map_err(|_| ProxyError::DispatchFailed)?;
 
     result
+}
+
+/// HTTP/2 carries routing authority in the URI. Resolve it before admission and
+/// reject ambiguous hosts so policy and dispatch always use the same identity.
+pub fn canonicalize_authority<B>(request: &mut Request<B>) -> Result<String, ProxyError> {
+    if request.headers().get_all(HOST).iter().count() > 1 {
+        return Err(ProxyError::BadRequest("multiple Host headers"));
+    }
+    let host = request
+        .headers()
+        .get(HOST)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ProxyError::BadRequest("invalid Host header"))
+        })
+        .transpose()?;
+    let authority = request.uri().authority().map(|value| value.as_str());
+    if let (Some(host), Some(authority)) = (host, authority) {
+        if !host.eq_ignore_ascii_case(authority) {
+            return Err(ProxyError::BadRequest("Host and authority disagree"));
+        }
+    }
+    let host = authority
+        .or(host)
+        .ok_or(ProxyError::BadRequest("missing request authority"))?;
+    let parsed = host
+        .parse::<axum::http::uri::Authority>()
+        .map_err(|_| ProxyError::BadRequest("invalid request authority"))?;
+    if parsed.host().is_empty() || host.contains('@') {
+        return Err(ProxyError::BadRequest("invalid request authority"));
+    }
+    let host = host.to_owned();
+    request.headers_mut().insert(
+        HOST,
+        HeaderValue::from_str(&host)
+            .map_err(|_| ProxyError::BadRequest("invalid request authority"))?,
+    );
+    Ok(host)
 }
 
 #[must_use]
@@ -237,6 +301,34 @@ pub fn connection_id_from_uuid() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http2_authority_is_canonical_and_conflicts_are_rejected() {
+        let mut request = axum::http::Request::builder()
+            .uri("https://demo.pike.test/path")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            super::canonicalize_authority(&mut request).unwrap(),
+            "demo.pike.test"
+        );
+        assert_eq!(request.headers()["host"], "demo.pike.test");
+        request
+            .headers_mut()
+            .insert("host", "other.pike.test".parse().unwrap());
+        assert!(super::canonicalize_authority(&mut request).is_err());
+        request
+            .headers_mut()
+            .insert("host", "demo.pike.test".parse().unwrap());
+        request
+            .headers_mut()
+            .append("host", "demo.pike.test".parse().unwrap());
+        assert!(super::canonicalize_authority(&mut request).is_err());
+        let mut userinfo = axum::http::Request::builder()
+            .header("host", "admin@demo.pike.test")
+            .body(())
+            .unwrap();
+        assert!(super::canonicalize_authority(&mut userinfo).is_err());
+    }
     use std::sync::Arc;
 
     use axum::body::Body;
@@ -300,16 +392,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admitted_route_does_not_move_to_a_new_hostname_owner() {
+        let router = Arc::new(VhostRouter::new());
+        let (first_tx, mut first_rx) = mpsc::channel(2);
+        let first = TunnelEntry {
+            tunnel_id: TunnelId::new(),
+            connection_id: uuid::Uuid::new_v4(),
+            stream_tx: first_tx,
+            active: true,
+            visitor: crate::visitor_policy::VisitorGate::unrestricted(),
+            domain: None,
+            origin_health: None,
+        };
+        let (second_tx, mut second_rx) = mpsc::channel(2);
+        router.register(
+            "same.pike.test",
+            TunnelEntry {
+                tunnel_id: TunnelId::new(),
+                connection_id: uuid::Uuid::new_v4(),
+                stream_tx: second_tx,
+                active: true,
+                visitor: crate::visitor_policy::VisitorGate::unrestricted(),
+                domain: None,
+                origin_health: None,
+            },
+        );
+        let request = || {
+            let mut request = Request::builder()
+                .header("host", "same.pike.test")
+                .uri("/")
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(super::PinnedTunnel(first.clone()));
+            request
+        };
+        let reply = tokio::spawn(async move {
+            let Some(TunnelRequest::Http(exchange)) = first_rx.recv().await else {
+                panic!("original owner must receive replay")
+            };
+            exchange
+                .response_tx
+                .send(Ok(Response::new(Body::empty())))
+                .unwrap();
+            // The original connector then disconnects. Its old sender must fail,
+            // even though the same hostname is still available on another owner.
+        });
+        assert_eq!(
+            proxy_request(router.clone(), request())
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        reply.await.unwrap();
+        assert_eq!(
+            proxy_request(router, request()).await.unwrap_err(),
+            ProxyError::DispatchFailed
+        );
+        assert!(second_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn returns_bad_gateway_for_inactive_tunnel() {
         let router = Arc::new(VhostRouter::new());
         let (tx, _rx) = mpsc::channel(1);
         router.register(
-            "inactive",
+            "inactive.pike.life",
             TunnelEntry {
                 tunnel_id: TunnelId::new(),
                 connection_id: uuid::Uuid::new_v4(),
                 stream_tx: tx,
                 active: false,
+                visitor: crate::visitor_policy::VisitorGate::unrestricted(),
+                domain: None,
+                origin_health: None,
             },
         );
 
@@ -329,12 +487,15 @@ mod tests {
         let router = Arc::new(VhostRouter::new());
         let (tx, mut rx) = mpsc::channel(1);
         router.register(
-            "demo",
+            "demo.pike.life",
             TunnelEntry {
                 tunnel_id: TunnelId::new(),
                 connection_id: uuid::Uuid::new_v4(),
                 stream_tx: tx,
                 active: true,
+                visitor: crate::visitor_policy::VisitorGate::unrestricted(),
+                domain: None,
+                origin_health: None,
             },
         );
 
@@ -379,5 +540,35 @@ mod tests {
                 .and_then(|h| h.to_str().ok()),
             Some("demo.pike.life")
         );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_full_dispatch_queue_consumes_the_request_deadline() {
+        let router = Arc::new(VhostRouter::new());
+        let (tx, _rx) = mpsc::channel(1);
+        let permit = tx.clone().reserve_owned().await.unwrap();
+        router.register(
+            "queued.pike.life",
+            TunnelEntry {
+                tunnel_id: TunnelId::new(),
+                connection_id: uuid::Uuid::new_v4(),
+                stream_tx: tx,
+                active: true,
+                visitor: crate::visitor_policy::VisitorGate::unrestricted(),
+                domain: None,
+                origin_health: None,
+            },
+        );
+        let mut request = Request::builder()
+            .header("host", "queued.pike.life")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(super::ProxyDeadline(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+        ));
+        assert_eq!(
+            proxy_request(router, request).await.unwrap_err(),
+            ProxyError::Timeout
+        );
+        drop(permit);
     }
 }

@@ -32,8 +32,12 @@ mod config;
 mod connection;
 mod diagnostics;
 mod inspector;
+mod managed;
+mod network;
+mod replay;
 mod session;
 mod tunnel;
+mod websocket;
 mod ws_probe;
 
 use std::io::IsTerminal;
@@ -53,7 +57,9 @@ use tokio::signal;
 use crate::config::Config;
 use crate::connection::{reconnect_backoff, ConnectionHandler};
 use crate::inspector::{InspectorServer, RequestStore};
-use crate::tunnel::{HttpTunnel, TcpTunnel};
+use crate::tunnel::origin::OriginOptions;
+use crate::tunnel::pool::{OriginPool, PoolOptions};
+use crate::tunnel::{udp::UdpTunnel, HttpTunnel, PortTunnel, TcpTunnel};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,10 +80,31 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Send an edited HTTP draft through an owned active tunnel, once.
+    Replay {
+        /// Saved tunnel name or runtime/cloud tunnel UUID.
+        tunnel: String,
+        /// JSON with method, path, headers and an explicit base64 body (max 64 KiB).
+        #[arg(long)]
+        file: PathBuf,
+        /// Relay HTTP origin; defaults to relay.ws_url or https://relay.addr.
+        #[arg(long)]
+        relay_url: Option<String>,
+    },
+    /// Start a tunnel using its saved dashboard configuration.
+    Start {
+        name: String,
+        #[arg(long)]
+        max_reconnects: Option<u32>,
+    },
     /// Start an HTTP tunnel.
     Http {
-        /// Local port to expose.
-        port: u16,
+        /// Local port to expose (or use --upstream / --unix-socket).
+        port: Option<u16>,
+        #[command(flatten)]
+        origin: OriginOptions,
+        #[command(flatten)]
+        pool: PoolOptions,
         /// Optional subdomain prefix.
         #[arg(long)]
         subdomain: Option<String>,
@@ -91,7 +118,7 @@ enum Commands {
         #[arg(long)]
         max_reconnects: Option<u32>,
     },
-    /// Start a TCP tunnel (not yet available: the relay does not forward TCP traffic yet).
+    /// Start a TCP tunnel.
     Tcp {
         /// Local port to expose.
         port: u16,
@@ -101,6 +128,35 @@ enum Commands {
         /// Maximum number of reconnection attempts (unlimited if not set).
         #[arg(long)]
         max_reconnects: Option<u32>,
+    },
+    /// Start an SNI-routed TLS tunnel on the relay's shared TLS port.
+    Tls {
+        #[arg(value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        #[arg(long)]
+        subdomain: String,
+        /// Passthrough requires a TLS origin. Terminate requires an owned relay certificate.
+        #[arg(long, default_value = "passthrough", value_parser = ["passthrough", "terminate"])]
+        mode: String,
+        #[arg(long)]
+        max_reconnects: Option<u32>,
+    },
+    /// Start a public UDP tunnel (maximum packet size 65,507 bytes).
+    Udp {
+        #[arg(value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(10000..=65000))]
+        remote_port: Option<u16>,
+        /// Expire inactive client sessions, in seconds.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u16).range(1..=300))]
+        idle_timeout: u16,
+        #[arg(long)]
+        max_reconnects: Option<u32>,
+    },
+    /// Private IPv4 networks over native WireGuard (Linux hub/site gateways).
+    Network {
+        #[command(subcommand)]
+        command: network::NetworkCommand,
     },
     /// Store API key in config.
     Login {
@@ -142,11 +198,6 @@ enum Commands {
 }
 
 // ─── Display Constants ──────────────────────────────────────
-
-/// TCP tunnels are registered by the relay but have no server-side data plane
-/// yet, so the CLI refuses to start one. Flip to true when the relay forwards
-/// TCP traffic end-to-end.
-const TCP_TUNNELS_AVAILABLE: bool = false;
 
 const BOX_WIDTH: usize = 45;
 const BOX_INNER: usize = BOX_WIDTH - 2;
@@ -310,7 +361,7 @@ fn format_elapsed(d: Duration) -> String {
     }
 }
 
-fn print_tunnel_box_http(public_url: &str, host: &str, port: u16, inspector_port: Option<u16>) {
+fn print_tunnel_box_http(public_url: &str, origin: &str, inspector_port: Option<u16>) {
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
 
     if use_fancy() {
@@ -321,10 +372,10 @@ fn print_tunnel_box_http(public_url: &str, host: &str, port: u16, inspector_port
         let (sc, sl) = status_row("Active");
         box_row_colored(&sc, sl);
         box_row("URL", public_url);
-        box_row("Local", &format!("http://{}:{}", host, port));
+        box_row("Local", origin);
         box_row("Transport", "QUIC (fallback WS)");
-        if let Some(inspector_port) = inspector_port {
-            box_row("Inspector", &format!("http://127.0.0.1:{}", inspector_port));
+        if inspector_port.is_some() {
+            box_row("Inspector", "Use Inspector access link");
         }
         box_sep();
         box_text("  Ctrl+C to stop");
@@ -333,38 +384,47 @@ fn print_tunnel_box_http(public_url: &str, host: &str, port: u16, inspector_port
         println!("pike {}", version);
         println!("Status: Active");
         println!("URL: {}", public_url);
-        println!("Local: http://{}:{}", host, port);
+        println!("Local: {}", origin);
         println!("Transport: QUIC (fallback WS)");
-        if let Some(inspector_port) = inspector_port {
-            println!("Inspector: http://127.0.0.1:{}", inspector_port);
+        if inspector_port.is_some() {
+            println!("Inspector: use the Inspector access link printed by this process");
         }
         println!("Ctrl+C to stop");
     }
 }
 
-fn print_tunnel_box_tcp(port: u16, remote_port: Option<u16>, relay_addr: &str) {
+fn print_tunnel_box_port(
+    port: u16,
+    remote_port: Option<u16>,
+    relay_addr: &str,
+    protocol: &str,
+    endpoint: Option<&str>,
+) {
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let relay_port = remote_port.unwrap_or(port);
+    let endpoint = endpoint
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{protocol}://{relay_port}"));
 
     if use_fancy() {
         print_logo();
         box_top();
-        box_header("Pike Tunnel (TCP)", &version);
+        box_header(
+            &format!("Pike Tunnel ({})", protocol.to_uppercase()),
+            &version,
+        );
         box_sep();
         let (sc, sl) = status_row("Active");
         box_row_colored(&sc, sl);
-        box_row(
-            "Tunnel",
-            &format!("tcp://{} -> 127.0.0.1:{}", relay_port, port),
-        );
+        box_row("Tunnel", &format!("{endpoint} -> 127.0.0.1:{port}"));
         box_row("Relay", relay_addr);
         box_sep();
         box_text("  Ctrl+C to stop");
         box_bottom();
     } else {
-        println!("pike {} (TCP)", version);
+        println!("pike {} ({})", version, protocol.to_uppercase());
         println!("Status: Active");
-        println!("Tunnel: tcp://{} -> 127.0.0.1:{}", relay_port, port);
+        println!("Tunnel: {endpoint} -> 127.0.0.1:{port}");
         println!("Relay: {}", relay_addr);
         println!("Ctrl+C to stop");
     }
@@ -433,7 +493,7 @@ fn print_http_stop_summary(tunnel_start: Instant, request_store: Option<&Arc<Req
     );
 }
 
-fn print_tcp_stop_summary(tunnel_start: Instant) {
+fn print_port_stop_summary(tunnel_start: Instant) {
     let elapsed = format_elapsed(tunnel_start.elapsed());
     println!("\n  {}", format!("Tunnel stopped in {}.", elapsed).dimmed());
 }
@@ -474,11 +534,13 @@ async fn wait_for_retry(
 
 fn spawn_inspector(
     request_store: Option<Arc<RequestStore>>,
+    pool: OriginPool,
     listener: Option<tokio::net::TcpListener>,
+    replay: anyhow::Result<replay::ReplayClient>,
 ) {
     if let (Some(store), Some(listener)) = (request_store, listener) {
         tokio::spawn(async move {
-            let server = InspectorServer::new(store);
+            let server = InspectorServer::new(store, pool, replay);
             if let Err(e) = server.run(listener).await {
                 eprintln!("Inspector server error: {e}");
             }
@@ -536,8 +598,7 @@ async fn bind_inspector_listener(
 async fn build_http_tunnel(
     cfg: &Config,
     tunnel_config: &TunnelConfig,
-    port: u16,
-    host: &str,
+    origin: &OriginPool,
     request_store: Option<Arc<RequestStore>>,
     max_reconnects: Option<u32>,
 ) -> anyhow::Result<HttpTunnel> {
@@ -547,30 +608,27 @@ async fn build_http_tunnel(
     let connection = handler
         .take_connection()
         .ok_or_else(|| anyhow!("no connection"))?;
-    let client = handler.take_client().ok_or_else(|| anyhow!("no client"))?;
     let requested_subdomain = match &tunnel_config.tunnel_type {
         TunnelType::Http { subdomain, .. } => subdomain.clone(),
-        TunnelType::Tcp { .. } => None,
+        TunnelType::Tcp { .. } | TunnelType::Udp { .. } | TunnelType::Tls { .. } => None,
     };
 
     Ok(HttpTunnel::new(
         tunnel_config.clone(),
-        port,
-        host.to_string(),
+        origin.clone(),
         requested_subdomain,
         connection,
-        client,
         request_store,
     ))
 }
 
-async fn build_tcp_tunnel(
+async fn build_port_tunnel(
     cfg: &Config,
     tunnel_config: &TunnelConfig,
     port: u16,
     remote_port: Option<u16>,
     max_reconnects: Option<u32>,
-) -> anyhow::Result<TcpTunnel> {
+) -> anyhow::Result<PortTunnel> {
     let mut handler =
         ConnectionHandler::new(cfg.clone()).with_max_reconnect_attempts(max_reconnects);
     handler.connect().await?;
@@ -578,13 +636,19 @@ async fn build_tcp_tunnel(
         .take_connection()
         .ok_or_else(|| anyhow!("no connection"))?;
 
-    Ok(TcpTunnel::new(
+    if matches!(tunnel_config.tunnel_type, TunnelType::Udp { .. }) {
+        return Ok(PortTunnel::Udp(UdpTunnel::new(
+            tunnel_config.clone(),
+            connection,
+        )));
+    }
+    Ok(PortTunnel::Tcp(TcpTunnel::new(
         tunnel_config.clone(),
         port,
         cfg.tunnel.bind_addr.clone(),
         remote_port,
         connection,
-    ))
+    )))
 }
 
 async fn warn_if_local_service_unreachable(host: &str, port: u16, label: &str) {
@@ -622,8 +686,7 @@ async fn warn_if_local_service_unreachable(host: &str, port: u16, label: &str) {
 async fn run_http_command(
     cfg: Config,
     tunnel_config: TunnelConfig,
-    port: u16,
-    host: String,
+    origin: OriginPool,
     inspector_port_override: Option<u16>,
     max_reconnects: Option<u32>,
 ) -> anyhow::Result<()> {
@@ -639,7 +702,13 @@ async fn run_http_command(
     } else {
         (None, None)
     };
-    spawn_inspector(request_store.clone(), inspector_listener);
+    let replay = replay::ReplayClient::new(&cfg, &tunnel_config.id.to_string(), None);
+    spawn_inspector(
+        request_store.clone(),
+        origin.clone(),
+        inspector_listener,
+        replay,
+    );
 
     let tunnel_start = Instant::now();
     let mut reconnect_attempt = 0_u32;
@@ -651,8 +720,7 @@ async fn run_http_command(
         let mut tunnel = match build_http_tunnel(
             &cfg,
             &tunnel_config,
-            port,
-            &host,
+            &origin,
             request_store.clone(),
             max_reconnects,
         )
@@ -693,7 +761,7 @@ async fn run_http_command(
         };
 
         if !initial_displayed {
-            print_tunnel_box_http(&public_url, &host, port, inspector_port);
+            print_tunnel_box_http(&public_url, &origin.display(), inspector_port);
             initial_displayed = true;
         } else {
             let now = Local::now().format("%H:%M:%S");
@@ -722,24 +790,6 @@ async fn run_http_command(
             signal_result = signal::ctrl_c() => {
                 signal_result?;
                 tunnel.shutdown().await?;
-                // Deactivate tunnel in Workers API
-                if let Some(api_key) = &cfg.auth.api_key {
-                    let subdomain = public_url
-                        .trim_start_matches("https://")
-                        .trim_start_matches("http://")
-                        .split('.')
-                        .next()
-                        .unwrap_or_default();
-                    if !subdomain.is_empty() {
-                        let url = format!("{}/api/v1/tunnels/deactivate", cfg.relay.api_url);
-                        let _ = reqwest::Client::new()
-                            .post(&url)
-                            .bearer_auth(api_key)
-                            .json(&serde_json::json!({ "subdomain": subdomain }))
-                            .send()
-                            .await;
-                    }
-                }
                 print_http_stop_summary(tunnel_start, request_store.as_ref());
                 return Ok(());
             }
@@ -747,13 +797,18 @@ async fn run_http_command(
     }
 }
 
-async fn run_tcp_command(
+async fn run_port_command(
     cfg: Config,
     tunnel_config: TunnelConfig,
     port: u16,
     remote_port: Option<u16>,
     max_reconnects: Option<u32>,
 ) -> anyhow::Result<()> {
+    let protocol = match tunnel_config.tunnel_type {
+        TunnelType::Udp { .. } => "udp",
+        TunnelType::Tls { .. } => "tls",
+        _ => "tcp",
+    };
     let tunnel_start = Instant::now();
     let mut reconnect_attempt = 0_u32;
     let mut initial_displayed = false;
@@ -761,21 +816,28 @@ async fn run_tcp_command(
     loop {
         let connect_spinner = (!initial_displayed).then(|| spinner("Connecting to relay..."));
 
-        let mut tunnel =
-            match build_tcp_tunnel(&cfg, &tunnel_config, port, remote_port, max_reconnects).await {
-                Ok(tunnel) => tunnel,
-                Err(err) => {
-                    if let Some(spinner) = &connect_spinner {
-                        spinner.finish_and_clear();
-                    }
-                    let reason = format!("connect failed: {err}");
-                    if !wait_for_retry(&mut reconnect_attempt, max_reconnects, &reason).await? {
-                        print_tcp_stop_summary(tunnel_start);
-                        return Ok(());
-                    }
-                    continue;
+        let mut tunnel = match build_port_tunnel(
+            &cfg,
+            &tunnel_config,
+            port,
+            remote_port,
+            max_reconnects,
+        )
+        .await
+        {
+            Ok(tunnel) => tunnel,
+            Err(err) => {
+                if let Some(spinner) = &connect_spinner {
+                    spinner.finish_and_clear();
                 }
-            };
+                let reason = format!("connect failed: {err}");
+                if !wait_for_retry(&mut reconnect_attempt, max_reconnects, &reason).await? {
+                    print_port_stop_summary(tunnel_start);
+                    return Ok(());
+                }
+                continue;
+            }
+        };
 
         if let Some(spinner) = connect_spinner {
             spinner.finish_and_clear();
@@ -790,7 +852,7 @@ async fn run_tcp_command(
             Err(err) => {
                 let reason = format!("tunnel registration failed: {err}");
                 if !wait_for_retry(&mut reconnect_attempt, max_reconnects, &reason).await? {
-                    print_tcp_stop_summary(tunnel_start);
+                    print_port_stop_summary(tunnel_start);
                     return Ok(());
                 }
                 continue;
@@ -803,17 +865,36 @@ async fn run_tcp_command(
             Some(assigned_port)
         };
 
+        if protocol == "tls" {
+            println!(
+                "TLS endpoint: {} (SNI required)",
+                tunnel.public_url().unwrap_or_default()
+            );
+        }
         if !initial_displayed {
-            print_tunnel_box_tcp(port, display_remote_port, &cfg.relay.addr);
+            print_tunnel_box_port(
+                port,
+                display_remote_port,
+                &cfg.relay.addr,
+                protocol,
+                if protocol == "tls" {
+                    tunnel.public_url()
+                } else {
+                    None
+                },
+            );
             initial_displayed = true;
         } else {
             let now = Local::now().format("%H:%M:%S");
-            let relay_port = display_remote_port.unwrap_or(port);
+            let endpoint = tunnel
+                .public_url()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{protocol}://{}", display_remote_port.unwrap_or(port)));
             println!(
-                "[{}] {} (tcp://{} -> 127.0.0.1:{})",
+                "[{}] {} ({} -> 127.0.0.1:{})",
                 now,
                 "Tunnel reconnected".green(),
-                relay_port,
+                endpoint,
                 port
             );
         }
@@ -828,13 +909,14 @@ async fn run_tcp_command(
                     max_reconnects,
                     "relay connection lost",
                 ).await? {
-                    print_tcp_stop_summary(tunnel_start);
+                    print_port_stop_summary(tunnel_start);
                     return Ok(());
                 }
             }
             signal_result = signal::ctrl_c() => {
                 signal_result?;
-                print_tcp_stop_summary(tunnel_start);
+                tunnel.shutdown().await?;
+                print_port_stop_summary(tunnel_start);
                 return Ok(());
             }
         }
@@ -852,51 +934,106 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(format!("pike_cli={}", cli.log_level))
+        .with_env_filter(format!(
+            "pike={},pike_core={}",
+            cli.log_level, cli.log_level
+        ))
         .init();
 
     let config_path = config::resolve_config_path(&cli.config);
 
+    // `doctor` and `test-ws` run without a config file, so each command that
+    // needs the config loads (or creates) it itself.
     match cli.command {
+        Commands::Replay {
+            tunnel,
+            file,
+            relay_url,
+        } => {
+            let cfg = config::load_or_create_config(&config_path).await?;
+            replay::run(&cfg, &tunnel, &file, relay_url.as_deref()).await?;
+        }
+        Commands::Start {
+            name,
+            max_reconnects,
+        } => {
+            let cfg = config::load_or_create_config(&config_path).await?;
+            managed::run(cfg, &name, max_reconnects).await?;
+        }
         Commands::Http {
             port,
+            origin,
+            pool,
             subdomain,
             host,
             inspector_port,
             max_reconnects,
         } => {
             let cfg = config::load_or_create_config(&config_path).await?;
-            warn_if_local_service_unreachable(&host, port, "HTTP upstream").await;
-            let tunnel_config = cfg.as_http_tunnel_config(&host, port, subdomain)?;
-            run_http_command(
-                cfg,
-                tunnel_config,
-                port,
-                host,
-                inspector_port,
-                max_reconnects,
-            )
-            .await?;
+            let settings = serde_json::json!({
+                "local_host": host, "local_port": port, "origins": origin.upstream,
+                "unix_socket": origin.unix_socket, "origin_protocol": match origin.upstream_protocol {
+                    crate::tunnel::origin::OriginProtocol::Auto => "auto", crate::tunnel::origin::OriginProtocol::Http1 => "http1", crate::tunnel::origin::OriginProtocol::Http2 => "http2" },
+                "origin_ca": origin.origin_ca, "origin_server_name": origin.origin_server_name,
+                "health_path": pool.health_path, "health_interval": pool.health_interval, "health_timeout_ms": pool.health_timeout_ms,
+            });
+            let origin = OriginPool::from_options(port, &host, origin, pool)?;
+            let address = origin.registration_address();
+            let mut tunnel_config = cfg.as_http_tunnel_config(address, subdomain);
+            tunnel_config.cloud = Some(pike_core::types::CloudTunnelConfig {
+                name: None,
+                settings_json: Some(serde_json::to_string(&settings)?),
+            });
+            run_http_command(cfg, tunnel_config, origin, inspector_port, max_reconnects).await?;
         }
         Commands::Tcp {
             port,
             remote_port,
             max_reconnects,
         } => {
-            // Gate: the relay has no TCP data plane yet — a registration would
-            // succeed and report a public port that nothing listens on. Refuse
-            // up front instead of handing the user a dead endpoint. Flip
-            // TCP_TUNNELS_AVAILABLE once the server-side forwarder ships.
-            if !TCP_TUNNELS_AVAILABLE {
-                anyhow::bail!(
-                    "TCP tunnels are not yet available: the relay does not forward TCP traffic yet. \
-                     Use `pike http <port>` for HTTP/WebSocket tunnels."
-                );
-            }
             let cfg = config::load_or_create_config(&config_path).await?;
             warn_if_local_service_unreachable(&cfg.tunnel.bind_addr, port, "TCP upstream").await;
             let tunnel_config = cfg.as_tcp_tunnel_config(port, remote_port)?;
-            run_tcp_command(cfg, tunnel_config, port, remote_port, max_reconnects).await?;
+            run_port_command(cfg, tunnel_config, port, remote_port, max_reconnects).await?;
+        }
+        Commands::Tls {
+            port,
+            subdomain,
+            mode,
+            max_reconnects,
+        } => {
+            let cfg = config::load_or_create_config(&config_path).await?;
+            let subdomain = pike_core::types::SubdomainSpec::new(subdomain.to_lowercase())?.0;
+            let mut tunnel_config = cfg.as_tcp_tunnel_config(port, None)?;
+            tunnel_config.tunnel_type = TunnelType::Tls {
+                local_port: port,
+                subdomain,
+                mode: if mode == "terminate" {
+                    pike_core::types::TlsMode::Terminate
+                } else {
+                    pike_core::types::TlsMode::Passthrough
+                },
+            };
+            run_port_command(cfg, tunnel_config, port, None, max_reconnects).await?;
+        }
+        Commands::Udp {
+            port,
+            remote_port,
+            idle_timeout,
+            max_reconnects,
+        } => {
+            let cfg = config::load_or_create_config(&config_path).await?;
+            let mut config = cfg.as_tcp_tunnel_config(port, remote_port)?;
+            config.tunnel_type = TunnelType::Udp {
+                local_port: port,
+                remote_port,
+                idle_timeout_secs: idle_timeout,
+            };
+            run_port_command(cfg, config, port, remote_port, max_reconnects).await?;
+        }
+        Commands::Network { command } => {
+            let cfg = config::load_or_create_config(&config_path).await?;
+            network::run(&cfg, &config_path, command).await?;
         }
         Commands::Login { api_key } => {
             let api_key = resolve_login_api_key(api_key)?;
@@ -1040,11 +1177,12 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Http {
-                port: 3000,
+                port: Some(3000),
                 subdomain: Some(_),
                 host,
                 inspector_port: Some(5050),
-                max_reconnects: None
+                max_reconnects: None,
+                ..
             } if host == "0.0.0.0"
         ));
     }
@@ -1223,8 +1361,7 @@ mod tests {
 
         let loaded = config::load_config(&config_path).await.unwrap();
         let tunnel = loaded
-            .as_http_tunnel_config("127.0.0.1", 3000, Some("demo".to_string()))
-            .expect("http tunnel config");
+            .as_http_tunnel_config("127.0.0.1:3000".parse().unwrap(), Some("demo".to_string()));
 
         assert!(matches!(
             tunnel.tunnel_type,

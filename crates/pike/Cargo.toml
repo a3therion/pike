@@ -6,8 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[lints]
-workspace = true
+# The workspace forbids unsafe code. This crate needs exactly one unsafe
+# function, the Linux parent-death guard a gateway installs in its children
+# between fork and exec (network/gateway.rs), so the workspace lints are
+# repeated here with that lint at `deny` and a single scoped allow.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
 
 [dependencies]
 pike-core = { path = "../pike-core" }
@@ -26,6 +34,12 @@ dirs = "5"
 rand = "0.8"
 rpassword = "7"
 axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
 tower = { workspace = true }
 uuid = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
@@ -33,9 +47,18 @@ async-stream = { workspace = true }
 futures = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-quiche = { workspace = true }
-tokio-tungstenite = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+
+# prctl(PR_SET_PDEATHSIG) and getppid for the gateway's child guard; already
+# in the lock file transitively.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
 tokio-test = "0.4"
+tonic = { version = "0.14.3", features = ["transport"] }
+tonic-prost = "0.14.3"
+prost = "0.14"
+tokio-stream = { version = "0.1", features = ["net"] }

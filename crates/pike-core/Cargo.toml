@@ -18,5 +18,15 @@ serde = { workspace = true }
 postcard = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+http = "1"
+http-body-util = "0.1"
+http-body = "1"
+bytes = "1"
+base64 = "0.22"
+async-stream = { workspace = true }
 thiserror = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
+socket2 = "0.6"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

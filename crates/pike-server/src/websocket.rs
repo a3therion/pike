@@ -1,445 +1,318 @@
+//! WebSocket fallback carries the same session messages as the QUIC transport.
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use axum::extract::ws::{Message, WebSocket};
-use pike_core::proto::{ControlMessage, MAX_FRAME_SIZE};
-use pike_core::types::{RelayInfo, TunnelType};
-use tokio::sync::mpsc;
-use uuid::Uuid;
+use futures_util::{SinkExt, StreamExt};
+use pike_core::proto::{ControlMessage, StreamHeader};
+use pike_core::quic::server::{InboundData, OutboundData, PikeMessage, PikeOutboundMessage};
+use pike_core::websocket::{decode, encode, WsMessage, MAX_HEADER_SIZE};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit};
 
-use crate::connection::{ClientConnection, ConnectionState};
-use crate::registry::ClientRegistry;
-use crate::transport::{decode_multiplexed_frame, encode_multiplexed_frame};
+const MAX_OPEN_STREAMS: usize = 256;
+// Held from HTTP upgrade until successful login (or connection teardown).
+// This bounds pre-authentication frame buffers independently of active sessions.
+pub const MAX_PENDING_LOGINS: usize = 8;
 
-const CONTROL_STREAM_ID: u64 = 0;
-
-/// The WS fallback transport is not production-ready: no route mounts it
-/// (`http.rs::websocket_handler` is dead code), no released client implements
-/// a WS transport, its login path skips control-plane validation entirely,
-/// and `RegisterTunnel` answers with a hardcoded public URL that has no
-/// VhostRouter wiring — so it could authenticate nobody correctly and serve
-/// no traffic. Refuse logins (mirroring the TCP gate) so mounting the route
-/// can never silently expose an unauthenticated transport. Before flipping
-/// this to true: validate logins against the control plane + auth cache like
-/// the QUIC path in `main.rs`, and wire registrations into the VhostRouter.
-const WS_FALLBACK_AVAILABLE: bool = false;
-
-pub struct WebSocketTunnel {
-    socket: WebSocket,
-    streams: HashMap<u64, mpsc::Sender<Vec<u8>>>,
+pub struct AcceptedWebSocket {
+    pub socket: WebSocket,
+    pub peer_addr: SocketAddr,
+    pub login_permit: OwnedSemaphorePermit,
 }
 
-impl WebSocketTunnel {
-    #[must_use]
-    pub fn new(socket: WebSocket) -> Self {
-        Self {
-            socket,
-            streams: HashMap::new(),
-        }
+fn decode_inbound(bytes: &[u8], authenticated: bool) -> Result<WsMessage> {
+    if !authenticated && (bytes.len() > MAX_HEADER_SIZE + 1 || bytes.first() != Some(&0)) {
+        bail!("only a bounded login control message is allowed before authentication");
     }
-
-    async fn recv_multiplexed_frame(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
-        loop {
-            let Some(message_result) = self.socket.recv().await else {
-                return Ok(None);
-            };
-            let message = message_result.context("failed to read websocket frame")?;
-
-            match message {
-                Message::Binary(payload) => {
-                    let frame = decode_multiplexed_frame(payload.as_ref())?;
-                    return Ok(Some(frame));
-                }
-                Message::Close(_) => return Ok(None),
-                Message::Ping(data) => {
-                    self.socket
-                        .send(Message::Pong(data))
-                        .await
-                        .context("failed to write websocket pong")?;
-                }
-                Message::Pong(_) => {}
-                Message::Text(_) => {
-                    return Err(anyhow!(
-                        "text websocket frames are not supported for tunnel transport"
-                    ));
-                }
-            }
-        }
+    let message = decode(bytes)?;
+    if !authenticated && !matches!(&message, WsMessage::Control(ControlMessage::Login { .. })) {
+        bail!("authentication required");
     }
+    Ok(message)
+}
 
-    async fn send_multiplexed_frame(&mut self, stream_id: u64, payload: &[u8]) -> Result<()> {
-        let data = encode_multiplexed_frame(stream_id, payload)?;
-        self.socket
-            .send(Message::Binary(data.into()))
-            .await
-            .context("failed to write websocket frame")
-    }
+struct StreamState {
+    header: StreamHeader,
+    sent_fin: bool,
+    received_fin: bool,
+}
 
-    async fn route_stream_frame(&mut self, stream_id: u64, payload: Vec<u8>) -> Result<()> {
-        let tx = if let Some(existing) = self.streams.get(&stream_id) {
-            existing.clone()
+#[derive(Default)]
+struct Streams {
+    next_id: u64,
+    active: HashMap<u64, StreamState>,
+    connections: HashMap<u64, u64>,
+}
+
+impl Streams {
+    fn outbound(&mut self, data: OutboundData) -> Result<WsMessage> {
+        let header = StreamHeader {
+            tunnel_id: data.tunnel_id,
+            connection_id: data.connection_id,
+            source_addr: data.source_addr,
+            streaming: data.streaming,
+            mode: data.mode,
+        };
+        let existing = data
+            .stream_id
+            .or_else(|| self.connections.get(&data.connection_id).copied());
+        let id = if let Some(id) = existing {
+            id
         } else {
-            let (tx, mut rx) = mpsc::channel(128);
-            self.streams.insert(stream_id, tx.clone());
-            tokio::spawn(async move { while rx.recv().await.is_some() {} });
-            tx
-        };
-
-        tx.send(payload)
-            .await
-            .map_err(|_| anyhow!("failed to route multiplexed stream payload"))
-    }
-}
-
-/// RAII guard that unregisters a WebSocket-transport client from the registry on drop,
-/// freeing its connection slot on EVERY exit path from the session (clean close, early
-/// `?` error, or panic unwind). Without this, any error after `register_client` would
-/// permanently leak the slot; because the connection cap keys on `clients.len()`, leaked
-/// slots would accumulate until all new connections (QUIC and WS) are refused — a remote
-/// DoS that would nullify the connection cap.
-struct RegisteredClientGuard {
-    registry: Arc<ClientRegistry>,
-    connection_id: Uuid,
-}
-
-impl Drop for RegisteredClientGuard {
-    fn drop(&mut self) {
-        self.registry.remove_client(&self.connection_id);
-    }
-}
-
-pub async fn handle_websocket(socket: WebSocket, registry: Arc<ClientRegistry>) {
-    let mut tunnel = WebSocketTunnel::new(socket);
-    if let Err(error) = run_session(&mut tunnel, registry).await {
-        tracing::warn!(error = %error, "websocket session ended with error");
-        let _ = tunnel.socket.send(Message::Close(None)).await;
-    }
-}
-
-async fn run_session(tunnel: &mut WebSocketTunnel, registry: Arc<ClientRegistry>) -> Result<()> {
-    let (stream_id, payload) = tunnel
-        .recv_multiplexed_frame()
-        .await?
-        .ok_or_else(|| anyhow!("websocket closed before login"))?;
-
-    if stream_id != CONTROL_STREAM_ID {
-        return Err(anyhow!(
-            "first websocket tunnel frame must be on control stream"
-        ));
-    }
-
-    let login: ControlMessage = decode_postcard_frame(&payload)?;
-    let ControlMessage::Login {
-        api_key,
-        client_version: _,
-        protocol_version: _,
-    } = login
-    else {
-        return Err(anyhow!("first control message must be login"));
-    };
-
-    if !WS_FALLBACK_AVAILABLE {
-        let failure = ControlMessage::LoginFailure {
-            reason: "websocket fallback transport is not yet available on this relay".to_string(),
-        };
-        let frame = encode_postcard_frame(&failure)?;
-        tunnel
-            .send_multiplexed_frame(CONTROL_STREAM_ID, &frame)
-            .await?;
-        return Ok(());
-    }
-
-    if api_key.trim().is_empty() {
-        let failure = ControlMessage::LoginFailure {
-            reason: "empty api key".to_string(),
-        };
-        let frame = encode_postcard_frame(&failure)?;
-        tunnel
-            .send_multiplexed_frame(CONTROL_STREAM_ID, &frame)
-            .await?;
-        return Ok(());
-    }
-
-    // Fix #8: bans are stored by user_id, but this path only has the api key. Consult
-    // both the revoked-api-key set (populated when a user is banned/killed, which
-    // unifies the identifier spaces for live sessions) and the api-key-space ban check.
-    // The QUIC path additionally resolves api_key -> user_id and checks is_banned there.
-    if !registry.is_api_key_allowed(&api_key) || registry.abuse_detector.is_banned(&api_key) {
-        let failure = ControlMessage::LoginFailure {
-            reason: "user is banned".to_string(),
-        };
-        let frame = encode_postcard_frame(&failure)?;
-        tunnel
-            .send_multiplexed_frame(CONTROL_STREAM_ID, &frame)
-            .await?;
-        return Ok(());
-    }
-
-    let connection_id = Uuid::new_v4();
-    let mut client = ClientConnection::new(connection_id, None);
-    client.transition_to(ConnectionState::Handshaking)?;
-    client.authenticate(&api_key, false)?;
-    client.activate()?;
-    // Enforce the connection cap here too (this WS fallback transport shares the same
-    // registry). On rejection, tell the client and return WITHOUT registering, so the
-    // disconnect cleanup below never runs for an unregistered connection.
-    if let Err(error) = registry.register_client(client) {
-        tracing::warn!(%connection_id, error = %error, "refusing WS connection: at max_connections");
-        crate::metrics::CONNECTION_LIMIT_REJECTIONS.inc();
-        let failure = ControlMessage::LoginFailure {
-            reason: "server at capacity".to_string(),
-        };
-        let frame = encode_postcard_frame(&failure)?;
-        tunnel
-            .send_multiplexed_frame(CONTROL_STREAM_ID, &frame)
-            .await?;
-        return Ok(());
-    }
-
-    // The slot is now held. From here on, EVERY exit path (error via `?`, panic, or the
-    // clean loop exit) must free it — so bind an RAII guard rather than relying on the
-    // single happy-path `remove_client` call that previously leaked on any early error.
-    let _client_guard = RegisteredClientGuard {
-        registry: Arc::clone(&registry),
-        connection_id,
-    };
-
-    let success = ControlMessage::LoginSuccess {
-        session_id: format!("ws-session-{}", now_unix_secs()),
-        relay_info: RelayInfo {
-            addr: SocketAddr::from(([0, 0, 0, 0], 4433)),
-            region: "global".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-    };
-    let success_frame = encode_postcard_frame(&success)?;
-    tunnel
-        .send_multiplexed_frame(CONTROL_STREAM_ID, &success_frame)
-        .await?;
-
-    while let Some((current_stream, data)) = tunnel.recv_multiplexed_frame().await? {
-        if current_stream == CONTROL_STREAM_ID {
-            let control: ControlMessage = decode_postcard_frame(&data)?;
-            if let Some(response) = handle_control_message(control).await? {
-                let encoded = encode_postcard_frame(&response)?;
-                tunnel
-                    .send_multiplexed_frame(CONTROL_STREAM_ID, &encoded)
-                    .await?;
+            if self.active.len() >= MAX_OPEN_STREAMS {
+                bail!("WebSocket stream limit reached");
             }
-            continue;
+            self.next_id = self
+                .next_id
+                .checked_add(4)
+                .ok_or_else(|| anyhow!("stream IDs exhausted"))?;
+            self.active.insert(
+                self.next_id,
+                StreamState {
+                    header: header.clone(),
+                    sent_fin: false,
+                    received_fin: false,
+                },
+            );
+            self.connections.insert(header.connection_id, self.next_id);
+            self.next_id
+        };
+        let state = self
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| anyhow!("unknown outbound stream"))?;
+        if state.header != header || state.sent_fin {
+            bail!("invalid outbound stream state");
         }
-
-        tunnel.route_stream_frame(current_stream, data).await?;
+        state.sent_fin = data.fin;
+        self.remove_closed(id);
+        Ok(WsMessage::Data {
+            stream_id: id,
+            header,
+            payload: data.payload,
+            fin: data.fin,
+        })
     }
 
-    // `_client_guard` frees the connection slot on drop (here and on every early return).
-    Ok(())
-}
+    fn inbound(&mut self, id: u64, header: &StreamHeader, fin: bool) -> Result<()> {
+        let state = self
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| anyhow!("unsolicited data stream"))?;
+        if &state.header != header || state.received_fin {
+            bail!("invalid inbound stream state");
+        }
+        state.received_fin = fin;
+        self.remove_closed(id);
+        Ok(())
+    }
 
-async fn handle_control_message(message: ControlMessage) -> Result<Option<ControlMessage>> {
-    let response = match message {
-        ControlMessage::Heartbeat { seq, timestamp } => Some(ControlMessage::HeartbeatAck {
-            seq,
-            timestamp,
-            server_time: now_unix_secs(),
-        }),
-        // No TCP data plane exists yet — reject instead of acknowledging a
-        // registration whose public port nothing will ever bind.
-        ControlMessage::RegisterTunnel { config }
-            if matches!(config.tunnel_type, TunnelType::Tcp { .. }) =>
+    fn remove_closed(&mut self, id: u64) {
+        if self
+            .active
+            .get(&id)
+            .is_some_and(|s| s.sent_fin && s.received_fin)
         {
-            Some(ControlMessage::TunnelError {
-                tunnel_id: config.id,
-                reason: "TCP tunnels are not yet available on this relay".to_string(),
-            })
+            if let Some(state) = self.active.remove(&id) {
+                self.connections.remove(&state.header.connection_id);
+            }
         }
-        ControlMessage::RegisterTunnel { config } => Some(ControlMessage::TunnelRegistered {
-            tunnel_id: config.id,
-            public_url: "https://ws-fallback.pike.life".to_string(),
-            remote_port: None,
-        }),
-        ControlMessage::UnregisterTunnel { .. } => None,
-        ControlMessage::Login { .. } => {
-            return Err(anyhow!(
-                "login control message is only valid as first websocket frame"
-            ));
+    }
+}
+
+pub async fn run_transport(
+    socket: WebSocket,
+    login_permit: OwnedSemaphorePermit,
+    inbound: mpsc::Sender<PikeMessage>,
+    mut outbound: mpsc::Receiver<PikeOutboundMessage>,
+) {
+    let (mut writer, mut reader) = socket.split();
+    let authenticated = Arc::new(AtomicBool::new(false));
+    let streams = Arc::new(Mutex::new(Streams::default()));
+    let mut login_permit = Some(login_permit);
+    let read = async {
+        while let Some(message) = reader.next().await {
+            match message? {
+                Message::Binary(bytes) => {
+                    let message =
+                        match decode_inbound(&bytes, authenticated.load(Ordering::Acquire))? {
+                            WsMessage::Control(control) => {
+                                if !authenticated.load(Ordering::Acquire)
+                                    && !matches!(control, ControlMessage::Login { .. })
+                                {
+                                    bail!("authentication required");
+                                }
+                                PikeMessage::Control(control)
+                            }
+                            WsMessage::Data {
+                                stream_id,
+                                header,
+                                payload,
+                                fin,
+                            } => {
+                                if !authenticated.load(Ordering::Acquire) {
+                                    bail!("authentication required");
+                                }
+                                streams.lock().await.inbound(stream_id, &header, fin)?;
+                                PikeMessage::Data(InboundData {
+                                    stream_id,
+                                    tunnel_id: header.tunnel_id,
+                                    connection_id: header.connection_id,
+                                    source_addr: header.source_addr,
+                                    payload,
+                                    fin,
+                                    streaming: header.streaming,
+                                    mode: header.mode,
+                                })
+                            }
+                        };
+                    inbound
+                        .send(message)
+                        .await
+                        .map_err(|_| anyhow!("session closed"))?;
+                }
+                Message::Close(_) => break,
+                Message::Ping(_) | Message::Pong(_) => {}
+                Message::Text(_) => bail!("binary tunnel envelopes required"),
+            }
         }
-        ControlMessage::LoginSuccess { .. }
-        | ControlMessage::LoginFailure { .. }
-        | ControlMessage::TunnelRegistered { .. }
-        | ControlMessage::TunnelError { .. }
-        | ControlMessage::HeartbeatAck { .. } => {
-            return Err(anyhow!(
-                "received server-originated control message on websocket control stream"
-            ));
-        }
+        Ok::<(), anyhow::Error>(())
     };
-
-    Ok(response)
-}
-
-fn encode_postcard_frame(message: &ControlMessage) -> Result<Vec<u8>> {
-    let payload = postcard::to_allocvec(message)
-        .map_err(|error| anyhow!("failed to encode control message: {error}"))?;
-    if payload.len() > MAX_FRAME_SIZE {
-        return Err(anyhow!("control message exceeds max frame size"));
+    let write = async {
+        while let Some(message) = outbound.recv().await {
+            let denied = matches!(
+                &message,
+                PikeOutboundMessage::Control(ControlMessage::LoginFailure { .. })
+            );
+            let message = match message {
+                PikeOutboundMessage::Control(control) => {
+                    if matches!(control, ControlMessage::LoginSuccess { .. }) {
+                        authenticated.store(true, Ordering::Release);
+                        login_permit.take();
+                    }
+                    WsMessage::Control(control)
+                }
+                PikeOutboundMessage::Data(data) => streams.lock().await.outbound(data)?,
+            };
+            writer
+                .send(Message::Binary(encode(&message)?.into()))
+                .await?;
+            if denied {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let result = tokio::select! { result = read => result, result = write => result };
+    if let Err(error) = result {
+        tracing::debug!(%error, "WebSocket tunnel transport closed");
     }
-
-    let len_u32 = u32::try_from(payload.len())
-        .map_err(|_| anyhow!("control message too large for framed transport"))?;
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len_u32.to_be_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
-}
-
-fn decode_postcard_frame(data: &[u8]) -> Result<ControlMessage> {
-    if data.len() < 4 {
-        return Err(anyhow!("framed control message too short"));
-    }
-    let length =
-        u32::from_be_bytes(data[0..4].try_into().map_err(|_| anyhow!("bad length"))?) as usize;
-    if length > MAX_FRAME_SIZE {
-        return Err(anyhow!("control frame exceeds max size"));
-    }
-    if data.len() < 4 + length {
-        return Err(anyhow!("incomplete framed control message"));
-    }
-
-    postcard::from_bytes(&data[4..4 + length])
-        .map_err(|error| anyhow!("failed to decode framed control message: {error}"))
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
-    use pike_core::proto::ControlMessage;
-    use tokio::sync::mpsc;
-
-    use std::sync::Arc;
-
-    use super::{
-        decode_postcard_frame, encode_postcard_frame, handle_control_message, RegisteredClientGuard,
-    };
-    use crate::config::AbuseConfig;
-    use crate::connection::{ClientConnection, ConnectionState};
-    use crate::registry::ClientRegistry;
-    use crate::transport::{decode_multiplexed_frame, encode_multiplexed_frame};
-    use uuid::Uuid;
-
-    fn register_activated_client(registry: &ClientRegistry, id: u128) -> Uuid {
-        let connection_id = Uuid::from_u128(id);
-        let mut client = ClientConnection::new(connection_id, None);
-        client.state = ConnectionState::Authenticated;
-        registry
-            .register_client(client)
-            .expect("registration within limit");
-        connection_id
-    }
+    use super::*;
+    use pike_core::types::TunnelId;
 
     #[test]
-    fn ws_session_guard_frees_slot_on_drop_and_avoids_cap_exhaustion() {
-        // Cap of 2. Simulate many WS sessions that register then exit via error (drop).
-        let registry = Arc::new(ClientRegistry::with_limits(AbuseConfig::default(), 2, 10));
-
-        for i in 0..10u128 {
-            let connection_id = register_activated_client(&registry, i);
-            assert_eq!(
-                registry.clients.len(),
-                1,
-                "one live client while session runs"
-            );
-            {
-                let _guard = RegisteredClientGuard {
-                    registry: Arc::clone(&registry),
-                    connection_id,
-                };
-                // guard drops here, mirroring the session returning (Ok or Err)
-            }
-            assert_eq!(
-                registry.clients.len(),
-                0,
-                "slot must be freed on session exit (drop), iteration {i}"
-            );
+    fn half_close_keeps_other_direction_and_releases_completed_streams() {
+        let mut streams = Streams::default();
+        for connection_id in 0..1000 {
+            let data = OutboundData {
+                stream_id: None,
+                tunnel_id: TunnelId::new(),
+                connection_id,
+                source_addr: "127.0.0.1:3456".parse().unwrap(),
+                payload: vec![],
+                fin: false,
+                streaming: true,
+                mode: pike_core::proto::StreamMode::Raw,
+            };
+            let WsMessage::Data {
+                stream_id, header, ..
+            } = streams.outbound(data.clone()).unwrap()
+            else {
+                panic!("expected data")
+            };
+            streams.inbound(stream_id, &header, true).unwrap();
+            assert_eq!(streams.active.len(), 1);
+            streams
+                .outbound(OutboundData { fin: true, ..data })
+                .unwrap();
+            assert!(streams.active.is_empty());
+            assert!(streams.connections.is_empty());
         }
-
-        // Cap is not exhausted after 10 errored sessions: two fresh clients still register.
-        register_activated_client(&registry, 100);
-        register_activated_client(&registry, 101);
-        assert_eq!(registry.clients.len(), 2);
     }
 
     #[test]
-    fn control_message_framing_roundtrip() -> Result<()> {
-        let input = ControlMessage::Heartbeat {
-            seq: 44,
-            timestamp: 1_700_000_000,
+    fn http_response_fragments_keep_identity_until_fin() {
+        let mut streams = Streams::default();
+        let request = OutboundData {
+            stream_id: None,
+            tunnel_id: TunnelId::new(),
+            connection_id: 42,
+            source_addr: "127.0.0.1:3456".parse().unwrap(),
+            payload: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            fin: true,
+            streaming: false,
+            mode: pike_core::proto::StreamMode::Raw,
         };
-        let encoded = encode_postcard_frame(&input)?;
-        let decoded = decode_postcard_frame(&encoded)?;
-        assert!(matches!(decoded, ControlMessage::Heartbeat { .. }));
-        Ok(())
+        let WsMessage::Data {
+            stream_id, header, ..
+        } = streams.outbound(request).unwrap()
+        else {
+            panic!("expected HTTP request");
+        };
+        streams.inbound(stream_id, &header, false).unwrap();
+        streams.inbound(stream_id, &header, false).unwrap();
+        assert_eq!(streams.active.len(), 1);
+        let mut changed = header.clone();
+        changed.connection_id += 1;
+        assert!(streams.inbound(stream_id, &changed, false).is_err());
+        streams.inbound(stream_id, &header, true).unwrap();
+        assert!(streams.active.is_empty());
+        assert!(streams.connections.is_empty());
+        assert!(streams.inbound(stream_id, &header, false).is_err());
     }
 
     #[test]
-    fn websocket_multiplexing_encodes_stream_id_and_payload() {
-        let payload = b"stream-payload";
-        let encoded = encode_multiplexed_frame(16, payload).expect("encode multiplexed frame");
-        let (stream_id, decoded_payload) =
-            decode_multiplexed_frame(&encoded).expect("decode multiplexed frame");
-        assert_eq!(stream_id, 16);
-        assert_eq!(decoded_payload, payload);
-    }
-
-    #[tokio::test]
-    async fn stream_routing_multiplexes_multiple_stream_ids() {
-        let (stream4_tx, mut stream4_rx) = mpsc::channel(4);
-        let (stream8_tx, mut stream8_rx) = mpsc::channel(4);
-        let mut streams = std::collections::HashMap::new();
-        streams.insert(4, stream4_tx);
-        streams.insert(8, stream8_tx);
-
-        let payload4 = b"alpha".to_vec();
-        let payload8 = b"beta".to_vec();
-        let tx4 = streams.get(&4).expect("stream 4 sender").clone();
-        let tx8 = streams.get(&8).expect("stream 8 sender").clone();
-        tx4.send(payload4.clone()).await.expect("send stream 4");
-        tx8.send(payload8.clone()).await.expect("send stream 8");
-
-        assert_eq!(stream4_rx.recv().await.expect("recv stream 4"), payload4);
-        assert_eq!(stream8_rx.recv().await.expect("recv stream 8"), payload8);
+    fn rejects_unsolicited_and_mismatched_data() {
+        let mut streams = Streams::default();
+        let header = StreamHeader {
+            tunnel_id: TunnelId::new(),
+            connection_id: 1,
+            source_addr: "127.0.0.1:3456".parse().unwrap(),
+            streaming: false,
+            mode: pike_core::proto::StreamMode::Raw,
+        };
+        assert!(streams.inbound(4, &header, true).is_err());
     }
 
     #[test]
-    fn control_message_decoder_rejects_incomplete_frame() {
-        let data = vec![0, 0, 0, 8, 1, 2];
-        let err = decode_postcard_frame(&data).expect_err("must reject incomplete frame");
-        assert!(err.to_string().contains("incomplete"));
-    }
-
-    #[tokio::test]
-    async fn control_stream_heartbeat_returns_ack() {
-        let response = handle_control_message(ControlMessage::Heartbeat {
-            seq: 7,
-            timestamp: 123,
-        })
-        .await
-        .expect("heartbeat handling")
-        .expect("heartbeat ack response");
-
+    fn pre_login_rejects_data_before_decoding_and_limits_control_size() {
+        let error = decode_inbound(&[1], false).unwrap_err();
+        assert!(error.to_string().contains("before authentication"));
+        assert!(decode_inbound(&vec![0; MAX_HEADER_SIZE + 2], false).is_err());
+        let heartbeat = encode(&WsMessage::Control(ControlMessage::Heartbeat {
+            seq: 1,
+            timestamp: 0,
+        }))
+        .unwrap();
+        assert!(decode_inbound(&heartbeat, false).is_err());
+        let login = encode(&WsMessage::Control(ControlMessage::Login {
+            api_key: "test".into(),
+            client_version: "test".into(),
+            protocol_version: None,
+        }))
+        .unwrap();
         assert!(matches!(
-            response,
-            ControlMessage::HeartbeatAck { seq: 7, .. }
+            decode_inbound(&login, false).unwrap(),
+            WsMessage::Control(ControlMessage::Login { .. })
         ));
     }
 }

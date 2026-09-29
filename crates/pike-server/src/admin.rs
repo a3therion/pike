@@ -16,7 +16,7 @@ pub enum AdminCommand {
     ListBans,
 }
 
-pub async fn run_admin_command(cmd: AdminCommand, registry: Arc<ClientRegistry>) -> Result<()> {
+pub fn run_admin_command(cmd: AdminCommand, registry: Arc<ClientRegistry>) -> Result<()> {
     match cmd {
         AdminCommand::Ban { user_id } => {
             registry
@@ -25,7 +25,6 @@ pub async fn run_admin_command(cmd: AdminCommand, registry: Arc<ClientRegistry>)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             registry
                 .kill_user_tunnels(&user_id)
-                .await
                 .with_context(|| format!("failed to kill tunnels for user {user_id}"))?;
             println!("User {user_id} banned");
         }
@@ -40,8 +39,7 @@ pub async fn run_admin_command(cmd: AdminCommand, registry: Arc<ClientRegistry>)
             let parsed = Uuid::from_str(&tunnel_id)
                 .with_context(|| format!("invalid tunnel id {tunnel_id}"))?;
             registry
-                .abuse_detector
-                .suspend_tunnel(TunnelId(parsed))
+                .suspend_tunnel_identity(TunnelId(parsed))
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             println!("Tunnel {tunnel_id} suspended");
         }

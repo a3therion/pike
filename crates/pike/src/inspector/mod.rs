@@ -1,3 +1,4 @@
+pub(crate) mod capture;
 pub mod server;
 pub mod storage;
 

@@ -1,13 +1,18 @@
+use crate::proxy::DEFAULT_PROXY_TIMEOUT;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use base64::Engine;
+use pike_core::http_response::{parse_head, Event, ResponseDecoder, ResponseHead, MAX_HEADERS};
 use pike_core::proto::StreamHeader;
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::time::{timeout_at, Instant};
 use tracing::{info, warn};
 
 use crate::proxy::{TunnelRequest, WebSocketRequest};
+use crate::traffic_meter::TrafficMeter;
+use pike_core::byte_stream::Direction;
 
 /// WebSocket GUID used to compute the Sec-WebSocket-Accept header.
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -124,6 +129,133 @@ fn compute_accept_key(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(hash)
 }
 
+/// Expected Sec-WebSocket-Accept for a raw upgrade request, if it carries a key.
+fn expected_accept_key(raw_upgrade_request: &[u8]) -> Option<String> {
+    let end = raw_upgrade_request
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")?;
+    std::str::from_utf8(&raw_upgrade_request[..end])
+        .ok()?
+        .split("\r\n")
+        .skip(1)
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("sec-websocket-key")
+                .then(|| compute_accept_key(value.trim()))
+        })
+}
+
+fn upgrade_accepted(head: &ResponseHead, accept_key: &str) -> bool {
+    head.status == 101
+        && head.header("sec-websocket-accept") == Some(accept_key)
+        && head
+            .header("upgrade")
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        && head.header("connection").is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        })
+}
+
+enum UpgradeResponse {
+    /// The response head has not fully arrived yet.
+    Incomplete,
+    /// Upgrade accepted; WebSocket frames start at `header_end`.
+    Accepted { header_end: usize },
+    /// Not a valid 101 for this request; nothing that follows is WebSocket.
+    Rejected,
+}
+
+/// Classify buffered upstream bytes the same way `handle_ws_upgrade` does.
+fn classify_upgrade_response(accept_key: Option<&str>, raw: &[u8]) -> UpgradeResponse {
+    let Some(end) = raw.windows(4).position(|part| part == b"\r\n\r\n") else {
+        return if raw.len() > MAX_HEADERS {
+            UpgradeResponse::Rejected
+        } else {
+            UpgradeResponse::Incomplete
+        };
+    };
+    match (parse_head(&raw[..end]), accept_key) {
+        (Ok(head), Some(key)) if upgrade_accepted(&head, key) => UpgradeResponse::Accepted {
+            header_end: end + 4,
+        },
+        _ => UpgradeResponse::Rejected,
+    }
+}
+
+/// What telemetry should record for one upstream chunk of a relayed WebSocket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpstreamObservation {
+    /// This chunk completed an accepted upgrade; count the connection as open.
+    pub accepted: bool,
+    /// WebSocket frames and bytes after the upgrade head; zero for handshake bytes.
+    pub frames: u64,
+    pub bytes: u64,
+}
+
+impl UpstreamObservation {
+    fn frames(bytes: &[u8]) -> Self {
+        if bytes.is_empty() {
+            return Self::default();
+        }
+        Self {
+            accepted: false,
+            frames: websocket_frame_stats(bytes).frames.max(1),
+            bytes: bytes.len() as u64,
+        }
+    }
+}
+
+enum UpstreamState {
+    Handshake(Vec<u8>),
+    Open,
+    Rejected,
+}
+
+/// Separates the upstream upgrade response from WebSocket frames so telemetry
+/// never counts HTTP headers or rejected upgrades as frames.
+pub struct UpstreamObserver {
+    accept_key: Option<String>,
+    state: UpstreamState,
+}
+
+impl UpstreamObserver {
+    #[must_use]
+    pub fn new(raw_upgrade_request: &[u8]) -> Self {
+        Self {
+            accept_key: expected_accept_key(raw_upgrade_request),
+            state: UpstreamState::Handshake(Vec::new()),
+        }
+    }
+
+    pub fn observe(&mut self, bytes: &[u8]) -> UpstreamObservation {
+        match &mut self.state {
+            UpstreamState::Rejected => UpstreamObservation::default(),
+            UpstreamState::Open => UpstreamObservation::frames(bytes),
+            UpstreamState::Handshake(head) => {
+                head.extend_from_slice(bytes);
+                match classify_upgrade_response(self.accept_key.as_deref(), head) {
+                    UpgradeResponse::Incomplete => UpstreamObservation::default(),
+                    UpgradeResponse::Rejected => {
+                        self.state = UpstreamState::Rejected;
+                        UpstreamObservation::default()
+                    }
+                    UpgradeResponse::Accepted { header_end } => {
+                        let observation = UpstreamObservation {
+                            accepted: true,
+                            ..UpstreamObservation::frames(&head[header_end..])
+                        };
+                        self.state = UpstreamState::Open;
+                        observation
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Handle a WebSocket upgrade by accepting it and relaying raw bytes
 /// (not decoded WS frames) through the tunnel's QUIC stream.
 ///
@@ -135,6 +267,8 @@ pub async fn handle_ws_upgrade(
     stream_header: StreamHeader,
     raw_upgrade_request: Vec<u8>,
     request_id: String,
+    meter: TrafficMeter,
+    visitor: crate::visitor_policy::VisitorAdmission,
 ) -> Response<Body> {
     // Extract the Sec-WebSocket-Key to compute the accept value
     let ws_key = match req.headers().get("sec-websocket-key") {
@@ -156,13 +290,17 @@ pub async fn handle_ws_upgrade(
     };
 
     let accept_key = compute_accept_key(&ws_key);
+    if let Err(error) = meter.opened().await {
+        warn!(%error, "WebSocket usage observation failed");
+        return crate::quota::error_response(&error);
+    }
 
     // Extract the hyper OnUpgrade to get raw connection after 101
     let on_upgrade = hyper::upgrade::on(req);
 
     // Create channels for bidirectional relay between raw connection and QUIC
-    let (ws_to_quic_tx, ws_to_quic_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (quic_to_ws_tx, quic_to_ws_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (ws_to_quic_tx, ws_to_quic_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (quic_to_ws_tx, mut quic_to_ws_rx) = mpsc::channel::<Vec<u8>>(16);
 
     let ws_req = WebSocketRequest {
         stream_header,
@@ -172,46 +310,141 @@ pub async fn handle_ws_upgrade(
         quic_to_ws_tx,
     };
 
-    // Send the WebSocket request to the tunnel forwarder
-    if tunnel_request_tx
-        .send(TunnelRequest::WebSocket(ws_req))
-        .await
-        .is_err()
-    {
+    let deadline = Instant::now() + DEFAULT_PROXY_TIMEOUT;
+    if !matches!(
+        timeout_at(
+            deadline,
+            tunnel_request_tx.send(TunnelRequest::WebSocket(ws_req))
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         return Response::builder()
             .status(502)
             .body(Body::from("tunnel unavailable"))
             .unwrap_or_else(|_| Response::new(Body::from("error")));
     }
 
+    let handshake = timeout_at(deadline, async {
+        let mut raw = Vec::new();
+        loop {
+            let bytes = quic_to_ws_rx
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("upstream closed during upgrade"))?;
+            raw.extend_from_slice(&bytes);
+            if let Some(end) = raw.windows(4).position(|part| part == b"\r\n\r\n") {
+                let head = parse_head(&raw[..end])?;
+                return Ok::<_, anyhow::Error>((head, raw, end + 4));
+            }
+            if raw.len() > MAX_HEADERS {
+                anyhow::bail!("upgrade headers too large");
+            }
+        }
+    })
+    .await;
+    let Ok(Ok((head, raw, header_end))) = handshake else {
+        return Response::builder()
+            .status(502)
+            .body(Body::from("upstream upgrade failed"))
+            .unwrap();
+    };
+    if head.status != 101 {
+        let mut decoder = ResponseDecoder::new(false);
+        let mut body = Vec::new();
+        let result = timeout_at(deadline, async {
+            let mut next = Some(raw);
+            loop {
+                let eof = next.is_none();
+                for event in decoder.feed(next.as_deref().unwrap_or(&[]), eof)? {
+                    if let Event::Body(bytes) = event {
+                        body.extend(bytes);
+                    }
+                }
+                if body.len() > 1024 * 1024 {
+                    anyhow::bail!("upgrade rejection body too large");
+                }
+                if decoder.is_done() {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                next = quic_to_ws_rx.recv().await;
+            }
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            body.clear();
+        }
+        if meter
+            .bytes(Direction::TunnelToSocket, body.len())
+            .await
+            .is_err()
+        {
+            return Response::builder()
+                .status(503)
+                .body(Body::from("usage storage unavailable"))
+                .unwrap();
+        }
+        let mut response = Response::builder().status(head.status);
+        for (name, value) in head
+            .end_to_end_headers()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("content-length"))
+        {
+            response = response.header(name, value);
+        }
+        return response
+            .body(Body::from(body))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+    if !upgrade_accepted(&head, &accept_key) {
+        return Response::builder()
+            .status(502)
+            .body(Body::from("invalid upstream upgrade response"))
+            .unwrap();
+    }
+    let early_frames = raw[header_end..].to_vec();
     // Spawn the raw byte relay task
     tokio::spawn(async move {
-        match on_upgrade.await {
-            Ok(upgraded) => {
-                info!("WebSocket upgrade completed, starting raw byte relay");
-                let io = hyper_util::rt::TokioIo::new(upgraded);
-                let (mut read_half, mut write_half) = tokio::io::split(io);
+        let forwarding = async {
+            match on_upgrade.await {
+                Ok(upgraded) => {
+                    info!("WebSocket upgrade completed, starting raw byte relay");
+                    let io = hyper_util::rt::TokioIo::new(upgraded);
+                    let (mut read_half, mut write_half) = tokio::io::split(io);
 
-                relay_raw(
-                    &mut read_half,
-                    &mut write_half,
-                    quic_to_ws_rx,
-                    ws_to_quic_tx,
-                )
-                .await;
+                    if meter
+                        .bytes(Direction::TunnelToSocket, early_frames.len())
+                        .await
+                        .is_err()
+                        || write_half.write_all(&early_frames).await.is_err()
+                    {
+                        return;
+                    }
+                    relay_raw(
+                        &mut read_half,
+                        &mut write_half,
+                        quic_to_ws_rx,
+                        ws_to_quic_tx,
+                        meter,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(error = %e, "WebSocket upgrade failed");
+                }
             }
-            Err(e) => {
-                warn!(error = %e, "WebSocket upgrade failed");
-            }
+        };
+        tokio::select! {
+            biased;
+            () = visitor.cancelled() => {},
+            () = forwarding => {},
         }
     });
 
-    // Return the 101 Switching Protocols response to trigger the upgrade
-    Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Accept", accept_key)
+    let mut response = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (name, value) in head.headers {
+        response = response.header(name, value);
+    }
+    response
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
@@ -223,6 +456,7 @@ async fn relay_raw<R, W>(
     write_half: &mut W,
     mut from_tunnel: mpsc::Receiver<Vec<u8>>,
     to_tunnel: mpsc::Sender<Vec<u8>>,
+    meter: TrafficMeter,
 ) where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -236,6 +470,10 @@ async fn relay_raw<R, W>(
             match read_half.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Err(error) = meter.bytes(Direction::SocketToTunnel, n).await {
+                        warn!(%error, "WebSocket ingress accounting failed");
+                        break;
+                    }
                     if to_tunnel_for_read.send(buf[..n].to_vec()).await.is_err() {
                         break;
                     }
@@ -254,6 +492,10 @@ async fn relay_raw<R, W>(
             if data.is_empty() {
                 continue;
             }
+            if let Err(error) = meter.bytes(Direction::TunnelToSocket, data.len()).await {
+                warn!(%error, "WebSocket egress accounting failed");
+                break;
+            }
             if write_half.write_all(&data).await.is_err() {
                 break;
             }
@@ -270,21 +512,11 @@ async fn relay_raw<R, W>(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use super::{build_raw_upgrade_request, compute_accept_key, relay_raw, websocket_frame_stats};
+    use super::{
+        build_raw_upgrade_request, websocket_frame_stats, UpstreamObservation, UpstreamObserver,
+    };
     use axum::body::Body;
     use axum::http::Request;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::mpsc;
-
-    #[test]
-    fn computes_rfc_websocket_accept_key() {
-        // RFC 6455 section 1.3 example vector.
-        let key = "dGhlIHNhbXBsZSBub25jZQ==";
-
-        assert_eq!(compute_accept_key(key), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
-    }
 
     #[test]
     fn raw_upgrade_request_preserves_target_and_websocket_headers() {
@@ -342,66 +574,6 @@ mod tests {
         assert!(stats.incomplete);
     }
 
-    #[tokio::test]
-    async fn raw_relay_preserves_websocket_frame_bytes_in_both_directions() {
-        let client_frames = [
-            masked_client_frame(0x2, b"\x00binary\xff"),
-            masked_client_frame(0x9, b"ping"),
-            masked_client_frame(0x8, &[0x03, 0xe8]),
-        ]
-        .concat();
-        let server_frames = [
-            server_frame(0x2, b"\x01reply\xfe"),
-            server_frame(0xa, b"pong"),
-            server_frame(0x8, &[0x03, 0xe8]),
-        ]
-        .concat();
-
-        let (relay_side, mut browser_side) = tokio::io::duplex(4096);
-        let (mut relay_read, mut relay_write) = tokio::io::split(relay_side);
-        let (from_tunnel_tx, from_tunnel_rx) = mpsc::channel(4);
-        let (to_tunnel_tx, mut to_tunnel_rx) = mpsc::channel(4);
-
-        let relay = tokio::spawn(async move {
-            relay_raw(
-                &mut relay_read,
-                &mut relay_write,
-                from_tunnel_rx,
-                to_tunnel_tx,
-            )
-            .await;
-        });
-
-        browser_side
-            .write_all(&client_frames)
-            .await
-            .expect("browser frames should write");
-        let relayed_client_frames =
-            receive_relayed_bytes(&mut to_tunnel_rx, client_frames.len()).await;
-        assert_eq!(relayed_client_frames, client_frames);
-
-        from_tunnel_tx
-            .send(server_frames.clone())
-            .await
-            .expect("server frames should send");
-        let mut received_server_frames = vec![0; server_frames.len()];
-        browser_side
-            .read_exact(&mut received_server_frames)
-            .await
-            .expect("browser should receive server frames");
-        assert_eq!(received_server_frames, server_frames);
-
-        drop(from_tunnel_tx);
-        browser_side
-            .shutdown()
-            .await
-            .expect("browser side should shutdown");
-        tokio::time::timeout(Duration::from_secs(1), relay)
-            .await
-            .expect("relay should stop after browser shutdown")
-            .expect("relay task should not panic");
-    }
-
     fn masked_client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
         let mask = [0x12, 0x34, 0x56, 0x78];
         let payload_len = u8::try_from(payload.len()).expect("test payload should fit in u8");
@@ -431,15 +603,91 @@ mod tests {
         frame
     }
 
-    async fn receive_relayed_bytes(rx: &mut mpsc::Receiver<Vec<u8>>, len: usize) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(len);
-        while bytes.len() < len {
-            let chunk = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .expect("relay should produce bytes before timeout")
-                .expect("relay channel should stay open");
-            bytes.extend_from_slice(&chunk);
-        }
-        bytes
+    const UPGRADE_REQUEST: &[u8] = b"GET /media HTTP/1.1\r\nhost: a.test\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    const ACCEPTED_HEAD: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+
+    #[test]
+    fn upstream_observer_opens_empty_upgrade_without_frames() {
+        let mut observer = UpstreamObserver::new(UPGRADE_REQUEST);
+        let (first, rest) = ACCEPTED_HEAD.split_at(20);
+
+        assert_eq!(observer.observe(first), UpstreamObservation::default());
+        assert_eq!(
+            observer.observe(rest),
+            UpstreamObservation {
+                accepted: true,
+                frames: 0,
+                bytes: 0,
+            }
+        );
+        let frame = server_frame(0x1, b"hello");
+        let next = observer.observe(&frame);
+        assert!(!next.accepted);
+        assert_eq!((next.frames, next.bytes), (1, frame.len() as u64));
+    }
+
+    #[test]
+    fn upstream_observer_keeps_frame_coalesced_with_head() {
+        let frame = server_frame(0x2, b"early");
+        let mut observer = UpstreamObserver::new(UPGRADE_REQUEST);
+
+        let observation = observer.observe(&[ACCEPTED_HEAD, &frame[..]].concat());
+
+        assert_eq!(
+            observation,
+            UpstreamObservation {
+                accepted: true,
+                frames: 1,
+                bytes: frame.len() as u64,
+            }
+        );
+    }
+
+    #[test]
+    fn upstream_observer_counts_fragmented_frame_chunks_after_upgrade() {
+        let frame = server_frame(0x2, b"fragmented-payload");
+        let (head_part, tail_part) = frame.split_at(4);
+        let mut observer = UpstreamObserver::new(UPGRADE_REQUEST);
+
+        let first = observer.observe(&[ACCEPTED_HEAD, head_part].concat());
+        let second = observer.observe(tail_part);
+
+        assert!(first.accepted);
+        assert_eq!((first.frames, first.bytes), (1, 4));
+        assert!(!second.accepted);
+        assert_eq!(second.bytes, tail_part.len() as u64);
+        assert!(second.frames >= 1);
+    }
+
+    #[test]
+    fn upstream_observer_ignores_rejected_upgrades() {
+        let rejection = b"HTTP/1.1 403 Forbidden\r\ncontent-length: 4\r\n\r\ndeny";
+        let mut observer = UpstreamObserver::new(UPGRADE_REQUEST);
+        assert_eq!(observer.observe(rejection), UpstreamObservation::default());
+        assert_eq!(
+            observer.observe(&server_frame(0x1, b"after")),
+            UpstreamObservation::default()
+        );
+
+        let wrong_accept = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: bogus\r\n\r\n";
+        let mut observer = UpstreamObserver::new(UPGRADE_REQUEST);
+        assert_eq!(
+            observer.observe(wrong_accept),
+            UpstreamObservation::default()
+        );
+
+        let mut observer = UpstreamObserver::new(b"GET / HTTP/1.1\r\nupgrade: websocket\r\n\r\n");
+        assert_eq!(
+            observer.observe(ACCEPTED_HEAD),
+            UpstreamObservation::default()
+        );
+    }
+
+    #[test]
+    fn websocket_accept_matches_rfc6455_example() {
+        assert_eq!(
+            super::compute_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
     }
 }

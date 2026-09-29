@@ -172,6 +172,8 @@ pub struct PersistedTunnelMetricsDelta {
 pub struct TunnelMetricsStore {
     tunnels: RwLock<HashMap<String, Arc<TunnelMetrics>>>,
     state_store: Option<Arc<dyn StateStore>>,
+    usage_journal: Option<Arc<crate::usage_journal::UsageJournal>>,
+    quota: Option<Arc<crate::quota::QuotaManager>>,
 }
 
 impl Default for TunnelMetricsStore {
@@ -186,6 +188,8 @@ impl TunnelMetricsStore {
         Self {
             tunnels: RwLock::new(HashMap::new()),
             state_store: None,
+            usage_journal: None,
+            quota: None,
         }
     }
 
@@ -194,7 +198,32 @@ impl TunnelMetricsStore {
         Self {
             tunnels: RwLock::new(HashMap::new()),
             state_store,
+            usage_journal: None,
+            quota: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_usage_journal(
+        mut self,
+        journal: Option<Arc<crate::usage_journal::UsageJournal>>,
+    ) -> Self {
+        self.usage_journal = journal;
+        self
+    }
+
+    #[must_use]
+    pub fn usage_journal(&self) -> Option<&Arc<crate::usage_journal::UsageJournal>> {
+        self.usage_journal.as_ref()
+    }
+
+    pub fn with_quota(mut self, quota: Option<Arc<crate::quota::QuotaManager>>) -> Self {
+        self.quota = quota;
+        self
+    }
+
+    pub fn quota(&self) -> Option<&Arc<crate::quota::QuotaManager>> {
+        self.quota.as_ref()
     }
 
     pub async fn record(
@@ -230,7 +259,9 @@ impl TunnelMetricsStore {
         }
     }
 
-    pub async fn record_wss_open(&self, tunnel_id: &str) {
+    /// Count an accepted WebSocket connection as active until the returned
+    /// guard is closed or dropped (including when its task is aborted).
+    pub async fn open_wss(&self, tunnel_id: &str) -> WssConnection {
         let now = Utc::now();
         let now_unix_ms = now.timestamp_millis().max(0) as u64;
         let now_unix_sec = now.timestamp().max(0) as u64;
@@ -239,17 +270,10 @@ impl TunnelMetricsStore {
             .get_or_create(tunnel_id, now_unix_ms, now_unix_sec)
             .await;
         metrics.record_wss_open(now_unix_ms);
-    }
-
-    pub async fn record_wss_close(&self, tunnel_id: &str, reason: &str) {
-        let now = Utc::now();
-        let now_unix_ms = now.timestamp_millis().max(0) as u64;
-        let now_unix_sec = now.timestamp().max(0) as u64;
-
-        let metrics = self
-            .get_or_create(tunnel_id, now_unix_ms, now_unix_sec)
-            .await;
-        metrics.record_wss_close(now_unix_ms, reason).await;
+        WssConnection {
+            metrics,
+            reason_recorded: false,
+        }
     }
 
     pub async fn record_wss_inbound_frames(
@@ -517,6 +541,33 @@ impl TunnelMetricsStore {
     }
 }
 
+/// One active WSS connection. The active gauge is decremented exactly once,
+/// on drop, so an aborted relay task cannot leave it stuck.
+#[must_use]
+pub struct WssConnection {
+    metrics: Arc<TunnelMetrics>,
+    reason_recorded: bool,
+}
+
+impl WssConnection {
+    pub async fn close(mut self, reason: &str) {
+        *self.metrics.wss_last_close_reason.write().await = Some(reason.to_string());
+        self.reason_recorded = true;
+    }
+}
+
+impl Drop for WssConnection {
+    fn drop(&mut self) {
+        let now_unix_ms = Utc::now().timestamp_millis().max(0) as u64;
+        self.metrics.record_wss_close(now_unix_ms);
+        if !self.reason_recorded {
+            if let Ok(mut reason) = self.metrics.wss_last_close_reason.try_write() {
+                *reason = Some("aborted".to_string());
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TunnelMetrics {
     created_at_unix_sec: u64,
@@ -679,7 +730,7 @@ impl TunnelMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    async fn record_wss_close(&self, now_unix_ms: u64, reason: &str) {
+    fn record_wss_close(&self, now_unix_ms: u64) {
         self.last_activity_unix_ms
             .store(now_unix_ms, Ordering::Relaxed);
         self.wss_active_connections
@@ -687,7 +738,6 @@ impl TunnelMetrics {
                 Some(value.saturating_sub(1))
             })
             .ok();
-        *self.wss_last_close_reason.write().await = Some(reason.to_string());
     }
 
     async fn record_wss_frames(
@@ -1245,7 +1295,7 @@ mod tests {
     async fn records_live_wss_metrics() {
         let store = TunnelMetricsStore::new();
 
-        store.record_wss_open("tunnel-wss").await;
+        let connection = store.open_wss("tunnel-wss").await;
         store
             .record_wss_inbound_frames("tunnel-wss", 5, 800, 2_000)
             .await;
@@ -1272,7 +1322,7 @@ mod tests {
         assert_eq!(status.reconnects, 0);
         assert_eq!(status.close_reason.as_deref(), Some("relay_missing"));
 
-        store.record_wss_close("tunnel-wss", "client_closed").await;
+        connection.close("client_closed").await;
         let closed = store.streaming_status("tunnel-wss").await;
         assert_eq!(closed.wss_connections, 0);
         assert_eq!(closed.close_reason.as_deref(), Some("client_closed"));
@@ -1285,5 +1335,39 @@ mod tests {
         assert_eq!(timeseries.data[0].bytes_in, 800);
         assert_eq!(timeseries.data[0].bytes_out, 900);
         assert!(timeseries.data[0].frame_rate_fps > 0.0);
+    }
+
+    #[tokio::test]
+    async fn aborted_wss_connection_decrements_active_gauge_once() {
+        let store = Arc::new(TunnelMetricsStore::new());
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let connection = store.open_wss("tunnel-wss").await;
+                let _ = opened_tx.send(());
+                std::future::pending::<()>().await;
+                connection.close("unreachable").await;
+            }
+        });
+        opened_rx.await.expect("connection should open");
+        assert_eq!(
+            store.streaming_status("tunnel-wss").await.wss_connections,
+            1
+        );
+
+        task.abort();
+        assert!(task.await.expect_err("task was aborted").is_cancelled());
+
+        let status = store.streaming_status("tunnel-wss").await;
+        assert_eq!(status.wss_connections, 0);
+        assert_eq!(status.reconnects, 0);
+        assert_eq!(status.close_reason.as_deref(), Some("aborted"));
+
+        let other = store.open_wss("tunnel-wss").await;
+        other.close("client_closed").await;
+        let status = store.streaming_status("tunnel-wss").await;
+        assert_eq!(status.wss_connections, 0);
+        assert_eq!(status.close_reason.as_deref(), Some("client_closed"));
     }
 }

@@ -9,20 +9,24 @@ use pike_core::proto::StreamHeader;
 use pike_core::quic::stream_manager::StreamManager;
 use pike_core::types::TunnelId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::sync::{mpsc, watch, Mutex};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 const PORT_MIN: u16 = 10_000;
 const PORT_MAX: u16 = 65_000;
 const COPY_BUFFER_SIZE: usize = 16 * 1024;
 const BACKPRESSURE_WAIT: Duration = Duration::from_millis(10);
+const LISTENER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(60);
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TcpError {
     #[error("no available TCP port in pool")]
     PortExhausted,
+    #[error("requested TCP port {0} is outside the pool or already allocated")]
+    PortUnavailable(u16),
     #[error("failed to bind TCP listener on {0}: {1}")]
     Bind(SocketAddr, std::io::Error),
     #[error("listener not found for tunnel {0}")]
@@ -39,17 +43,37 @@ pub enum TcpError {
 
 #[derive(Debug)]
 pub struct TcpTunnelManager {
-    listeners: DashMap<TunnelId, TcpListenerHandle>,
-    dispatchers: DashMap<TunnelId, mpsc::Sender<TcpStream>>,
+    listeners: DashMap<TunnelId, ListenerEntry>,
+    lifecycle: Mutex<()>,
     port_pool: Arc<Mutex<PortPool>>,
     stream_manager: Arc<StreamManager>,
+    /// Public interface for tunnel listeners; wildcard unless the operator
+    /// dedicates an address (for example two relays on one multi-homed host).
+    bind_ip: Ipv4Addr,
+}
+
+#[derive(Debug)]
+struct ListenerEntry {
+    handle: TcpListenerHandle,
+    task: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone)]
 pub struct TcpListenerHandle {
     pub tunnel_id: TunnelId,
     pub local_addr: SocketAddr,
-    shutdown_tx: mpsc::Sender<()>,
+    shutdown_tx: watch::Sender<bool>,
+    dispatcher_tx: watch::Sender<Option<mpsc::Sender<TcpStream>>>,
+    handoff: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for TcpTunnelManager {
+    fn drop(&mut self) {
+        for listener in &self.listeners {
+            listener.handle.dispatcher_tx.send_replace(None);
+            listener.task.abort();
+        }
+    }
 }
 
 impl TcpTunnelManager {
@@ -57,10 +81,17 @@ impl TcpTunnelManager {
     pub fn new(stream_manager: Arc<StreamManager>) -> Self {
         Self {
             listeners: DashMap::new(),
-            dispatchers: DashMap::new(),
+            lifecycle: Mutex::new(()),
             port_pool: Arc::new(Mutex::new(PortPool::new())),
             stream_manager,
+            bind_ip: Ipv4Addr::UNSPECIFIED,
         }
+    }
+
+    #[must_use]
+    pub fn with_bind_ip(mut self, bind_ip: Ipv4Addr) -> Self {
+        self.bind_ip = bind_ip;
+        self
     }
 
     pub async fn create_listener(
@@ -78,26 +109,57 @@ impl TcpTunnelManager {
         preferred_port: Option<u16>,
         dispatcher: mpsc::Sender<TcpStream>,
     ) -> Result<TcpListenerHandle, TcpError> {
-        self.dispatchers.insert(tunnel_id, dispatcher);
-        self.create_listener_inner(tunnel_id, preferred_port, Some(tunnel_id))
+        self.create_listener_inner(tunnel_id, preferred_port, Some(dispatcher))
             .await
     }
 
     pub async fn close_listener(&self, tunnel_id: TunnelId) {
-        if let Some((_, handle)) = self.listeners.remove(&tunnel_id) {
-            let _ = handle.shutdown_tx.send(()).await;
-            let mut pool = self.port_pool.lock().await;
-            pool.release(handle.local_addr.port());
-        }
+        let _guard = self.lifecycle.lock().await;
+        self.close_listener_inner(tunnel_id).await;
+    }
 
-        self.dispatchers.remove(&tunnel_id);
+    /// Stop forwarding while preserving this runtime's bound port for one
+    /// bounded lease-driven reconnect. Ordinary disconnects still close it.
+    pub async fn park_listener(&self, tunnel_id: TunnelId) {
+        let _guard = self.lifecycle.lock().await;
+        if let Some(entry) = self.listeners.get(&tunnel_id) {
+            if !entry.task.is_finished() {
+                entry.handle.handoff.store(true, Ordering::Release);
+                entry.handle.dispatcher_tx.send_replace(None);
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn parked_port(&self, tunnel_id: TunnelId) -> Option<u16> {
+        self.listeners
+            .get(&tunnel_id)
+            .filter(|entry| {
+                !entry.task.is_finished()
+                    && entry.handle.handoff.load(Ordering::Acquire)
+                    && entry.handle.dispatcher_tx.borrow().is_none()
+            })
+            .map(|entry| entry.handle.local_addr.port())
+    }
+
+    async fn close_listener_inner(&self, tunnel_id: TunnelId) {
+        if let Some((_, entry)) = self.listeners.remove(&tunnel_id) {
+            let _ = entry.handle.shutdown_tx.send(true);
+            entry.handle.dispatcher_tx.send_replace(None);
+            let _ = entry.task.await;
+            self.port_pool
+                .lock()
+                .await
+                .release(entry.handle.local_addr.port());
+        }
     }
 
     #[must_use]
     pub fn active_listeners(&self) -> Vec<(TunnelId, SocketAddr)> {
+        self.listeners.retain(|_, entry| !entry.task.is_finished());
         self.listeners
             .iter()
-            .map(|entry| (*entry.key(), entry.local_addr))
+            .map(|entry| (*entry.key(), entry.handle.local_addr))
             .collect()
     }
 
@@ -110,83 +172,146 @@ impl TcpTunnelManager {
         &self,
         tunnel_id: TunnelId,
         preferred_port: Option<u16>,
-        dispatcher_tunnel: Option<TunnelId>,
+        dispatcher: Option<mpsc::Sender<TcpStream>>,
     ) -> Result<TcpListenerHandle, TcpError> {
-        if self.listeners.contains_key(&tunnel_id) {
-            self.close_listener(tunnel_id).await;
+        let _guard = self.lifecycle.lock().await;
+        if let Some(entry) = self.listeners.get(&tunnel_id) {
+            if !entry.task.is_finished()
+                && entry.handle.handoff.load(Ordering::Acquire)
+                && entry.handle.dispatcher_tx.borrow().is_none()
+                && preferred_port.is_none_or(|port| port == entry.handle.local_addr.port())
+                && dispatcher.is_some()
+            {
+                entry.handle.handoff.store(false, Ordering::Release);
+                entry.handle.dispatcher_tx.send_replace(dispatcher);
+                return Ok(entry.handle.clone());
+            }
         }
-
+        self.close_listener_inner(tunnel_id).await;
+        self.listeners.retain(|_, entry| !entry.task.is_finished());
         let listener = self.bind_listener(preferred_port).await?;
         let local_addr = listener.local_addr()?;
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-        let dispatchers = self.dispatchers.clone();
-
-        tokio::spawn(async move {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (dispatcher_tx, mut dispatcher_rx) = watch::channel(dispatcher);
+        let handoff = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending_handoff = handoff.clone();
+        let pool = self.port_pool.clone();
+        let task = tokio::spawn(async move {
+            let mut handoff_deadline = None;
             loop {
+                let dispatcher = dispatcher_rx.borrow_and_update().clone();
+                if pending_handoff.load(Ordering::Acquire) && dispatcher.is_none() {
+                    handoff_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + LISTENER_HANDOFF_TIMEOUT
+                    });
+                } else {
+                    handoff_deadline = None;
+                }
                 tokio::select! {
-                    maybe_shutdown = shutdown_rx.recv() => {
-                        if maybe_shutdown.is_some() {
-                            break;
-                        }
-                    }
-                    accepted = listener.accept() => {
-                        match accepted {
-                            Ok((stream, _peer)) => {
-                                if let Some(dispatch_tunnel_id) = dispatcher_tunnel {
-                                    if let Some(dispatcher) = dispatchers.get(&dispatch_tunnel_id) {
-                                        if dispatcher.send(stream).await.is_err() {
-                                            tracing::warn!(tunnel_id = %dispatch_tunnel_id, "TCP dispatcher dropped");
-                                        }
-                                    }
+                    biased;
+                    _ = shutdown_rx.changed() => break,
+                    changed = dispatcher_rx.changed() => { if changed.is_err() { break; } },
+                    _ = async {
+                        if let Some(deadline) = handoff_deadline { tokio::time::sleep_until(deadline).await; }
+                        else { std::future::pending::<()>().await; }
+                    } => break,
+                    _ = async {
+                        if let Some(dispatcher) = &dispatcher { dispatcher.closed().await; }
+                        else { std::future::pending::<()>().await; }
+                    } => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, _)) => {
+                            if let Some(dispatcher) = &dispatcher {
+                                // Shutdown remains responsive while the bounded
+                                // accept queue applies backpressure.
+                                tokio::select! {
+                                    biased;
+                                    _ = shutdown_rx.changed() => break,
+                                    changed = dispatcher_rx.changed() => if changed.is_err() { break; },
+                                    result = dispatcher.send(stream) => if result.is_err() { break; },
                                 }
                             }
-                            Err(error) => {
-                                tracing::warn!(tunnel_id = %tunnel_id, error = %error, "TCP accept failed");
-                                break;
-                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%tunnel_id, %error, "TCP accept failed");
+                            break;
                         }
                     }
                 }
             }
+            drop(listener);
+            pool.lock().await.release(local_addr.port());
         });
-
         let handle = TcpListenerHandle {
             tunnel_id,
             local_addr,
             shutdown_tx,
+            dispatcher_tx,
+            handoff,
         };
-        self.listeners.insert(tunnel_id, handle.clone());
+        self.listeners.insert(
+            tunnel_id,
+            ListenerEntry {
+                handle: handle.clone(),
+                task,
+            },
+        );
         Ok(handle)
+    }
+
+    fn bind_public_socket(addr: SocketAddr) -> std::io::Result<TcpSocket> {
+        let socket = TcpSocket::new_v4()?;
+        // On macOS, SO_REUSEADDR allows a wildcard listener to overlap an
+        // existing loopback listener. That can send clients to another app.
+        // Retain Linux's TIME_WAIT reuse; disable address reuse elsewhere.
+        socket.set_reuseaddr(cfg!(target_os = "linux"))?;
+        socket.bind(addr)?;
+        Ok(socket)
+    }
+
+    /// Cheap local validation before charging a tunnel creation attempt. The
+    /// real bind below remains authoritative if another process claims the port
+    /// afterward. This probe never listens or accepts a connection.
+    pub fn check_requested_port(&self, port: u16) -> Result<(), TcpError> {
+        if !(PORT_MIN..=PORT_MAX).contains(&port) {
+            return Err(TcpError::PortUnavailable(port));
+        }
+        let addr = SocketAddr::new(IpAddr::V4(self.bind_ip), port);
+        Self::bind_public_socket(addr).map_err(|error| TcpError::Bind(addr, error))?;
+        Ok(())
+    }
+
+    /// Shared by tunnel listeners and ingress frontend forwarders so both keep
+    /// the same interface-overlap protection.
+    pub fn bind_public_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+        Self::bind_public_socket(addr)?.listen(1024)
     }
 
     async fn bind_listener(&self, preferred_port: Option<u16>) -> Result<TcpListener, TcpError> {
         let mut pool = self.port_pool.lock().await;
-
         if let Some(port) = preferred_port {
-            if let Some(allocated) = pool.allocate(Some(port)) {
-                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), allocated);
-                match TcpListener::bind(addr).await {
-                    Ok(listener) => return Ok(listener),
-                    Err(error) => {
-                        pool.release(allocated);
-                        return Err(TcpError::Bind(addr, error));
-                    }
+            let allocated = pool
+                .allocate(Some(port))
+                .ok_or(TcpError::PortUnavailable(port))?;
+            let addr = SocketAddr::new(IpAddr::V4(self.bind_ip), allocated);
+            return match Self::bind_public_listener(addr) {
+                Ok(listener) => Ok(listener),
+                Err(error) => {
+                    pool.release(allocated);
+                    Err(TcpError::Bind(addr, error))
                 }
-            }
+            };
         }
-
         for _ in 0..64 {
             let Some(port) = pool.allocate(None) else {
                 break;
             };
-
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-            match TcpListener::bind(addr).await {
+            let addr = SocketAddr::new(IpAddr::V4(self.bind_ip), port);
+            match Self::bind_public_listener(addr) {
                 Ok(listener) => return Ok(listener),
                 Err(_) => pool.release(port),
             }
         }
-
         Err(TcpError::PortExhausted)
     }
 }
@@ -414,6 +539,7 @@ pub async fn handle_tcp_connection<Q: QuicConnectionIo>(
         connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
         source_addr,
         streaming: false,
+        mode: pike_core::proto::StreamMode::Raw,
     };
     let header_frame = framed_postcard(&header)?;
     send_with_backpressure(quic_conn, stream_id, &header_frame, false).await?;
@@ -591,6 +717,7 @@ mod tests {
             connection_id: 42,
             source_addr: "127.0.0.1:12345".parse().expect("valid addr"),
             streaming: false,
+            mode: pike_core::proto::StreamMode::Raw,
         };
 
         let frame = framed_postcard(&header).expect("encode framed header");
@@ -703,5 +830,197 @@ mod tests {
                 .any(|(stream_id, direction)| *stream_id == 4
                     && *direction == quiche::Shutdown::Write)
         );
+    }
+    #[tokio::test]
+    async fn occupied_interface_port_is_rejected_without_displacing_its_owner() {
+        let owner = loop {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            if listener.local_addr().unwrap().port() <= PORT_MAX {
+                break listener;
+            }
+        };
+        let addr = owner.local_addr().unwrap();
+        let manager = TcpTunnelManager::new(Arc::new(StreamManager::new()));
+        assert!(
+            matches!(
+                manager
+                    .create_listener(TunnelId::new(), Some(addr.port()))
+                    .await,
+                Err(TcpError::Bind(_, _))
+            ),
+            "wildcard listener must not overlap another interface's listener"
+        );
+        assert!(manager.active_listeners().is_empty());
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"owner").await.unwrap();
+        let (mut accepted, _) = owner.accept().await.unwrap();
+        let mut bytes = [0; 5];
+        accepted.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"owner");
+        *manager.port_pool.lock().await = PortPool::from_ports(vec![addr.port()]);
+        assert!(
+            matches!(
+                manager.create_listener(TunnelId::new(), None).await,
+                Err(TcpError::PortExhausted)
+            ),
+            "automatic allocation must skip an occupied interface port too"
+        );
+        assert!(manager.active_listeners().is_empty());
+    }
+
+    #[tokio::test]
+    async fn requested_ports_never_silently_fall_back() {
+        let manager = TcpTunnelManager::new(Arc::new(StreamManager::new()));
+        assert!(matches!(
+            manager.create_listener(TunnelId::new(), Some(80)).await,
+            Err(TcpError::PortUnavailable(80))
+        ));
+        let first = manager
+            .create_listener(TunnelId::new(), None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager
+                .create_listener(TunnelId::new(), Some(first.local_addr.port()))
+                .await,
+            Err(TcpError::PortUnavailable(_))
+        ));
+        manager.close_listener(first.tunnel_id).await;
+    }
+
+    #[tokio::test]
+    async fn replacing_dispatcher_delivers_only_to_the_new_receiver() {
+        let manager = TcpTunnelManager::new(Arc::new(StreamManager::new()));
+        let id = TunnelId::new();
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let first = manager
+            .create_listener_with_dispatcher(id, None, old_tx)
+            .await
+            .unwrap();
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        let second = manager
+            .create_listener_with_dispatcher(id, Some(first.local_addr.port()), new_tx)
+            .await
+            .unwrap();
+        let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, second.local_addr.port()))
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), new_rx.recv())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(old_rx.recv().await.is_none());
+        manager.close_listener(id).await;
+    }
+
+    #[tokio::test]
+    async fn listener_shutdown_interrupts_a_full_dispatch_queue() {
+        let manager = TcpTunnelManager::new(Arc::new(StreamManager::new()));
+        let id = TunnelId::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let handle = manager
+            .create_listener_with_dispatcher(id, None, tx.clone())
+            .await
+            .unwrap();
+        let _first = TcpStream::connect((Ipv4Addr::LOCALHOST, handle.local_addr.port()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tx.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _second = TcpStream::connect((Ipv4Addr::LOCALHOST, handle.local_addr.port()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), manager.close_listener(id))
+            .await
+            .unwrap();
+        let _rebound = TcpListener::bind(handle.local_addr).await.unwrap();
+        assert!(manager.active_listeners().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_manager_stops_listener_even_if_a_handle_is_retained() {
+        let manager = TcpTunnelManager::new(Arc::new(StreamManager::new()));
+        let handle = manager
+            .create_listener(TunnelId::new(), None)
+            .await
+            .unwrap();
+        drop(manager);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if TcpListener::bind(handle.local_addr).await.is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lease_handoff_reuses_only_the_same_runtime_listener_without_rebinding() {
+        let manager = TcpTunnelManager::new(Arc::new(StreamManager::new()));
+        let id = TunnelId::new();
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let listener = manager
+            .create_listener_with_dispatcher(id, None, old_tx)
+            .await
+            .unwrap();
+        let address = ("127.0.0.1", listener.local_addr.port());
+        let old_client = TcpStream::connect(address).await.unwrap();
+        let old_accepted = old_rx.recv().await.unwrap();
+        manager.park_listener(id).await;
+        assert_eq!(manager.parked_port(id), Some(address.1));
+        let (foreign_tx, _foreign_rx) = mpsc::channel(1);
+        assert!(manager
+            .create_listener_with_dispatcher(TunnelId::new(), Some(address.1), foreign_tx)
+            .await
+            .is_err());
+        let mut parked_client = TcpStream::connect(address).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), parked_client.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        let reused = manager
+            .create_listener_with_dispatcher(id, Some(address.1), new_tx)
+            .await
+            .unwrap();
+        assert_eq!(reused.local_addr, listener.local_addr);
+        assert_eq!(manager.parked_port(id), None);
+        let new_client = TcpStream::connect(address).await.unwrap();
+        let new_accepted = tokio::time::timeout(Duration::from_secs(2), new_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(old_rx.try_recv().is_err());
+        drop((old_client, old_accepted, new_client, new_accepted));
+        manager.close_listener(id).await;
+        assert!(manager.active_listeners().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unused_listener_handoff_expires_instead_of_reserving_a_port_forever() {
+        let manager = TcpTunnelManager::new(Arc::new(StreamManager::new()));
+        let id = TunnelId::new();
+        let (sender, _accepted) = mpsc::channel(1);
+        manager
+            .create_listener_with_dispatcher(id, None, sender)
+            .await
+            .unwrap();
+        manager.park_listener(id).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(LISTENER_HANDOFF_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(manager.parked_port(id), None);
+        assert!(manager.active_listeners().is_empty());
     }
 }

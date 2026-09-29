@@ -7,7 +7,7 @@ use std::str::FromStr;
 use crate::metrics::metrics_handler;
 use anyhow::Context;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header::AUTHORIZATION, Request, Response, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -118,7 +118,7 @@ pub fn management_router(registry: Arc<ClientRegistry>, internal_token: &str) ->
         .route("/api/connections", get(get_connections))
         // Fix #6c: authenticated push endpoints that act on the LIVE registry so the
         // control-plane admin gets an immediate enforcement path. They degrade
-        // gracefully: if unreachable, the D1 status + revalidation poll still enforces.
+        // gracefully: if unreachable, the D1 status + session revalidation still enforces.
         .route("/api/tunnels/{id}/suspend", post(suspend_tunnel_handler))
         .route(
             "/api/tunnels/{id}/unsuspend",
@@ -127,6 +127,7 @@ pub fn management_router(registry: Arc<ClientRegistry>, internal_token: &str) ->
         .route("/api/users/{id}/disconnect", post(disconnect_user_handler))
         .route("/api/users/{id}/ban", post(ban_user_handler))
         .route("/api/users/{id}/unban", post(unban_user_handler))
+        .route("/api/ingress/routes", get(get_ingress_routes))
         .with_state(state)
         .layer(
             ServiceBuilder::new().layer(AsyncRequireAuthorizationLayer::new(
@@ -135,6 +136,53 @@ pub fn management_router(registry: Arc<ClientRegistry>, internal_token: &str) ->
         );
 
     Router::new().merge(authenticated)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngressQuery {
+    nonce: String,
+}
+
+async fn get_ingress_routes(
+    State(state): State<ManagementState>,
+    Query(query): Query<IngressQuery>,
+) -> Response<Body> {
+    if query.nonce.len() != 32 || !query.nonce.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("cache-control", "no-store")
+            .body(Body::from("invalid nonce"))
+            .unwrap();
+    }
+    let result = state
+        .registry
+        .ingress
+        .snapshot(&query.nonce)
+        .and_then(|snapshot| Ok(serde_json::to_vec(&snapshot)?))
+        .and_then(|body| {
+            anyhow::ensure!(
+                body.len() <= crate::ingress_directory::MAX_RESPONSE_BYTES,
+                "ingress snapshot too large"
+            );
+            Ok(body)
+        });
+    match result {
+        Ok(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .header("cache-control", "no-store")
+            .body(Body::from(body))
+            .unwrap(),
+        Err(error) => {
+            tracing::warn!(%error, "ingress snapshot unavailable");
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("cache-control", "no-store")
+                .body(Body::from("ingress snapshot unavailable"))
+                .unwrap()
+        }
+    }
 }
 
 pub async fn run_management_server(
@@ -246,7 +294,9 @@ fn json_error(status: StatusCode, message: &str) -> Response<Body> {
 }
 
 /// POST /api/tunnels/:id/suspend — suspend a tunnel on the live registry (persists to
-/// the state store via the abuse detector).
+/// the state store via the abuse detector). The Worker sends the canonical DB UUID,
+/// while traffic enforcement keys on runtime tunnel IDs, so the ID is resolved to
+/// every registered runtime member before suspending.
 async fn suspend_tunnel_handler(
     State(state): State<ManagementState>,
     Path(tunnel_id): Path<String>,
@@ -254,13 +304,13 @@ async fn suspend_tunnel_handler(
     let Ok(parsed) = Uuid::from_str(&tunnel_id) else {
         return json_error(StatusCode::BAD_REQUEST, "invalid tunnel_id");
     };
-    match state
-        .registry
-        .abuse_detector
-        .suspend_tunnel(TunnelId(parsed))
-    {
-        Ok(()) => {
-            tracing::warn!(tunnel_id = %tunnel_id, "tunnel suspended via management API");
+    match state.registry.suspend_tunnel_identity(TunnelId(parsed)) {
+        Ok(members) => {
+            tracing::warn!(
+                tunnel_id = %tunnel_id,
+                runtime_members = ?members,
+                "tunnel suspended via management API"
+            );
             json_ok("tunnel suspended")
         }
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -268,7 +318,8 @@ async fn suspend_tunnel_handler(
 }
 
 /// POST /api/tunnels/:id/unsuspend — lift a tunnel suspension on the live registry
-/// (clears the state-store record via the abuse detector).
+/// (clears the state-store record via the abuse detector) for the ID and every
+/// registered runtime member, mirroring the suspend handler.
 async fn unsuspend_tunnel_handler(
     State(state): State<ManagementState>,
     Path(tunnel_id): Path<String>,
@@ -276,13 +327,13 @@ async fn unsuspend_tunnel_handler(
     let Ok(parsed) = Uuid::from_str(&tunnel_id) else {
         return json_error(StatusCode::BAD_REQUEST, "invalid tunnel_id");
     };
-    match state
-        .registry
-        .abuse_detector
-        .unsuspend_tunnel(TunnelId(parsed))
-    {
-        Ok(()) => {
-            tracing::warn!(tunnel_id = %tunnel_id, "tunnel unsuspended via management API");
+    match state.registry.unsuspend_tunnel_identity(TunnelId(parsed)) {
+        Ok(members) => {
+            tracing::warn!(
+                tunnel_id = %tunnel_id,
+                runtime_members = ?members,
+                "tunnel unsuspended via management API"
+            );
             json_ok("tunnel unsuspended")
         }
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -295,7 +346,7 @@ async fn disconnect_user_handler(
     State(state): State<ManagementState>,
     Path(user_id): Path<String>,
 ) -> Response<Body> {
-    if let Err(error) = state.registry.kill_user_tunnels(&user_id).await {
+    if let Err(error) = state.registry.kill_user_tunnels(&user_id) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     tracing::warn!(user_id = %user_id, "user disconnected via management API");
@@ -311,7 +362,7 @@ async fn ban_user_handler(
     if let Err(error) = state.registry.abuse_detector.ban_user(user_id.clone()) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    if let Err(error) = state.registry.kill_user_tunnels(&user_id).await {
+    if let Err(error) = state.registry.kill_user_tunnels(&user_id) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     tracing::warn!(user_id = %user_id, "user banned via management API");
@@ -454,6 +505,73 @@ mod tests {
         let response = app.oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(registry.abuse_detector.is_suspended(&tunnel_id));
+    }
+
+    /// The Worker addresses tunnels by canonical DB UUID, but forwarders check the
+    /// runtime tunnel ID. Suspend/unsuspend must cover every runtime member of that
+    /// canonical identity and leave unrelated tunnels alone.
+    #[tokio::test]
+    async fn suspend_and_unsuspend_cover_every_runtime_member_of_a_canonical_id() {
+        use pike_core::types::TunnelId;
+
+        let registry = Arc::new(ClientRegistry::new());
+        let add_tunnel = |host: &str, canonical: &str| {
+            let conn_id = uuid::Uuid::new_v4();
+            let mut client = ClientConnection::new(conn_id, None);
+            client.state = crate::connection::ConnectionState::Authenticated;
+            registry.register_client(client).expect("register client");
+            let runtime = TunnelId::new();
+            registry
+                .register_new_tunnel(conn_id, host.into(), runtime, canonical.into(), true)
+                .expect("register tunnel");
+            runtime
+        };
+
+        let canonical = uuid::Uuid::new_v4();
+        let member_a = add_tunnel("member-a.test", &canonical.to_string());
+        let member_b = add_tunnel("member-b.test", &canonical.to_string());
+        let unrelated = add_tunnel("unrelated.test", &uuid::Uuid::new_v4().to_string());
+        assert_ne!(member_a, member_b);
+        // The latest-runtime mapping alone only knows one member.
+        assert_eq!(
+            registry.runtime_tunnel_id(&canonical.to_string()),
+            member_b.to_string()
+        );
+
+        let app = management_router(registry.clone(), TOKEN);
+        let post = |path: String| {
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .expect("request")
+        };
+
+        let response = app
+            .clone()
+            .oneshot(post(format!("/api/tunnels/{canonical}/suspend")))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let detector = &registry.abuse_detector;
+        assert!(detector.is_suspended(&member_a));
+        assert!(detector.is_suspended(&member_b));
+        assert!(detector.is_suspended(&TunnelId(canonical)));
+        assert!(!detector.is_suspended(&unrelated));
+        assert!(registry.lookup_tunnel("unrelated.test").is_some());
+
+        let response = app
+            .oneshot(post(format!("/api/tunnels/{canonical}/unsuspend")))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!detector.is_suspended(&member_a));
+        assert!(!detector.is_suspended(&member_b));
+        assert!(!detector.is_suspended(&TunnelId(canonical)));
+        assert!(!detector.is_suspended(&unrelated));
+        // Suspension never removes routing for anyone.
+        assert_eq!(registry.active_tunnels(), 3);
     }
 
     #[tokio::test]
