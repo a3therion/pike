@@ -412,6 +412,9 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|s| s.strip_prefix("Bearer "))
 }
 
+// These guards return the ready-to-send rejection response as their `Err`, the
+// idiomatic axum shape; boxing it would add allocation without changing behaviour.
+#[allow(clippy::result_large_err)]
 async fn authenticate_platform_user(
     state: &HttpState,
     headers: &HeaderMap,
@@ -419,6 +422,7 @@ async fn authenticate_platform_user(
     authenticate_platform_user_for_scope(state, headers, "analytics:read").await
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) async fn authenticate_platform_user_for_scope(
     state: &HttpState,
     headers: &HeaderMap,
@@ -461,6 +465,7 @@ pub(super) async fn authenticate_platform_user_for_scope(
         })
 }
 
+#[allow(clippy::result_large_err)]
 async fn ensure_tunnel_access(
     state: &HttpState,
     headers: &HeaderMap,

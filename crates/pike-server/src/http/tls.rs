@@ -106,7 +106,7 @@ struct Shared {
 
 enum Outcome {
     Served,
-    Forward(TlsForward, OwnedSemaphorePermit),
+    Forward(Box<TlsForward>, OwnedSemaphorePermit),
 }
 
 async fn injected(receiver: &mut Option<mpsc::Receiver<InjectedTls>>) -> Option<InjectedTls> {
@@ -200,7 +200,7 @@ async fn admit(
                 let target = Target::hostname(Protocol::Https, &hostname);
                 if frontend.resolve(&target).is_some() {
                     let forward = frontend.forward_tls(&target, io, prefix, addr).await?;
-                    return Ok(Outcome::Forward(forward, permit));
+                    return Ok(Outcome::Forward(Box::new(forward), permit));
                 }
             }
             anyhow::bail!("unknown HTTPS endpoint");
@@ -270,7 +270,7 @@ async fn admit(
                 || watch::channel(false).1,
                 |frontend| frontend.shutdown_signal(),
             );
-            forward.pipe(shutdown).await;
+            (*forward).pipe(shutdown).await;
         }
         _ => tracing::debug!(%addr, "native HTTPS handshake rejected"),
     }

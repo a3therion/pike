@@ -31,7 +31,7 @@ impl Cidr {
     }
 
     /// RFC 1918 or 100.64.0.0/10, never the default route.
-    pub fn is_private(&self) -> bool {
+    pub fn is_private(self) -> bool {
         let first = u32::from(self.address);
         let last = first
             | if self.prefix >= 32 {
@@ -49,7 +49,7 @@ impl Cidr {
         .any(|(lo, hi)| first >= *lo && last <= *hi)
     }
 
-    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+    pub fn contains(self, ip: Ipv4Addr) -> bool {
         let mask = if self.prefix == 0 {
             0
         } else {
@@ -59,7 +59,7 @@ impl Cidr {
     }
 
     /// nft element text: a host is written bare, anything else as a prefix.
-    pub fn nft(&self) -> String {
+    pub fn nft(self) -> String {
         if self.prefix == 32 {
             self.address.to_string()
         } else {

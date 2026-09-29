@@ -258,7 +258,7 @@ mod tests {
                 .handshake(TokioIo::new(socket))
                 .await
                 .unwrap();
-        let driver = tokio::spawn(async move { connection.await });
+        let driver = tokio::spawn(connection);
         let request = Request::builder()
             .uri("http://pike.test/endless")
             .body(Body::empty())

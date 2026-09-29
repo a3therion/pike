@@ -212,6 +212,10 @@ pub struct DashboardWsState {
 /// credential the live connection keeps revalidating. Prefers a single-use `ticket`;
 /// falls back to the legacy `token` (self-hosted static key or JWT) so older/degraded
 /// clients keep working.
+///
+/// The `Err` is the ready-to-send rejection response, the idiomatic axum shape for
+/// an auth guard; boxing it would add allocation without changing behaviour.
+#[allow(clippy::result_large_err)]
 async fn authenticate_dashboard_ws(
     state: &DashboardWsState,
     query: &DashboardWsQuery,

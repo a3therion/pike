@@ -686,11 +686,7 @@ mod tests {
             let closed = timeout(Duration::from_secs(5), socket.next())
                 .await
                 .unwrap();
-            assert!(
-                closed.is_none()
-                    || closed
-                        .is_some_and(|message| message.is_err() || message.unwrap().is_close())
-            );
+            assert!(closed.is_none_or(|message| message.is_err() || message.unwrap().is_close()));
         });
         let first = opening();
         let (task, input, mut output) = running_tunnel(addr.port(), &first);

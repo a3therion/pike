@@ -631,10 +631,10 @@ mod tests {
         let frame = server_frame(0x2, b"early");
         let mut observer = UpstreamObserver::new(UPGRADE_REQUEST);
 
-        let observed = observer.observe(&[ACCEPTED_HEAD, &frame[..]].concat());
+        let observation = observer.observe(&[ACCEPTED_HEAD, &frame[..]].concat());
 
         assert_eq!(
-            observed,
+            observation,
             UpstreamObservation {
                 accepted: true,
                 frames: 1,

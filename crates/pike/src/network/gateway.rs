@@ -30,6 +30,7 @@
 //!   unowned is touched while anything is unknown;
 //! - teardown flushes authorization, removes the interface and deletes the
 //!   table last; unless the interface is confirmed gone the table stays.
+//!
 //! Nothing global is ever flushed, replaced or forwarded.
 use super::api::{Api, ApiError, Desired, PeerReport, StatusReport};
 use super::keys::{self, MemberState};
@@ -711,7 +712,7 @@ impl Gateway {
         })
     }
 
-    fn table_definition(&self, pool: &Cidr) -> String {
+    fn table_definition(&self, pool: Cidr) -> String {
         match &self.lan_if {
             Some(lan) => render::site_table(&self.table, &self.ifname, lan, pool, &self.owner),
             None => render::hub_table(&self.table, &self.ifname, &self.owner),
@@ -779,7 +780,7 @@ impl Gateway {
                 self.table
             );
         }
-        let definition = self.table_definition(&plan.pool);
+        let definition = self.table_definition(plan.pool);
         exec_within(
             NFT_BUDGET,
             "nft",
@@ -884,7 +885,7 @@ impl Gateway {
             )
             .await?;
         }
-        self.applied_routes = desired.clone();
+        self.applied_routes.clone_from(desired);
         Ok(())
     }
 
@@ -927,7 +928,7 @@ impl Gateway {
                 }
                 Step::ReconcileRoutes => self.reconcile_routes(&plan.kernel_routes).await?,
                 Step::InstallAuthorization => {
-                    lease = self.install(&plan.authorization, started).await?
+                    lease = self.install(&plan.authorization, started).await?;
                 }
             }
         }

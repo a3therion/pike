@@ -1026,7 +1026,7 @@ impl ClientRegistry {
         self.request_count.load(Ordering::Relaxed) as f64 / elapsed_minutes
     }
 
-    pub async fn kill_user_tunnels(&self, user_id: &str) -> anyhow::Result<()> {
+    pub fn kill_user_tunnels(&self, user_id: &str) -> anyhow::Result<()> {
         let matches: Vec<(ConnectionId, Option<String>)> = self
             .clients
             .iter()

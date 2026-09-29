@@ -223,6 +223,9 @@ pub fn load(paths: &MemberPaths) -> Result<MemberState> {
 }
 
 /// The private key is read only by gateway and config commands and never logged.
+// The octal mask below spells out "no group/other bits"; the trailing_zeros form
+// clippy suggests hides which permission classes are being denied.
+#[allow(clippy::verbose_bit_mask)]
 pub fn load_private_key(paths: &MemberPaths) -> Result<String> {
     #[cfg(unix)]
     {
@@ -413,8 +416,7 @@ mod tests {
         let (_, found) = find_state(&config, "lab", "c1").unwrap();
         assert!(found.is_pending());
         let refused = require_committed(&found)
-            .err()
-            .expect("a pending record is not a committed enrollment")
+            .expect_err("a pending record is not a committed enrollment")
             .to_string();
         assert!(
             refused.contains("pending")
@@ -444,8 +446,7 @@ mod tests {
         // A key file without a record is never silently reused or deleted.
         fs::remove_file(&paths.state).unwrap();
         assert!(load_existing(&paths)
-            .err()
-            .expect("orphan key must be reported")
+            .expect_err("orphan key must be reported")
             .to_string()
             .contains("without an enrollment record"));
     }

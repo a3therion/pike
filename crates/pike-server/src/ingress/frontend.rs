@@ -646,8 +646,8 @@ impl Frontend {
                         if peers.get(&peer).is_some_and(|(current, _)| *current == id) { peers.remove(&peer); }
                     }
                 }
-                received = socket.recv_from(&mut buffer) => {
-                    let Ok((size, peer)) = received else { break; };
+                datagram = socket.recv_from(&mut buffer) => {
+                    let Ok((size, peer)) = datagram else { break; };
                     if size > MAX_PACKET_BYTES { continue; }
                     if let Some((_, sender)) = peers.get(&peer) {
                         // Drop complete packets under pressure, never fragments.
@@ -1277,7 +1277,7 @@ mod tests {
         use hyper::{server::conn::http1, service::service_fn};
         let (client, server) = tokio::io::duplex(65_536);
         let task = tokio::spawn(async move {
-            let (upgrades, mut upgraded) = mpsc::channel::<hyper::upgrade::OnUpgrade>(1);
+            let (upgrades, mut upgrade_rx) = mpsc::channel::<hyper::upgrade::OnUpgrade>(1);
             let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
                 let upgrades = upgrades.clone();
                 async move {
@@ -1301,7 +1301,7 @@ mod tests {
                     .with_upgrades()
                     .await;
             });
-            if let Some(on_upgrade) = upgraded.recv().await {
+            if let Some(on_upgrade) = upgrade_rx.recv().await {
                 if let Ok(io) = on_upgrade.await {
                     let mut io = TokioIo::new(io);
                     let mut sink = vec![0_u8; 4096];
@@ -1331,7 +1331,7 @@ mod tests {
     async fn pending_downstream() -> (hyper::upgrade::OnUpgrade, tokio::io::DuplexStream) {
         use hyper::{server::conn::http1, service::service_fn};
         let (mut visitor, server) = tokio::io::duplex(4096);
-        let (upgrades, mut upgraded) = mpsc::channel::<hyper::upgrade::OnUpgrade>(1);
+        let (upgrades, mut upgrade_rx) = mpsc::channel::<hyper::upgrade::OnUpgrade>(1);
         tokio::spawn(async move {
             let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
                 let upgrades = upgrades.clone();
@@ -1349,7 +1349,7 @@ mod tests {
             .write_all(b"GET /socket HTTP/1.1\r\nhost: demo.pike.test\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n")
             .await
             .unwrap();
-        (upgraded.recv().await.unwrap(), visitor)
+        (upgrade_rx.recv().await.unwrap(), visitor)
     }
 
     /// Polls `body` to its end: `Err` for a cut response, `Ok` for a clean end.
@@ -1358,7 +1358,7 @@ mod tests {
         timeout(Duration::from_secs(5), async {
             loop {
                 match body.frame().await {
-                    Some(Ok(_)) => continue,
+                    Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error.to_string()),
                     None => return Ok(()),
                 }
@@ -1489,7 +1489,7 @@ mod tests {
         let outcome = timeout(Duration::from_secs(5), async {
             loop {
                 match body.frame().await {
-                    Some(Ok(_)) => continue,
+                    Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error.to_string()),
                     None => return Ok(()),
                 }
@@ -1677,7 +1677,7 @@ mod tests {
         let ended = timeout(Duration::from_secs(5), async {
             loop {
                 match body.frame().await {
-                    Some(Ok(_)) => continue,
+                    Some(Ok(_)) => {}
                     Some(Err(error)) => return Some(error.to_string()),
                     None => return None,
                 }

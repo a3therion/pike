@@ -227,9 +227,10 @@ impl Session {
                 return true;
             }
             ApiKeyValidation::Invalid(reason) => reason,
-            ApiKeyValidation::Valid(user) => match self.account_rejection(key, &user) {
-                Some(reason) => reason.to_string(),
-                None => {
+            ApiKeyValidation::Valid(user) => {
+                if let Some(reason) = self.account_rejection(key, &user) {
+                    reason.to_string()
+                } else {
                     let _ = self.context.registry.rate_limiter.update_user_plan(
                         &user.user_id,
                         Some(&user.plan),
@@ -240,7 +241,7 @@ impl Session {
                     }
                     return true;
                 }
-            },
+            }
         };
         warn!(connection_id = %self.id, %reason, "revalidation ended session");
         pike_server::metrics::REVALIDATION_DISCONNECTS.inc();

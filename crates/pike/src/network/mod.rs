@@ -851,7 +851,7 @@ mod tests {
     }
 
     fn message(result: Result<()>) -> String {
-        result.err().expect("the command must fail").to_string()
+        result.expect_err("the command must fail").to_string()
     }
 
     #[test]
@@ -1105,7 +1105,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys::load(&paths).unwrap().member_id, MEMBER);
-        assert!(key_bytes(&paths) == before);
+        assert_eq!(key_bytes(&paths), before);
     }
 
     #[tokio::test]
@@ -1212,7 +1212,7 @@ mod tests {
             .await;
         let error = message(run(&api_config(&server), &config_path, leave("c1", false)).await);
         assert!(error.contains("were kept"), "{error}");
-        assert!(key_bytes(&paths) == before);
+        assert_eq!(key_bytes(&paths), before);
         // Deliberate cleanup of a deleted network or stale enrollment.
         server.reset().await;
         Mock::given(method("DELETE"))
@@ -1365,8 +1365,7 @@ mod tests {
         let config_path = temp.path().join("config.toml");
         seed(&config_path, "", Some(PRIVATE));
         let error = gateway_state(&config_path, "lab", "c1", "client")
-            .err()
-            .expect("a pending record cannot run a gateway")
+            .expect_err("a pending record cannot run a gateway")
             .to_string();
         assert!(
             error.contains("pending")

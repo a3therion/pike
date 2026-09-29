@@ -63,7 +63,7 @@ pub fn owner_marker(member_id: &str) -> String {
         "owner_{}",
         member_id
             .chars()
-            .filter(|c| c.is_ascii_hexdigit())
+            .filter(char::is_ascii_hexdigit)
             .collect::<String>()
     )
 }
@@ -134,7 +134,7 @@ pub fn site_table(
     table: &str,
     ifname: &str,
     lan_if: &str,
-    client_cidr: &Cidr,
+    client_cidr: Cidr,
     owner: &str,
 ) -> String {
     format!(
@@ -333,7 +333,7 @@ mod tests {
             "pike_0f8fad5b",
             "pike0f8fad5b",
             "eth1",
-            &cidr("100.96.0.0/24"),
+            cidr("100.96.0.0/24"),
             "owner_7c9e6679742540de944be07fc1f90ae7",
         );
         assert_eq!(

@@ -105,7 +105,11 @@ async fn distribution(public: u16, count: usize) -> [usize; 2] {
     let mut counts = [0, 0];
     for _ in 0..count {
         let response = http_get(public, "pool.pike.test", "/").await;
-        assert_eq!(response.status(), 200);
+        if response.status() != 200 {
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            panic!("pool distribution returned {status}: {body}");
+        }
         let index = match response.headers()["x-origin"].to_str().unwrap() {
             "a" => 0,
             "b" => 1,

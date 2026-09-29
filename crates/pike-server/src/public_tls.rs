@@ -1,6 +1,6 @@
 //! Shared, bounded SNI listener. Private keys are selected from operator-owned
 //! configuration; tunnel owners can select a mode but cannot supply relay keys.
-//! A hostname owned by another relay leaves after the ClientHello peek with its
+//! A hostname owned by another relay leaves after the `ClientHello` peek with its
 //! handshake intact; a hostname arriving over the ingress hop is admitted here
 //! with the same checks as a direct connection, bound to the expected gate.
 use super::relay_tcp::{Duplex, RelayStream};
@@ -50,7 +50,7 @@ impl Drop for TlsEndpoints {
 
 enum Outcome {
     Served,
-    Forward(TlsForward, OwnedSemaphorePermit),
+    Forward(Box<TlsForward>, OwnedSemaphorePermit),
 }
 
 /// One accepted stream: SNI, route, mode-specific handshake and a final
@@ -84,7 +84,7 @@ async fn admit(
                     let forward = frontend
                         .forward_tls(&target, socket, prefix, source_addr)
                         .await?;
-                    return Ok(Outcome::Forward(forward, permit));
+                    return Ok(Outcome::Forward(Box::new(forward), permit));
                 }
             }
             anyhow::bail!("unknown TLS hostname");
@@ -159,7 +159,7 @@ async fn admit(
                 || watch::channel(false).1,
                 |frontend| frontend.shutdown_signal(),
             );
-            forward.pipe(shutdown).await;
+            (*forward).pipe(shutdown).await;
         }
         Ok(Err(error)) => tracing::debug!(%error, %source_addr, "public TLS connection rejected"),
         Err(_) => tracing::debug!(%source_addr, "public TLS handshake timed out"),

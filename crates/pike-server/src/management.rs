@@ -346,7 +346,7 @@ async fn disconnect_user_handler(
     State(state): State<ManagementState>,
     Path(user_id): Path<String>,
 ) -> Response<Body> {
-    if let Err(error) = state.registry.kill_user_tunnels(&user_id).await {
+    if let Err(error) = state.registry.kill_user_tunnels(&user_id) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     tracing::warn!(user_id = %user_id, "user disconnected via management API");
@@ -362,7 +362,7 @@ async fn ban_user_handler(
     if let Err(error) = state.registry.abuse_detector.ban_user(user_id.clone()) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    if let Err(error) = state.registry.kill_user_tunnels(&user_id).await {
+    if let Err(error) = state.registry.kill_user_tunnels(&user_id) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     tracing::warn!(user_id = %user_id, "user banned via management API");

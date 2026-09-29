@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
             config.max_tunnels_per_connection,
             state_store.clone(),
         ));
-        run_admin_command(command, registry).await?;
+        run_admin_command(command, registry)?;
         return Ok(());
     }
 
