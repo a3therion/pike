@@ -148,7 +148,7 @@ pub enum RateLimitError {
     TunnelRequestRateExceeded,
     #[error("free tier bandwidth limit exceeded")]
     BandwidthLimitExceeded,
-    #[error("free tier tunnel limit exceeded")]
+    #[error("account tunnel limit exceeded")]
     TunnelLimitExceeded,
     #[error("daily request limit exceeded")]
     DailyRequestLimitExceeded,
@@ -234,7 +234,12 @@ impl RateLimiter {
 
     pub fn check_limit(&self, user_id: UserId) -> Result<(), RateLimitError> {
         self.ensure_user_quota(&user_id)?;
+        self.check_request_rate(user_id)
+    }
 
+    /// Hosted byte/day quotas use shared reservations. Keep burst protection
+    /// independent so stale plan defaults cannot override custom cloud limits.
+    pub fn check_request_rate(&self, user_id: UserId) -> Result<(), RateLimitError> {
         let plan = self
             .user_plans
             .get(&user_id)
@@ -305,6 +310,16 @@ impl RateLimiter {
         tunnel_id: TunnelId,
         plan_name: Option<&str>,
     ) -> Result<(), RateLimitError> {
+        self.register_tunnel_with_cap(user_id, tunnel_id, plan_name, None)
+    }
+
+    pub fn register_tunnel_with_cap(
+        &self,
+        user_id: UserId,
+        tunnel_id: TunnelId,
+        plan_name: Option<&str>,
+        cap: Option<u64>,
+    ) -> Result<(), RateLimitError> {
         let month = month_epoch();
         let plan = SubscriptionPlan::from_name(plan_name);
         let plan_limits = plan.limits();
@@ -321,16 +336,20 @@ impl RateLimiter {
         if usage.month_epoch != month {
             usage.month_epoch = month;
             usage.bandwidth_bytes = 0;
-            usage.active_tunnels = 0;
         }
 
-        let max_tunnels = self
-            .user_limit_overrides
-            .get(&user_id)
-            .and_then(|entry| entry.max_tunnels)
-            .or(plan_limits.max_tunnels);
+        // Explicit hosted cap first, then the control-plane limit override, then the
+        // plan default. A cap of zero is a real limit, never "missing".
+        let max_tunnels = cap
+            .or_else(|| {
+                self.user_limit_overrides
+                    .get(&user_id)
+                    .and_then(|entry| entry.max_tunnels)
+                    .map(u64::from)
+            })
+            .or(plan_limits.max_tunnels.map(u64::from));
         if let Some(max_tunnels) = max_tunnels {
-            if usage.active_tunnels >= max_tunnels {
+            if u64::from(usage.active_tunnels) >= max_tunnels {
                 return Err(RateLimitError::TunnelLimitExceeded);
             }
         }
@@ -395,6 +414,10 @@ impl RateLimiter {
         }
     }
 
+    pub fn check_bandwidth(&self, user_id: &UserId) -> Result<(), RateLimitError> {
+        self.ensure_user_quota(user_id)
+    }
+
     fn ensure_user_quota(&self, user_id: &UserId) -> Result<(), RateLimitError> {
         let month = month_epoch();
         let plan = self
@@ -408,7 +431,6 @@ impl RateLimiter {
             if usage.month_epoch != month {
                 usage.month_epoch = month;
                 usage.bandwidth_bytes = 0;
-                usage.active_tunnels = 0;
             }
 
             fallback_bandwidth = usage.bandwidth_bytes;
@@ -846,6 +868,35 @@ mod tests {
     use crate::state_store::{FallbackStateStore, InMemoryStateStore, RedisStateStore, StateStore};
 
     #[test]
+    fn custom_tunnel_cap_overrides_plan_without_treating_zero_as_missing() {
+        let limiter = RateLimiter::new();
+        let first = TunnelId::new();
+        limiter
+            .register_tunnel_with_cap("custom".into(), first, Some("free"), Some(2))
+            .unwrap();
+        limiter
+            .register_tunnel_with_cap("custom".into(), TunnelId::new(), Some("free"), Some(2))
+            .unwrap();
+        assert!(matches!(
+            limiter.register_tunnel_with_cap(
+                "custom".into(),
+                TunnelId::new(),
+                Some("free"),
+                Some(2)
+            ),
+            Err(RateLimitError::TunnelLimitExceeded)
+        ));
+        limiter.unregister_tunnel(first);
+        limiter
+            .register_tunnel_with_cap("custom".into(), TunnelId::new(), Some("free"), Some(2))
+            .unwrap();
+        assert!(matches!(
+            limiter.register_tunnel_with_cap("zero".into(), TunnelId::new(), Some("pro"), Some(0)),
+            Err(RateLimitError::TunnelLimitExceeded)
+        ));
+    }
+
+    #[test]
     fn allows_tunnel_requests_within_window_limit() {
         let limiter = RateLimiter::new();
         let tunnel_id = TunnelId::new();
@@ -963,9 +1014,9 @@ mod tests {
             .expect("register tunnel with fallback store");
         limiter.track_bandwidth(tunnel_id, FREE_TIER_BANDWIDTH_BYTES_PER_MONTH + 1);
 
-        let limit_result = limiter.check_limit("fallback-user".to_string());
+        let outcome = limiter.check_limit("fallback-user".to_string());
         assert!(matches!(
-            limit_result,
+            outcome,
             Err(RateLimitError::BandwidthLimitExceeded)
         ));
     }
@@ -1039,6 +1090,35 @@ mod tests {
         // Downgrade to free: effective cap becomes FREE_TIER_MAX_TUNNELS.
         let max = limiter.update_user_plan(&user_id, Some("free"), &UserLimits::default());
         assert_eq!(max, Some(super::FREE_TIER_MAX_TUNNELS));
+    }
+
+    #[test]
+    fn monthly_rollover_preserves_live_tunnel_admission_count() {
+        for check_bandwidth_first in [false, true] {
+            let limiter = RateLimiter::new();
+            let owner = "rollover-user".to_string();
+            let existing = TunnelId::new();
+            limiter
+                .register_tunnel(owner.clone(), existing, Some("free"))
+                .unwrap();
+            limiter.track_bandwidth(existing, 99);
+            limiter.user_usage.get_mut(&owner).unwrap().month_epoch = super::month_epoch() - 1;
+            if check_bandwidth_first {
+                limiter.check_bandwidth(&owner).unwrap();
+            }
+            assert!(matches!(
+                limiter.register_tunnel(owner.clone(), TunnelId::new(), Some("free")),
+                Err(RateLimitError::TunnelLimitExceeded)
+            ));
+            let usage = limiter.user_usage.get(&owner).unwrap();
+            assert_eq!(usage.bandwidth_bytes, 0);
+            assert_eq!(usage.active_tunnels, 1);
+            drop(usage);
+            limiter.unregister_tunnel(existing);
+            limiter
+                .register_tunnel(owner, TunnelId::new(), Some("free"))
+                .unwrap();
+        }
     }
 
     #[test]

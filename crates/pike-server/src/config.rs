@@ -31,15 +31,6 @@ const DEFAULT_CAPTURE_HEADERS: bool = false;
 const DEFAULT_CAPTURE_BODIES: bool = false;
 const DEFAULT_MAX_BODY_PREVIEW_BYTES: usize = 64 * 1024;
 const DEFAULT_DEPLOYMENT_TOPOLOGY: &str = "single-node";
-/// End-to-end timeout for a single inbound proxied HTTP request (slow-loris / hung-upstream
-/// protection). Applied to the whole request-body read + upstream round-trip + response-body
-/// read; WebSocket upgrades are exempt (long-lived by design).
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
-/// Maximum buffered request/response body size, both directions. Bodies larger than this are
-/// rejected with 413 instead of being buffered into memory (OOM protection). Kept modest because
-/// the proxy buffers whole bodies in memory per in-flight request; raise via `max_body_size` in
-/// server.toml if a deployment needs larger uploads and has the headroom.
-const DEFAULT_MAX_BODY_SIZE: usize = 32 * 1024 * 1024;
 /// When false (default), the enforced per-IP identity is the real connection peer IP and any
 /// client-supplied `X-Forwarded-For` is ignored (non-spoofable). Set true ONLY when the relay
 /// sits behind Cloudflare, in which case the validated `CF-Connecting-IP` header is trusted.
@@ -47,7 +38,18 @@ const DEFAULT_TRUST_CLOUDFLARE: bool = false;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    pub trusted_http_proxies: crate::visitor_policy::TrustedProxies,
+    pub visitor_sessions: std::sync::Arc<crate::visitor_policy::oidc::Sessions>,
+    pub visitor_keys: std::sync::Arc<crate::visitor_policy::jwks::KeyStore>,
+    pub visitor_policies: std::collections::HashMap<String, crate::visitor_policy::Policy>,
+    pub custom_domains: std::collections::HashMap<String, StandaloneDomains>,
     pub bind_addr: SocketAddr,
+    pub public_tls: Option<PublicTlsConfig>,
+    pub public_https: Option<PublicTlsConfig>,
+    pub acme: Option<crate::certificates::AcmeConfig>,
+    pub ingress: Option<IngressConfig>,
+    /// IPv4 interface for public TCP/UDP tunnel ports and ingress forwarders.
+    pub public_bind_ip: std::net::Ipv4Addr,
     pub http_bind_addr: SocketAddr,
     pub management_bind_addr: SocketAddr,
     pub internal_token: String,
@@ -57,6 +59,7 @@ pub struct ServerConfig {
     pub local_api_keys: Option<Vec<String>>,
     pub workers_api_url: Option<String>,
     pub server_token: Option<String>,
+    pub usage_journal_path: PathBuf,
     pub redis_url: Option<String>,
     pub require_redis: bool,
     pub heartbeat_timeout_secs: u64,
@@ -65,12 +68,9 @@ pub struct ServerConfig {
     pub traffic_inspection: TrafficInspectionConfig,
     pub deployment_topology: DeploymentTopology,
     pub domain: String,
+    pub max_request_body_bytes: usize,
     pub max_connections: usize,
     pub max_tunnels_per_connection: usize,
-    /// End-to-end inbound request timeout in seconds (fix: no inbound request timeout).
-    pub request_timeout_secs: u64,
-    /// Maximum buffered body size in bytes, both directions (fix: uncapped body buffering).
-    pub max_body_size: usize,
     /// Trust Cloudflare's `CF-Connecting-IP` for per-IP limiting (fix: XFF-spoofable IP).
     pub trust_cloudflare: bool,
     /// Sentry DSN for error monitoring; `None`/empty disables Sentry entirely (fix #6).
@@ -100,6 +100,9 @@ pub struct TrafficInspectionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeploymentTopology {
     SingleNode,
+    /// Relays forward public traffic to the owning relay over the `[ingress]`
+    /// mTLS hop. Requires an `[ingress]` table; see deploy/PUBLIC-INGRESS.md.
+    CrossRelay,
 }
 
 impl DeploymentTopology {
@@ -107,7 +110,66 @@ impl DeploymentTopology {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SingleNode => DEFAULT_DEPLOYMENT_TOPOLOGY,
+            Self::CrossRelay => CROSS_RELAY_TOPOLOGY,
         }
+    }
+}
+
+const CROSS_RELAY_TOPOLOGY: &str = "cross-relay";
+const MAX_INGRESS_PEERS: usize = 64;
+
+/// Relay-to-relay hop trust. The CA must be dedicated to relay identities; it
+/// is never a visitor mTLS policy CA or a public certificate chain.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngressConfig {
+    pub ca_path: PathBuf,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    /// Owner role: accept authenticated hops from peer frontends here.
+    pub hop_bind_addr: Option<SocketAddr>,
+    /// Frontend role: forward public traffic for targets these peers own.
+    #[serde(default)]
+    pub peers: Vec<IngressPeer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngressPeer {
+    /// Exact TLS server name the peer's hop certificate must carry.
+    pub name: String,
+    pub addr: SocketAddr,
+}
+
+impl IngressConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.hop_bind_addr.is_some() || !self.peers.is_empty(),
+            "[ingress] needs hop_bind_addr (owner), peers (frontend) or both"
+        );
+        anyhow::ensure!(
+            self.peers.len() <= MAX_INGRESS_PEERS,
+            "[ingress] allows at most {MAX_INGRESS_PEERS} peers"
+        );
+        let mut names = std::collections::HashSet::new();
+        for peer in &self.peers {
+            anyhow::ensure!(
+                !peer.name.is_empty()
+                    && peer.name.len() <= 253
+                    && crate::router::normalize_host(&peer.name) == peer.name
+                    && rustls::pki_types::ServerName::try_from(peer.name.clone()).is_ok(),
+                "[ingress] peer name must be an exact lowercase DNS name"
+            );
+            anyhow::ensure!(
+                names.insert(peer.name.as_str()) && !peer.addr.ip().is_unspecified(),
+                "[ingress] peers need unique names and concrete addresses"
+            );
+            anyhow::ensure!(
+                Some(peer.addr) != self.hop_bind_addr,
+                "[ingress] a relay cannot list its own hop listener as a peer"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -148,6 +210,22 @@ pub struct CliArgs {
 
 #[derive(Debug, Deserialize)]
 struct FileConfig {
+    #[serde(default)]
+    trusted_http_proxies: Vec<String>,
+    #[serde(default)]
+    allow_insecure_loopback_visitors: bool,
+    #[serde(default)]
+    #[serde(alias = "visitor_identity_sources")]
+    visitor_jwks_sources: Vec<crate::visitor_policy::jwks::SourceConfig>,
+    #[serde(default)]
+    visitor_policies: std::collections::HashMap<String, crate::visitor_policy::Policy>,
+    #[serde(default)]
+    custom_domains: std::collections::HashMap<String, StandaloneDomains>,
+    public_tls: Option<PublicTlsConfig>,
+    public_https: Option<PublicTlsConfig>,
+    acme: Option<crate::certificates::AcmeConfig>,
+    ingress: Option<IngressConfig>,
+    public_bind_ip: Option<std::net::Ipv4Addr>,
     bind_addr: Option<SocketAddr>,
     http_bind_addr: Option<SocketAddr>,
     management_bind_addr: Option<SocketAddr>,
@@ -157,16 +235,17 @@ struct FileConfig {
     local_api_keys: Option<Vec<String>>,
     workers_api_url: Option<String>,
     server_token: Option<String>,
+    usage_journal_path: Option<PathBuf>,
     redis_url: Option<String>,
     require_redis: Option<bool>,
+    visitor_session_store: Option<crate::visitor_policy::oidc::SessionStoreConfig>,
     heartbeat_timeout_secs: Option<u64>,
     shutdown_timeout_secs: Option<u64>,
     domain: Option<String>,
     deployment_topology: Option<String>,
+    max_request_body_bytes: Option<usize>,
     max_connections: Option<usize>,
     max_tunnels_per_connection: Option<usize>,
-    request_timeout_secs: Option<u64>,
-    max_body_size: Option<usize>,
     trust_cloudflare: Option<bool>,
     sentry_dsn: Option<String>,
     quic: Option<QuicConfigFile>,
@@ -211,6 +290,14 @@ impl ServerConfig {
             .with_context(|| format!("failed to read config file at {}", path.display()))?;
         let parsed: FileConfig = toml::from_str(&raw)
             .with_context(|| format!("failed to parse TOML config from {}", path.display()))?;
+
+        if let Some(acme) = &parsed.acme {
+            acme.validate()?;
+            anyhow::ensure!(
+                parsed.public_https.is_some() || parsed.public_tls.is_some(),
+                "ACME requires a native HTTPS or public TLS listener"
+            );
+        }
 
         let default_bind: SocketAddr = DEFAULT_BIND_ADDR
             .parse()
@@ -257,6 +344,15 @@ impl ServerConfig {
         let control_plane_url = parsed.control_plane_url;
         let local_api_keys = parsed.local_api_keys;
         let deployment_topology = parse_deployment_topology(parsed.deployment_topology.as_deref())?;
+        if let Some(ingress) = &parsed.ingress {
+            ingress.validate()?;
+        }
+        // The guard stays explicit: forwarding is enabled only by naming the
+        // topology and configuring the hop trust together.
+        anyhow::ensure!(
+            parsed.ingress.is_some() == (deployment_topology == DeploymentTopology::CrossRelay),
+            "deployment_topology = \"cross-relay\" and the [ingress] table must be configured together"
+        );
         // Fail-safe default (fix #16): in production mode require_redis defaults to `true`
         // so a misconfigured instance refuses to silently fall back to in-memory state
         // (which resets bandwidth/ban counters on restart). Operators who genuinely want
@@ -322,7 +418,43 @@ impl ServerConfig {
             anyhow::bail!("require_redis = true requires redis_url to be configured (require_redis defaults to true in production; set it to false explicitly to opt into in-memory state)");
         }
 
+        let max_request_body_bytes = parsed
+            .max_request_body_bytes
+            .unwrap_or(crate::http::DEFAULT_MAX_BODY_SIZE);
+        anyhow::ensure!(
+            max_request_body_bytes > 0,
+            "max_request_body_bytes must be positive"
+        );
+        let domain = parsed.domain.unwrap_or_else(|| "pike.life".to_string());
+        anyhow::ensure!(
+            parsed.custom_domains.is_empty()
+                || dev_mode
+                || parsed
+                    .workers_api_url
+                    .as_ref()
+                    .or(control_plane_url.as_ref())
+                    .is_none_or(|url| url.trim().is_empty()),
+            "custom_domains is for standalone relays; hosted names require the ownership API"
+        );
+        validate_custom_domains(&parsed.custom_domains, &domain)?;
         Ok(Self {
+            trusted_http_proxies: crate::visitor_policy::TrustedProxies::new(
+                &parsed.trusted_http_proxies,
+                parsed.allow_insecure_loopback_visitors,
+            )?,
+            visitor_sessions: crate::visitor_policy::oidc::Sessions::configured(
+                parsed.visitor_session_store.as_ref(),
+            )?,
+            visitor_keys: crate::visitor_policy::jwks::KeyStore::new(&parsed.visitor_jwks_sources)?,
+            visitor_policies: parsed.visitor_policies,
+            custom_domains: parsed.custom_domains,
+            public_tls: parsed.public_tls,
+            public_https: parsed.public_https,
+            acme: parsed.acme,
+            ingress: parsed.ingress,
+            public_bind_ip: parsed
+                .public_bind_ip
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
             bind_addr: parsed.bind_addr.unwrap_or(default_bind),
             http_bind_addr: parsed.http_bind_addr.unwrap_or(default_http_bind),
             management_bind_addr: parsed
@@ -336,6 +468,13 @@ impl ServerConfig {
             local_api_keys,
             workers_api_url: parsed.workers_api_url.or(control_plane_url),
             server_token: parsed.server_token,
+            usage_journal_path: parsed
+                .usage_journal_path
+                .or_else(|| {
+                    std::env::var_os("STATE_DIRECTORY")
+                        .map(|path| PathBuf::from(path).join("usage.sqlite3"))
+                })
+                .unwrap_or_else(|| PathBuf::from("data/usage.sqlite3")),
             redis_url: parsed.redis_url,
             require_redis,
             heartbeat_timeout_secs: parsed
@@ -347,13 +486,10 @@ impl ServerConfig {
             abuse: parse_abuse_config(parsed.abuse, require_redis),
             traffic_inspection: parse_traffic_inspection_config(parsed.traffic_inspection),
             deployment_topology,
-            domain: parsed.domain.unwrap_or_else(|| "pike.life".to_string()),
+            domain,
+            max_request_body_bytes,
             max_connections: parsed.max_connections.unwrap_or(1000),
             max_tunnels_per_connection: parsed.max_tunnels_per_connection.unwrap_or(10),
-            request_timeout_secs: parsed
-                .request_timeout_secs
-                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
-            max_body_size: parsed.max_body_size.unwrap_or(DEFAULT_MAX_BODY_SIZE),
             trust_cloudflare: parsed.trust_cloudflare.unwrap_or(DEFAULT_TRUST_CLOUDFLARE),
             // Prefer the config file value, else fall back to the SENTRY_DSN env var. An empty
             // string is normalized to None so Sentry stays a no-op when unset (fix #6).
@@ -364,6 +500,36 @@ impl ServerConfig {
                 .filter(|dsn| !dsn.is_empty()),
         })
     }
+}
+
+fn validate_custom_domains(
+    domains: &std::collections::HashMap<String, StandaloneDomains>,
+    platform: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        domains.len() <= 256,
+        "too many standalone domain assignments"
+    );
+    let suffix = format!(".{platform}");
+    let mut names = std::collections::HashSet::new();
+    for (primary, assignment) in domains {
+        let name = primary
+            .strip_suffix(&suffix)
+            .context("custom-domain primary must be in the relay platform zone")?;
+        pike_core::types::SubdomainSpec::new(name.to_owned())?;
+        anyhow::ensure!(
+            !assignment.owner_user_id.trim().is_empty(),
+            "custom domains require an owner_user_id"
+        );
+        crate::domain_grants::DomainGrants::from_operator(&assignment.hostnames, platform)?;
+        for hostname in &assignment.hostnames {
+            anyhow::ensure!(
+                names.insert(hostname),
+                "custom hostname assigned to multiple tunnels"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn ensure_tls_assets(quic: &PikeQuicConfig, dev_mode: bool) -> Result<()> {
@@ -477,8 +643,9 @@ fn parse_deployment_topology(parsed: Option<&str>) -> Result<DeploymentTopology>
     let normalized = parsed.unwrap_or(DEFAULT_DEPLOYMENT_TOPOLOGY).trim();
     match normalized {
         "single-node" | "single_node" | "single" => Ok(DeploymentTopology::SingleNode),
+        "cross-relay" | "cross_relay" => Ok(DeploymentTopology::CrossRelay),
         _ => anyhow::bail!(
-            "unsupported deployment_topology: {normalized}; only \"single-node\" is supported until distributed tunnel routing is implemented"
+            "unsupported deployment_topology: {normalized}; use \"single-node\" or \"cross-relay\" with an [ingress] table"
         ),
     }
 }
@@ -541,6 +708,7 @@ enable_early_data = false
         );
 
         let config = ServerConfig::from_file(&path, false).expect("config parsed");
+        assert_eq!(config.max_request_body_bytes, 200_000_000);
         assert_eq!(config.bind_addr.to_string(), "127.0.0.1:7443");
         assert_eq!(config.http_bind_addr.to_string(), "127.0.0.1:8080");
         assert_eq!(config.management_bind_addr.to_string(), "127.0.0.1:9090");
@@ -757,6 +925,60 @@ deployment_topology = "multi-node"
     }
 
     #[test]
+    fn cross_relay_topology_and_ingress_table_are_required_together() {
+        let base = r#"
+bind_addr = "127.0.0.1:7443"
+control_plane_url = "https://cp.pike.life"
+internal_token = "dashboard-secret"
+require_redis = false
+"#;
+        let ingress = r#"
+[ingress]
+ca_path = "/etc/pike/ingress/ca.pem"
+cert_path = "/etc/pike/ingress/relay.pem"
+key_path = "/etc/pike/ingress/relay.key"
+hop_bind_addr = "10.0.0.1:7443"
+[[ingress.peers]]
+name = "relay-b.internal"
+addr = "10.0.0.2:7443"
+"#;
+        let mismatch = write_temp_config(&format!("{base}deployment_topology = \"cross-relay\"\n"));
+        let err = ServerConfig::from_file(&mismatch, false)
+            .expect_err("topology without trust must fail")
+            .to_string();
+        assert!(err.contains("configured together"), "{err}");
+        let _ = fs::remove_file(mismatch);
+        let unnamed = write_temp_config(&format!("{base}{ingress}"));
+        assert!(ServerConfig::from_file(&unnamed, false).is_err());
+        let _ = fs::remove_file(unnamed);
+        let valid = write_temp_config(&format!(
+            "{base}deployment_topology = \"cross-relay\"\n{ingress}"
+        ));
+        let config = ServerConfig::from_file(&valid, false).expect("config should parse");
+        assert_eq!(
+            config.deployment_topology,
+            super::DeploymentTopology::CrossRelay
+        );
+        assert_eq!(config.deployment_topology.as_str(), "cross-relay");
+        let peers = &config.ingress.as_ref().unwrap().peers;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "relay-b.internal");
+        let _ = fs::remove_file(valid);
+        for broken in [
+            "name = \"relay-b.internal\"\naddr = \"0.0.0.0:7443\"",
+            "name = \"Relay-B.internal\"\naddr = \"10.0.0.2:7443\"",
+            "name = \"relay-b.internal\"\naddr = \"10.0.0.1:7443\"",
+        ] {
+            let text = format!(
+                "{base}deployment_topology = \"cross-relay\"\n[ingress]\nca_path = \"/a\"\ncert_path = \"/b\"\nkey_path = \"/c\"\nhop_bind_addr = \"10.0.0.1:7443\"\n[[ingress.peers]]\n{broken}\n"
+            );
+            let path = write_temp_config(&text);
+            assert!(ServerConfig::from_file(&path, false).is_err(), "{broken}");
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
     fn require_redis_true_requires_redis_url() {
         let path = write_temp_config(
             r#"
@@ -868,4 +1090,27 @@ redis_url = "redis://127.0.0.1:6379/0"
 
         let _ = fs::remove_file(path);
     }
+}
+
+/// Operator-owned TLS material. Private keys never enter tunnel profiles.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicTlsConfig {
+    pub bind_addr: SocketAddr,
+    #[serde(default)]
+    pub certificates: Vec<PublicCertificate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicCertificate {
+    pub hostname: String,
+    pub owner_user_id: String,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandaloneDomains {
+    pub owner_user_id: String,
+    pub hostnames: Vec<String>,
 }

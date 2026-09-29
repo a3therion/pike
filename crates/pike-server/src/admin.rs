@@ -40,8 +40,7 @@ pub async fn run_admin_command(cmd: AdminCommand, registry: Arc<ClientRegistry>)
             let parsed = Uuid::from_str(&tunnel_id)
                 .with_context(|| format!("invalid tunnel id {tunnel_id}"))?;
             registry
-                .abuse_detector
-                .suspend_tunnel(TunnelId(parsed))
+                .suspend_tunnel_identity(TunnelId(parsed))
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             println!("Tunnel {tunnel_id} suspended");
         }

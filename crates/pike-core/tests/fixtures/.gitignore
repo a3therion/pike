@@ -1,0 +1,3 @@
+# Public, self-signed localhost certificate and key used only by the QUIC tests.
+!quic-test-cert.pem
+!quic-test-key.pem

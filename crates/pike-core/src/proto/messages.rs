@@ -45,6 +45,28 @@ pub enum ControlMessage {
         timestamp: u64,
         server_time: u64,
     },
+    TunnelUnregistered {
+        tunnel_id: TunnelId,
+    },
+    OriginHealthRequest {
+        tunnel_id: TunnelId,
+        nonce: u64,
+    },
+    OriginHealthResponse {
+        tunnel_id: TunnelId,
+        nonce: u64,
+        report: super::origin_health::OriginHealthReport,
+    },
+}
+
+/// Explicit application framing carried by a transport stream.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StreamMode {
+    #[default]
+    Raw,
+    Http,
+    Datagram,
+    ByteStream,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -54,6 +76,7 @@ pub struct StreamHeader {
     pub source_addr: SocketAddr,
     #[serde(default)]
     pub streaming: bool,
+    pub mode: crate::proto::StreamMode,
 }
 
 #[cfg(test)]
@@ -65,6 +88,7 @@ mod tests {
 
     fn sample_config() -> TunnelConfig {
         TunnelConfig {
+            cloud: None,
             id: TunnelId::new(),
             tunnel_type: TunnelType::Http {
                 local_port: 8080,
@@ -95,6 +119,20 @@ mod tests {
         let tunnel_id = TunnelId::new();
 
         let cases = vec![
+            ControlMessage::OriginHealthRequest {
+                tunnel_id,
+                nonce: 5,
+            },
+            ControlMessage::OriginHealthResponse {
+                tunnel_id,
+                nonce: 5,
+                report: super::super::origin_health::OriginHealthReport {
+                    origins: vec![super::super::origin_health::OriginObservation {
+                        healthy: None,
+                        checked_ago_ms: None,
+                    }],
+                },
+            },
             ControlMessage::Login {
                 api_key: "api-key-123".to_string(),
                 client_version: "0.1.0".to_string(),
@@ -104,6 +142,7 @@ mod tests {
                 config: sample_config(),
             },
             ControlMessage::UnregisterTunnel { tunnel_id },
+            ControlMessage::TunnelUnregistered { tunnel_id },
             ControlMessage::Heartbeat {
                 seq: 42,
                 timestamp: 1_717_171_717,
@@ -143,6 +182,7 @@ mod tests {
             connection_id: 7,
             source_addr: SocketAddr::from(([192, 168, 1, 10], 51432)),
             streaming: false,
+            mode: crate::proto::StreamMode::Raw,
         };
 
         let encoded = postcard::to_allocvec(&header).expect("serialize stream header");
@@ -158,6 +198,7 @@ mod tests {
             connection_id: 42,
             source_addr: SocketAddr::from(([10, 0, 0, 1], 8080)),
             streaming: true,
+            mode: crate::proto::StreamMode::Raw,
         };
 
         let encoded = postcard::to_allocvec(&header).expect("serialize stream header");

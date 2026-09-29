@@ -1,3 +1,6 @@
+# Total HTTP request body bytes; stream buffers remain small.
+max_request_body_bytes = 200000000
+
 # Pike Server Production Configuration for VPS deployments
 
 # QUIC listener. Keep this aligned with the CLI default relay address.
@@ -5,6 +8,9 @@ bind_addr = "[::]:443"
 
 # Local HTTP and management listeners for reverse proxy / local admin access
 http_bind_addr = "127.0.0.1:8080"
+# Enable only after the HTTPS frontend overwrites X-Real-IP and X-Forwarded-Proto.
+# See pike/deploy/VISITOR-POLICIES.md. Never trust arbitrary public addresses.
+# trusted_http_proxies = ["127.0.0.1/32", "::1/128"]
 management_bind_addr = "127.0.0.1:9090"
 deployment_topology = "single-node"
 
@@ -28,14 +34,6 @@ shutdown_timeout_secs = 30
 
 # Max concurrent client connections (hard cap; excess connections are refused).
 max_connections = 1000
-
-# End-to-end timeout (seconds) for a single inbound proxied HTTP request. Protects against
-# slow-loris clients and hung upstreams; returns 504 on expiry. WebSocket upgrades are exempt.
-request_timeout_secs = 30
-
-# Maximum buffered request/response body size in bytes (both directions). Larger bodies are
-# rejected with 413 instead of being buffered into memory. Default 100 MiB.
-max_body_size = 104857600
 
 # Set true ONLY when this relay sits behind Cloudflare. When true, the per-IP rate limiter
 # trusts Cloudflare's validated CF-Connecting-IP header. When false (default) it uses the real

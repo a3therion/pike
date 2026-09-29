@@ -137,14 +137,45 @@ pub enum TunnelType {
         local_port: u16,
         remote_port: Option<u16>,
     },
+    /// Named TLS endpoint on the relay's shared SNI listener.
+    Tls {
+        local_port: u16,
+        subdomain: String,
+        mode: TlsMode,
+    },
+    /// Public UDP endpoint; idle sessions expire on both sides.
+    Udp {
+        local_port: u16,
+        remote_port: Option<u16>,
+        idle_timeout_secs: u16,
+    },
+}
+
+/// Where a named TLS endpoint handles encryption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    #[default]
+    Passthrough,
+    Terminate,
 }
 
 /// Configuration for a single tunnel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CloudTunnelConfig {
+    pub name: Option<String>,
+    /// Bounded JSON bridges the public control-plane schema and postcard.
+    /// JSON values themselves require `deserialize_any`, unsupported by postcard.
+    pub settings_json: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelConfig {
     pub id: TunnelId,
     pub tunnel_type: TunnelType,
     pub local_addr: SocketAddr,
+    #[serde(default)]
+    pub cloud: Option<CloudTunnelConfig>,
 }
 
 // ────────────────────────────────────────────
@@ -280,6 +311,7 @@ mod tests {
     #[test]
     fn tunnel_config_roundtrip() {
         let config = TunnelConfig {
+            cloud: None,
             id: TunnelId::new(),
             tunnel_type: TunnelType::Http {
                 local_port: 3000,

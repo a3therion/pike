@@ -1,50 +1,67 @@
+use super::pool::{OriginPool, PoolUnavailable};
+use http_body_util::BodyExt;
+use pike_core::http_response::ResponseDecoder;
+use pike_core::{
+    byte_stream,
+    http_wire::{HttpFrame, IncomingBody, Writer, DATA_CHUNK_BYTES},
+    proto::StreamMode,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
-use pike_core::quic::client::{LocalData, PikeClient, PikeConnection, ServerData};
+use pike_core::quic::client::{LocalData, PikeConnection, ServerData};
 use pike_core::types::{TunnelConfig, TunnelId};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Semaphore};
+use pike_core::websocket::MAX_PAYLOAD_SIZE;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use crate::inspector::storage::{CapturedHeader, CapturedRequest, RequestStore};
+use crate::inspector::storage::RequestStore;
 
-const LOCAL_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_UPSTREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_INFLIGHT_HTTP_REQUESTS: usize = 32;
+const MAX_UPGRADE_HEADER_SIZE: usize = 16 * 1024;
+const STREAM_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct WebSocketRelay {
+    input: RelayInput,
+    cancel: watch::Sender<bool>,
+}
+
+enum RelayInput {
+    Http(mpsc::Sender<ServerData>),
+    WebSocket {
+        first: ServerData,
+        input: Box<byte_stream::Ingress<LocalData>>,
+    },
+}
 
 pub struct HttpTunnel {
     config: TunnelConfig,
-    local_port: u16,
-    local_host: String,
+    origin: OriginPool,
     subdomain: Option<String>,
     connection: PikeConnection,
-    _client: PikeClient, // Keep client alive to maintain QUIC connection
     tunnel_id: Option<TunnelId>,
     request_store: Option<Arc<RequestStore>>,
-    ws_relays: HashMap<u64, mpsc::Sender<Vec<u8>>>,
+    ws_relays: HashMap<u64, WebSocketRelay>,
 }
 
 impl HttpTunnel {
     pub fn new(
         config: TunnelConfig,
-        port: u16,
-        host: String,
+        origin: impl Into<OriginPool>,
         subdomain: Option<String>,
         connection: PikeConnection,
-        client: PikeClient,
         request_store: Option<Arc<RequestStore>>,
     ) -> Self {
         Self {
             config,
-            local_port: port,
-            local_host: host,
+            origin: origin.into(),
             subdomain,
             connection,
-            _client: client,
             tunnel_id: None,
             request_store,
             ws_relays: HashMap::new(),
@@ -60,7 +77,7 @@ impl HttpTunnel {
 
         info!(
             tunnel_id = %tunnel_id,
-            local_addr = %format!("{}:{}", self.local_host, self.local_port),
+            local_addr = %self.origin.display(),
             "HTTP tunnel registration requested (waiting for server confirmation)"
         );
 
@@ -70,774 +87,357 @@ impl HttpTunnel {
             Err(_) => bail!("registration timed out after 10s"),
         };
 
+        let health_pool = self.origin.clone();
+        self.connection
+            .set_origin_health_source(
+                tunnel_id,
+                pike_core::proto::origin_health::OriginHealthSource::new(move || {
+                    health_pool.health_report()
+                }),
+            )
+            .await?;
         Ok(registration.public_url)
     }
 
-    async fn handle_payload(
-        local_host: String,
-        local_port: u16,
-        request_store: Option<Arc<RequestStore>>,
-        request_data: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        let start = std::time::Instant::now();
-
-        let header_end = request_data
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .ok_or_else(|| anyhow!("invalid HTTP request framing"))?;
-        let body = &request_data[header_end + 4..];
-        let headers_str = std::str::from_utf8(&request_data[..header_end])?;
-        let mut lines = headers_str.split("\r\n");
-        let request_line_str = lines.next().ok_or_else(|| anyhow!("empty HTTP request"))?;
-        let request_line_parts: Vec<&str> = request_line_str.split_whitespace().collect();
-        if request_line_parts.len() < 3 {
-            return Err(anyhow!("invalid HTTP request line"));
-        }
-
-        let method = request_line_parts[0];
-        let path = request_line_parts[1];
-
-        // Rebuild the request as normalized HTTP/1.1 bytes for the localhost TCP hop.
-        let mut modified_request = Vec::with_capacity(request_data.len() + 256);
-        modified_request.extend_from_slice(format!("{method} {path} HTTP/1.1").as_bytes());
-        modified_request.extend_from_slice(b"\r\n");
-
-        let mut req_headers = Vec::new();
-        let mut forwarded_host: Option<String> = None;
-        let mut forwarded_proto: Option<String> = None;
-        let mut has_null_origin = false;
-        let mut has_host = false;
-
-        for line in lines {
-            if line.is_empty() {
-                continue;
-            }
-            let Some((name, value)) = line.split_once(':') else {
-                modified_request.extend_from_slice(line.as_bytes());
-                modified_request.extend_from_slice(b"\r\n");
-                continue;
-            };
-
-            let name_trimmed = name.trim();
-            let value_trimmed = value.trim();
-
-            // Capture forwarded headers for Origin reconstruction
-            if name.eq_ignore_ascii_case("x-forwarded-host") {
-                forwarded_host = Some(value_trimmed.to_string());
-            }
-            if name.eq_ignore_ascii_case("x-forwarded-proto") {
-                forwarded_proto = Some(value_trimmed.to_string());
-            }
-
-            // Fix Origin: null (Firefox sends this with strict referrer policies)
-            if name.eq_ignore_ascii_case("origin") && value_trimmed == "null" {
-                has_null_origin = true;
-                continue; // Will be replaced below
-            }
-
-            if is_hop_by_hop_header(name_trimmed) || name.eq_ignore_ascii_case("content-length") {
-                continue;
-            }
-
-            if name.eq_ignore_ascii_case("host") {
-                has_host = true;
-            }
-
-            req_headers.push(CapturedHeader {
-                name: name_trimmed.to_string(),
-                value: value_trimmed.to_string(),
-            });
-            modified_request.extend_from_slice(line.as_bytes());
-            modified_request.extend_from_slice(b"\r\n");
-        }
-
-        if !has_host {
-            if let Some(host) = &forwarded_host {
-                req_headers.push(CapturedHeader {
-                    name: "Host".to_string(),
-                    value: host.clone(),
-                });
-                modified_request.extend_from_slice(format!("Host: {host}\r\n").as_bytes());
-            }
-        }
-
-        // Add fixed Origin if it was null
-        if has_null_origin {
-            let origin = if let Some(host) = &forwarded_host {
-                let proto = forwarded_proto.as_deref().unwrap_or("https");
-                format!("{proto}://{host}")
-            } else {
-                "null".to_string()
-            };
-            req_headers.push(CapturedHeader {
-                name: "Origin".to_string(),
-                value: origin.clone(),
-            });
-            modified_request.extend_from_slice(format!("Origin: {origin}\r\n").as_bytes());
-        }
-
-        req_headers.push(CapturedHeader {
-            name: "Content-Length".to_string(),
-            value: body.len().to_string(),
-        });
-        req_headers.push(CapturedHeader {
-            name: "Connection".to_string(),
-            value: "close".to_string(),
-        });
-        modified_request
-            .extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-        modified_request.extend_from_slice(b"Connection: close\r\n\r\n");
-        modified_request.extend_from_slice(body);
-
-        let req_body = if !body.is_empty() {
-            String::from_utf8(body.to_vec()).ok()
-        } else {
-            None
+    /// Own the upgrade and both directions; every exit seals one terminal frame.
+    async fn relay_websocket(
+        origin: impl Into<OriginPool>,
+        stream_id: u64,
+        stream: byte_stream::Stream<LocalData>,
+        mut cancelled: watch::Receiver<bool>,
+    ) {
+        let origin = origin.into();
+        let (writer, mut incoming) = stream.into_parts();
+        let result = tokio::select! {
+            biased;
+            _ = cancelled.changed() => Err(anyhow!("WebSocket relay cancelled")),
+            result = Self::forward_websocket(&origin, &mut incoming, &writer) => result,
         };
-
-        let local_addr = format!("{}:{}", local_host, local_port);
-        let mut tcp = timeout(
-            LOCAL_UPSTREAM_CONNECT_TIMEOUT,
-            TcpStream::connect(&local_addr),
-        )
-        .await
-        .map_err(|_| anyhow!("timed out connecting to local upstream at {local_addr}"))??;
-
-        timeout(LOCAL_UPSTREAM_IO_TIMEOUT, tcp.write_all(&modified_request))
-            .await
-            .map_err(|_| anyhow!("timed out writing request to local upstream"))??;
-
-        let raw_response = Box::pin(timeout(
-            LOCAL_UPSTREAM_IO_TIMEOUT,
-            Self::read_upstream_response(&mut tcp),
-        ))
-        .await
-        .map_err(|_| anyhow!("timed out reading response from local upstream"))??;
-
-        let parsed_response = Self::normalize_upstream_response(&raw_response)?;
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-        let status_code = parsed_response.status_code;
-
-        info!(method = %method, path = %path, status = status_code, duration_ms, "HTTP request forwarded");
-
-        // Capture request for inspector
-        if let Some(store) = &request_store {
-            store.add(CapturedRequest {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: chrono::Utc::now(),
-                method: method.to_string(),
-                path: path.to_string(),
-                headers: req_headers,
-                body: req_body,
-                response_status: status_code,
-                response_headers: parsed_response.headers,
-                response_body: String::from_utf8(parsed_response.body).ok(),
-                duration_ms,
-            });
+        if let Err(error) = result {
+            warn!(stream_id, %error, "WebSocket relay ended");
         }
-
-        Ok(raw_response)
+        let _ = timeout(STREAM_ENQUEUE_TIMEOUT, writer.send(HttpFrame::End, true)).await;
     }
 
-    async fn read_upstream_response<R>(reader: &mut R) -> Result<Vec<u8>>
-    where
-        R: AsyncRead + Unpin,
-    {
-        let mut raw_response = Vec::with_capacity(64 * 1024);
-        let mut buf = [0_u8; 16 * 1024];
-
-        loop {
-            if let Some(complete_len) = Self::complete_upstream_response_len(&raw_response)? {
-                raw_response.truncate(complete_len);
-                return Ok(raw_response);
-            }
-
-            let read = reader.read(&mut buf).await?;
-            if read == 0 {
-                if raw_response.is_empty() {
-                    bail!("local upstream closed without response");
+    async fn forward_websocket(
+        origin: &OriginPool,
+        incoming: &mut IncomingBody,
+        writer: &Writer<LocalData>,
+    ) -> Result<()> {
+        let (tcp, client_frames, server_frames) = timeout(LOCAL_UPSTREAM_IO_TIMEOUT, async {
+            let mut request = Vec::new();
+            let header_end = loop {
+                let bytes = next_ws_bytes(incoming).await?
+                    .ok_or_else(|| anyhow!("peer closed before WebSocket upgrade"))?;
+                request.extend_from_slice(&bytes);
+                if let Some(end) = find_header_end(&request) {
+                    if end + 4 > MAX_UPGRADE_HEADER_SIZE { bail!("WebSocket upgrade request headers too large"); }
+                    break end + 4;
                 }
-                return Ok(raw_response);
-            }
-
-            raw_response.extend_from_slice(&buf[..read]);
-        }
-    }
-
-    fn complete_upstream_response_len(payload: &[u8]) -> Result<Option<usize>> {
-        let mut offset = 0;
-
-        loop {
-            let Some(header_end) = find_header_end(&payload[offset..]) else {
-                return Ok(None);
+                if request.len() > MAX_UPGRADE_HEADER_SIZE { bail!("WebSocket upgrade request headers too large"); }
             };
-            let header_end_abs = offset + header_end;
-            let header_text = std::str::from_utf8(&payload[offset..header_end_abs])?;
-            let mut lines = header_text.split("\r\n");
-
-            let status_line = lines
-                .next()
-                .ok_or_else(|| anyhow!("missing upstream status line"))?;
-            let status_code = status_line
-                .split_whitespace()
-                .nth(1)
-                .ok_or_else(|| anyhow!("missing upstream status code"))?
-                .parse::<u16>()?;
-
-            let mut content_length = None;
-            let mut chunked = false;
-            let mut body_allowed =
-                !matches!(status_code, 204 | 304) && !(100..200).contains(&status_code);
-
-            for line in lines {
-                if line.is_empty() {
-                    continue;
-                }
-                let Some((name, value)) = line.split_once(':') else {
-                    continue;
-                };
-
-                let name = name.trim();
-                let value = value.trim();
-
-                if name.eq_ignore_ascii_case("content-length") {
-                    content_length = Some(value.parse::<usize>()?);
-                    continue;
-                }
-
-                if name.eq_ignore_ascii_case("transfer-encoding") {
-                    chunked = value
-                        .split(',')
-                        .any(|part| part.trim().eq_ignore_ascii_case("chunked"));
-                }
-            }
-
-            if status_code == 101 {
-                body_allowed = false;
-            }
-
-            let body_start = header_end_abs + 4;
-            let body_end = if !body_allowed {
-                body_start
-            } else if chunked {
-                let Some(body_len) = chunked_body_wire_len(&payload[body_start..])? else {
-                    return Ok(None);
-                };
-                body_start
-                    .checked_add(body_len)
-                    .ok_or_else(|| anyhow!("upstream body length overflow"))?
-            } else if let Some(length) = content_length {
-                let end = body_start
-                    .checked_add(length)
-                    .ok_or_else(|| anyhow!("upstream body length overflow"))?;
-                if payload.len() < end {
-                    return Ok(None);
-                }
-                end
-            } else {
-                // EOF-delimited responses, including open-ended SSE streams, cannot be
-                // completed early on the current normal HTTP QUIC response path.
-                return Ok(None);
+            let mut client_frames = request.split_off(header_end);
+            let (_, mut tcp, _) = match origin.connect(true).await {
+                Ok(connection) => connection,
+                Err(error) if error.is::<PoolUnavailable>() => {
+                    send_ws_bytes(writer, b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\n\r\n").await?;
+                    return Err(error);
+                },
+                Err(error) => return Err(error),
             };
-
-            if (100..200).contains(&status_code) && status_code != 101 {
-                offset = body_end;
-                continue;
-            }
-
-            return Ok(Some(body_end));
-        }
-    }
-
-    fn normalize_upstream_response(payload: &[u8]) -> Result<ParsedUpstreamResponse> {
-        let mut offset = 0;
-
-        loop {
-            let header_end = find_header_end(&payload[offset..])
-                .ok_or_else(|| anyhow!("invalid upstream HTTP response framing"))?;
-            let header_end_abs = offset + header_end;
-            let header_text = std::str::from_utf8(&payload[offset..header_end_abs])?;
-            let mut lines = header_text.split("\r\n");
-
-            let status_line = lines
-                .next()
-                .ok_or_else(|| anyhow!("missing upstream status line"))?;
-            let status_code = status_line
-                .split_whitespace()
-                .nth(1)
-                .ok_or_else(|| anyhow!("missing upstream status code"))?
-                .parse::<u16>()?;
-
-            let mut headers = Vec::new();
-            let mut content_length = None;
-            let mut chunked = false;
-            let mut body_allowed =
-                !matches!(status_code, 204 | 304) && !(100..200).contains(&status_code);
-
-            for line in lines {
-                if line.is_empty() {
-                    continue;
-                }
-                let Some((name, value)) = line.split_once(':') else {
-                    continue;
-                };
-
-                let name = name.trim();
-                let value = value.trim();
-
-                if name.eq_ignore_ascii_case("content-length") {
-                    content_length = Some(value.parse::<usize>()?);
-                    continue;
-                }
-
-                if name.eq_ignore_ascii_case("transfer-encoding") {
-                    chunked = value
-                        .split(',')
-                        .any(|part| part.trim().eq_ignore_ascii_case("chunked"));
-                    continue;
-                }
-
-                if is_hop_by_hop_header(name) {
-                    continue;
-                }
-
-                headers.push(CapturedHeader {
-                    name: name.to_string(),
-                    value: value.to_string(),
-                });
-            }
-
-            if status_code == 101 {
-                body_allowed = false;
-            }
-
-            let body_start = header_end_abs + 4;
-            let (body, body_len) = if !body_allowed {
-                (Vec::new(), 0)
-            } else if chunked {
-                Self::decode_chunked_body(&payload[body_start..])?
-            } else if let Some(length) = content_length {
-                let end = body_start
-                    .checked_add(length)
-                    .ok_or_else(|| anyhow!("upstream body length overflow"))?;
-                if end > payload.len() {
-                    bail!("upstream body shorter than declared content-length");
-                }
-                (payload[body_start..end].to_vec(), length)
-            } else {
-                (
-                    payload[body_start..].to_vec(),
-                    payload.len().saturating_sub(body_start),
-                )
-            };
-
-            let next_offset = body_start + body_len;
-            if (100..200).contains(&status_code) && status_code != 101 {
-                if next_offset >= payload.len() {
-                    bail!("upstream returned only an interim response");
-                }
-                offset = next_offset;
-                continue;
-            }
-
-            return Ok(ParsedUpstreamResponse {
-                status_code,
-                headers,
-                body,
-            });
-        }
-    }
-
-    fn decode_chunked_body(payload: &[u8]) -> Result<(Vec<u8>, usize)> {
-        let mut decoded = Vec::new();
-        let mut cursor = 0;
-
-        loop {
-            // All indices and arithmetic are bounds-/overflow-checked so a malformed chunked
-            // body returns a decode error instead of panicking (matches the relay-side hardening).
-            let rest = payload
-                .get(cursor..)
-                .ok_or_else(|| anyhow!("invalid upstream chunk framing"))?;
-            let line_end =
-                find_crlf(rest).ok_or_else(|| anyhow!("invalid upstream chunk framing"))?;
-            let line_bytes = rest
-                .get(..line_end)
-                .ok_or_else(|| anyhow!("invalid upstream chunk framing"))?;
-            let line = std::str::from_utf8(line_bytes)?;
-            let size_text = line.split(';').next().unwrap_or("").trim();
-            let size = usize::from_str_radix(size_text, 16)?;
-            cursor = cursor
-                .checked_add(line_end)
-                .and_then(|c| c.checked_add(2))
-                .filter(|c| *c <= payload.len())
-                .ok_or_else(|| anyhow!("invalid upstream chunk framing"))?;
-
-            if size == 0 {
-                loop {
-                    let rest = payload
-                        .get(cursor..)
-                        .ok_or_else(|| anyhow!("invalid upstream trailer framing"))?;
-                    let trailer_end = find_crlf(rest)
-                        .ok_or_else(|| anyhow!("invalid upstream trailer framing"))?;
-                    cursor = cursor
-                        .checked_add(trailer_end)
-                        .and_then(|c| c.checked_add(2))
-                        .filter(|c| *c <= payload.len())
-                        .ok_or_else(|| anyhow!("invalid upstream trailer framing"))?;
-                    if trailer_end == 0 {
-                        return Ok((decoded, cursor));
+            tcp.write_all(&request).await?;
+            let mut response = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let response_end = loop {
+                tokio::select! {
+                    read = tcp.read(&mut buffer) => {
+                        let read = read?;
+                        if read == 0 { bail!("upstream closed during WebSocket upgrade"); }
+                        response.extend_from_slice(&buffer[..read]);
+                        if let Some(end) = find_header_end(&response) {
+                            if end + 4 > MAX_UPGRADE_HEADER_SIZE { bail!("WebSocket upgrade response headers too large"); }
+                            break end + 4;
+                        }
+                        if response.len() > MAX_UPGRADE_HEADER_SIZE { bail!("WebSocket upgrade response headers too large"); }
                     }
-                }
-            }
-
-            let chunk_end = cursor
-                .checked_add(size)
-                .ok_or_else(|| anyhow!("upstream chunk length overflow"))?;
-            let terminator_end = chunk_end
-                .checked_add(2)
-                .ok_or_else(|| anyhow!("upstream chunk length overflow"))?;
-            if terminator_end > payload.len() {
-                bail!("upstream chunk shorter than declared size");
-            }
-            let chunk = payload
-                .get(cursor..chunk_end)
-                .ok_or_else(|| anyhow!("upstream chunk shorter than declared size"))?;
-            decoded.extend_from_slice(chunk);
-            let terminator = payload
-                .get(chunk_end..terminator_end)
-                .ok_or_else(|| anyhow!("invalid upstream chunk terminator"))?;
-            if terminator != b"\r\n" {
-                bail!("invalid upstream chunk terminator");
-            }
-            cursor = terminator_end;
-        }
-    }
-
-    /// Spawn a long-lived WebSocket relay for a streaming connection.
-    /// Opens a raw TCP connection to the local server, sends the initial HTTP
-    /// upgrade request, and relays bytes bidirectionally.
-    fn spawn_ws_relay(&mut self, msg: ServerData, mut relay_rx: mpsc::Receiver<Vec<u8>>) {
-        let local_addr = format!("{}:{}", self.local_host, self.local_port);
-        let tunnel_id = msg.tunnel_id;
-        let connection_id = msg.connection_id;
-        let stream_id = msg.stream_id;
-        let source_addr = msg.source_addr;
-        let data_tx = self.connection.data_tx.clone();
-        let initial_payload = msg.payload;
-
-        tokio::spawn(async move {
-            // 1. Open TCP connection to local server
-            let tcp = match TcpStream::connect(&local_addr).await {
-                Ok(tcp) => tcp,
-                Err(e) => {
-                    error!(error = %e, "failed to connect to local server for WebSocket relay");
-                    return;
+                    next = next_ws_bytes(incoming) => {
+                        let next = next?.ok_or_else(|| anyhow!("peer closed during WebSocket upgrade"))?;
+                        if client_frames.len().saturating_add(next.len()) > MAX_PAYLOAD_SIZE {
+                            bail!("early WebSocket frames exceed payload limit");
+                        }
+                        client_frames.extend_from_slice(&next);
+                    }
                 }
             };
-
-            info!(
-                stream_id,
-                connection_id,
-                local_addr = %local_addr,
-                "WebSocket relay started"
-            );
-
-            let (mut tcp_read, mut tcp_write) = tcp.into_split();
-
-            // 2. Split initial payload: the HTTP upgrade request ends at \r\n\r\n.
-            //    Any bytes after that are raw WS frames that arrived on the same
-            //    QUIC stream (QUIC merges writes).
-            let (upgrade_bytes, extra_bytes) =
-                match initial_payload.windows(4).position(|w| w == b"\r\n\r\n") {
-                    Some(pos) => {
-                        let split = pos + 4;
-                        (&initial_payload[..split], &initial_payload[split..])
-                    }
-                    None => (initial_payload.as_slice(), &[] as &[u8]),
-                };
-
-            if let Err(e) = tcp_write.write_all(upgrade_bytes).await {
-                error!(error = %e, "failed to send upgrade request to local server");
-                return;
+            // Preserve the origin's rejection, subprotocols and extensions.
+            send_ws_bytes(writer, &response[..response_end]).await?;
+            let head = pike_core::http_response::parse_head(&response[..response_end - 4])?;
+            if head.status != 101 {
+                let mut decoder = ResponseDecoder::new(false);
+                decoder.feed(&response, false)?;
+                send_ws_bytes(writer, &response[response_end..]).await?;
+                let mut chunk = vec![0; DATA_CHUNK_BYTES];
+                while !decoder.is_done() {
+                    let count = tcp.read(&mut chunk).await?;
+                    decoder.feed(&chunk[..count], count == 0)?;
+                    send_ws_bytes(writer, &chunk[..count]).await?;
+                }
+                bail!("local upstream rejected WebSocket upgrade with {}", head.status);
             }
+            let server_frames = response.split_off(response_end);
+            Ok::<_, anyhow::Error>((tcp, client_frames, server_frames))
+        }).await.map_err(|_| anyhow!("WebSocket upgrade timed out"))??;
 
-            // 3. Read and discard the local server's HTTP upgrade response.
-            //    The browser already received a 101 from the pike-server.
-            //    We just need to consume the local server's 101 response headers.
-            {
-                let mut response_buf = Vec::with_capacity(4096);
-                let mut tmp = [0u8; 1];
-                loop {
-                    match tcp_read.read(&mut tmp).await {
-                        Ok(0) => {
-                            error!("local server closed connection during upgrade");
-                            return;
-                        }
-                        Ok(_) => {
-                            response_buf.push(tmp[0]);
-                            if response_buf.len() >= 4
-                                && response_buf[response_buf.len() - 4..] == *b"\r\n\r\n"
-                            {
-                                break;
-                            }
-                            if response_buf.len() > 8192 {
-                                error!("upgrade response too large");
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            error!(error = %e, "failed to read upgrade response from local server");
-                            return;
-                        }
-                    }
+        let (mut read, mut write) = tokio::io::split(tcp);
+        let send = async {
+            send_ws_bytes(writer, &server_frames).await?;
+            let mut buffer = vec![0_u8; DATA_CHUNK_BYTES];
+            loop {
+                let count = read.read(&mut buffer).await?;
+                if count == 0 {
+                    return Ok::<(), anyhow::Error>(());
                 }
-                if let Ok(resp) = std::str::from_utf8(&response_buf) {
-                    info!(
-                        "local server upgrade response consumed: {}",
-                        resp.lines().next().unwrap_or("")
-                    );
-                }
+                send_ws_bytes(writer, &buffer[..count]).await?;
             }
-
-            // 4. If extra bytes arrived with the initial payload (raw WS frames
-            //    merged by QUIC), write them to local TCP now.
-            if !extra_bytes.is_empty() {
-                info!(
-                    stream_id,
-                    bytes = extra_bytes.len(),
-                    "writing extra bytes from initial payload"
-                );
-                if let Err(e) = tcp_write.write_all(extra_bytes).await {
-                    error!(error = %e, "failed to write extra initial bytes");
-                    return;
-                }
+        };
+        let receive = async {
+            timeout(LOCAL_UPSTREAM_IO_TIMEOUT, write.write_all(&client_frames)).await??;
+            while let Some(bytes) = next_ws_bytes(incoming).await? {
+                timeout(LOCAL_UPSTREAM_IO_TIMEOUT, write.write_all(&bytes)).await??;
             }
-
-            // 4. Bidirectional relay
-            let data_tx_for_read = data_tx.clone();
-
-            // TCP -> QUIC: read from local server, send to QUIC stream
-            let tcp_to_quic = tokio::spawn(async move {
-                let mut buf = vec![0u8; 64 * 1024];
-                loop {
-                    match tcp_read.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if data_tx_for_read
-                                .send(LocalData {
-                                    stream_id: Some(stream_id),
-                                    tunnel_id,
-                                    connection_id,
-                                    source_addr,
-                                    payload: buf[..n].to_vec(),
-                                    fin: false,
-                                    streaming: true,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "TCP read error in WebSocket relay");
-                            break;
-                        }
-                    }
-                }
-                // Send fin when TCP closes
-                let _ = data_tx_for_read
-                    .send(LocalData {
-                        stream_id: Some(stream_id),
-                        tunnel_id,
-                        connection_id,
-                        source_addr,
-                        payload: vec![],
-                        fin: true,
-                        streaming: true,
-                    })
-                    .await;
-            });
-
-            // QUIC -> TCP: receive from relay channel, write to local server
-            let quic_to_tcp = tokio::spawn(async move {
-                while let Some(data) = relay_rx.recv().await {
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if tcp_write.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-                let _ = tcp_write.shutdown().await;
-            });
-
-            // Wait for either direction to finish
-            tokio::select! {
-                _ = tcp_to_quic => {}
-                _ = quic_to_tcp => {}
-            }
-
-            info!(stream_id, connection_id, "WebSocket relay ended");
-        });
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! { result = send => result, result = receive => result }
     }
 
     pub async fn run(&mut self) -> Result<()> {
         let tunnel_id = self.tunnel_id.unwrap_or(self.config.id);
         let request_limit = Arc::new(Semaphore::new(MAX_INFLIGHT_HTTP_REQUESTS));
         info!(
-            local_addr = %format!("{}:{}", self.local_host, self.local_port),
+            local_addr = %self.origin.display(),
             tunnel_id = %tunnel_id,
             "HTTP tunnel running"
         );
 
-        while let Some(msg) = self.connection.data_rx.recv().await {
+        self.origin.refresh().await;
+        let mut tasks = JoinSet::new();
+        let pool = self.origin.clone();
+        tasks.spawn(async move {
+            pool.monitor().await;
+        });
+        loop {
+            let msg = tokio::select! {
+                _ = tasks.join_next(), if !tasks.is_empty() => continue,
+                message = self.connection.data_rx.recv() => match message { Some(message) => message, None => break },
+            };
             if msg.tunnel_id != tunnel_id {
                 continue;
             }
 
-            // Check if this message belongs to an existing WS relay
-            if let Some(relay_tx) = self.ws_relays.get(&msg.stream_id) {
-                let _ = relay_tx.send(msg.payload).await;
-                if msg.fin {
-                    self.ws_relays.remove(&msg.stream_id);
+            // Keep failed relay senders until peer FIN. Late bytes must not
+            // reopen a second local connection with the same stream identity.
+            if let Some(relay) = self.ws_relays.get_mut(&msg.stream_id) {
+                let stream_id = msg.stream_id;
+                let fin = msg.fin;
+                let accepted = match &mut relay.input {
+                    RelayInput::Http(sender) => sender.try_send(msg).is_ok(),
+                    RelayInput::WebSocket { first, input } => {
+                        validate_ws_message(first, &msg).is_ok()
+                            && input.feed(&msg.payload, msg.fin).is_ok()
+                    }
+                };
+                if !accepted {
+                    let _ = relay.cancel.send(true);
+                }
+                if fin {
+                    self.ws_relays.remove(&stream_id);
                 }
                 continue;
             }
-
-            // First chunk for a streaming connection — spawn new WS relay
-            if msg.streaming {
-                let (relay_tx, relay_rx) = mpsc::channel(256);
-                self.ws_relays.insert(msg.stream_id, relay_tx);
-                self.spawn_ws_relay(msg, relay_rx);
+            if msg.mode == pike_core::proto::StreamMode::Http {
+                let Ok(permit) = request_limit.clone().try_acquire_owned() else {
+                    let mut reply = ws_response(
+                        &msg,
+                        [
+                            pike_core::http_wire::HttpFrame::Response {
+                                status: 503,
+                                headers: vec![],
+                            },
+                            pike_core::http_wire::HttpFrame::End,
+                        ]
+                        .iter()
+                        .map(pike_core::http_wire::encode)
+                        .collect::<Result<Vec<_>>>()?
+                        .concat(),
+                        true,
+                    );
+                    reply.mode = pike_core::proto::StreamMode::Http;
+                    let _ = self.connection.data_tx.try_send(reply);
+                    // Retain a closed route until peer FIN so late body chunks
+                    // cannot open another origin or produce a second final reply.
+                    if !msg.fin {
+                        let (sender, receiver) = mpsc::channel(1);
+                        drop(receiver);
+                        let (cancel, _) = watch::channel(false);
+                        self.ws_relays.insert(
+                            msg.stream_id,
+                            WebSocketRelay {
+                                input: RelayInput::Http(sender),
+                                cancel,
+                            },
+                        );
+                    }
+                    continue;
+                };
+                let (sender, receiver) = mpsc::channel(128);
+                let (cancel, cancelled) = watch::channel(false);
+                self.ws_relays.insert(
+                    msg.stream_id,
+                    WebSocketRelay {
+                        input: RelayInput::Http(sender),
+                        cancel: cancel.clone(),
+                    },
+                );
+                let origin = self.origin.clone();
+                let output = self.connection.data_tx.clone();
+                let store = self.request_store.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let _keep_cancel_open = cancel;
+                    super::http_stream::relay(origin, store, msg, receiver, output, cancelled)
+                        .await;
+                });
+                continue;
+            }
+            if msg.streaming && msg.mode == StreamMode::ByteStream {
+                let (cancel, cancelled) = watch::channel(false);
+                let writer = Writer::new(
+                    self.connection.data_tx.clone(),
+                    ws_response(&msg, vec![], false),
+                );
+                let (mut input, stream) = byte_stream::channel(writer);
+                let permit = request_limit.clone().try_acquire_owned();
+                if input.feed(&msg.payload, msg.fin).is_err() || permit.is_err() {
+                    let _ = cancel.send(true);
+                }
+                if !msg.fin {
+                    self.ws_relays.insert(
+                        msg.stream_id,
+                        WebSocketRelay {
+                            input: RelayInput::WebSocket {
+                                first: msg.clone(),
+                                input: Box::new(input),
+                            },
+                            cancel: cancel.clone(),
+                        },
+                    );
+                }
+                let origin = self.origin.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let _keep_cancel_open = cancel;
+                    Self::relay_websocket(origin, msg.stream_id, stream, cancelled).await;
+                });
                 continue;
             }
 
-            // Normal HTTP request-response
-            let Ok(permit) = request_limit.clone().acquire_owned().await else {
-                break;
-            };
-            let local_host = self.local_host.clone();
-            let local_port = self.local_port;
-            let request_store = self.request_store.clone();
-            let data_tx = self.connection.data_tx.clone();
-            let stream_id = msg.stream_id;
-            let connection_id = msg.connection_id;
-            let source_addr = msg.source_addr;
-            let payload = msg.payload;
-
-            tokio::spawn(async move {
-                let _permit = permit;
-                match Box::pin(Self::handle_payload(
-                    local_host,
-                    local_port,
-                    request_store,
-                    payload,
-                ))
-                .await
-                {
-                    Ok(response_payload) => {
-                        let _ = data_tx
-                            .send(LocalData {
-                                stream_id: Some(stream_id),
-                                tunnel_id,
-                                connection_id,
-                                source_addr,
-                                payload: response_payload,
-                                fin: true,
-                                streaming: false,
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        error!(stream_id, error = %e, "failed to process HTTP request");
-                    }
-                }
-            });
+            // HTTP exchanges and WebSocket upgrades both require bounded framing.
+            // Never fall back to buffering an unframed legacy request.
+            warn!(
+                stream_id = msg.stream_id,
+                "unsupported non-streaming HTTP message"
+            );
+            let _ = self
+                .connection
+                .data_tx
+                .try_send(ws_response(&msg, vec![], true));
         }
 
+        self.ws_relays.clear();
+        tasks.shutdown().await;
         Ok(())
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.connection.unregister_tunnel(self.config.id).await?;
         self.connection.close().await
     }
 }
 
-struct ParsedUpstreamResponse {
-    status_code: u16,
-    headers: Vec<CapturedHeader>,
-    body: Vec<u8>,
+fn ws_response(first: &ServerData, payload: Vec<u8>, fin: bool) -> LocalData {
+    LocalData {
+        stream_id: Some(first.stream_id),
+        tunnel_id: first.tunnel_id,
+        connection_id: first.connection_id,
+        source_addr: first.source_addr,
+        payload,
+        fin,
+        streaming: true,
+        mode: first.mode,
+    }
 }
 
-fn chunked_body_wire_len(payload: &[u8]) -> Result<Option<usize>> {
-    let mut cursor = 0;
-
-    loop {
-        let Some(line_end) = find_crlf(&payload[cursor..]) else {
-            return Ok(None);
-        };
-        let line = std::str::from_utf8(&payload[cursor..cursor + line_end])?;
-        let size_text = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16)?;
-        cursor += line_end + 2;
-
-        if size == 0 {
-            loop {
-                let Some(trailer_end) = find_crlf(&payload[cursor..]) else {
-                    return Ok(None);
-                };
-                cursor += trailer_end + 2;
-                if trailer_end == 0 {
-                    return Ok(Some(cursor));
-                }
-            }
-        }
-
-        let chunk_end = cursor
-            .checked_add(size)
-            .ok_or_else(|| anyhow!("upstream chunk length overflow"))?;
-        let terminator_end = chunk_end
-            .checked_add(2)
-            .ok_or_else(|| anyhow!("upstream chunk length overflow"))?;
-        if terminator_end > payload.len() {
-            return Ok(None);
-        }
-        if &payload[chunk_end..terminator_end] != b"\r\n" {
-            bail!("invalid upstream chunk terminator");
-        }
-        cursor = terminator_end;
+fn validate_ws_message(first: &ServerData, message: &ServerData) -> Result<()> {
+    if !message.streaming
+        || message.mode != StreamMode::ByteStream
+        || message.stream_id != first.stream_id
+        || message.tunnel_id != first.tunnel_id
+        || message.connection_id != first.connection_id
+        || message.source_addr != first.source_addr
+    {
+        bail!("WebSocket stream identity changed");
     }
+    if message.payload.len() > MAX_PAYLOAD_SIZE {
+        bail!("WebSocket payload too large");
+    }
+    Ok(())
+}
+
+async fn next_ws_bytes(incoming: &mut IncomingBody) -> Result<Option<axum::body::Bytes>> {
+    match incoming.frame().await {
+        Some(frame) => Ok(Some(
+            frame?
+                .into_data()
+                .map_err(|_| anyhow!("unexpected WebSocket trailers"))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+async fn send_ws_bytes(writer: &Writer<LocalData>, bytes: &[u8]) -> Result<()> {
+    for chunk in bytes.chunks(DATA_CHUNK_BYTES) {
+        timeout(
+            STREAM_ENQUEUE_TIMEOUT,
+            writer.send(HttpFrame::Data(chunk.to_vec()), false),
+        )
+        .await??;
+    }
+    Ok(())
 }
 
 fn find_header_end(payload: &[u8]) -> Option<usize> {
     payload.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn find_crlf(payload: &[u8]) -> Option<usize> {
-    payload.windows(2).position(|window| window == b"\r\n")
-}
-
 fn is_hop_by_hop_header(name: &str) -> bool {
-    matches!(
-        name.trim().to_ascii_lowercase().as_str(),
-        "connection"
-            | "proxy-connection"
-            | "keep-alive"
-            | "transfer-encoding"
-            | "te"
-            | "trailer"
-            | "upgrade"
-            | "expect"
-    )
+    pike_core::http_response::is_hop_by_hop(name)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::HttpTunnel;
+    use super::{HttpTunnel, MAX_UPGRADE_HEADER_SIZE};
+    use crate::tunnel::origin::{Origin, OriginOptions};
+    use futures::{SinkExt, StreamExt};
+    use pike_core::quic::client::{LocalData, PikeConnection, ServerData};
+    use pike_core::types::{TunnelConfig, TunnelId, TunnelType};
+    use pike_core::websocket::MAX_PAYLOAD_SIZE;
+    use pike_core::{
+        http_wire::{encode, Decoder, HttpFrame, DATA_CHUNK_BYTES},
+        proto::StreamMode,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
 
     async fn read_request_headers(socket: &mut TcpStream) -> Vec<u8> {
@@ -881,23 +481,453 @@ mod tests {
                 .expect("write response");
         });
 
-        let response = HttpTunnel::handle_payload(
-            "127.0.0.1".to_string(),
-            port,
-            None,
-            b"GET / HTTP/1.1\r\nHost: chat.pike.life\r\n\r\n".to_vec(),
-        )
-        .await
-        .expect("forwarded response");
-
+        let (response, _) = typed_http_exchange(port).await;
         server.await.expect("server task");
-        let response_text = String::from_utf8(response).expect("utf8 response");
-        assert!(response_text.starts_with("HTTP/1.1 200 OK"));
-        assert!(response_text.ends_with("ok"));
+        assert_eq!(response, b"ok");
+    }
+    const UPGRADE: &[u8] = b"GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+
+    fn opening() -> ServerData {
+        ServerData {
+            stream_id: 4,
+            connection_id: 17,
+            tunnel_id: TunnelId::new(),
+            source_addr: "127.0.0.1:1234".parse().unwrap(),
+            payload: vec![],
+            fin: false,
+            streaming: true,
+            mode: StreamMode::ByteStream,
+        }
+    }
+
+    // Exercise the real dispatcher and wire framing; assertions below inspect
+    // application bytes while this peer handles transport credits and End.
+    struct PeerInput(mpsc::Sender<ServerData>);
+    impl PeerInput {
+        async fn send(&self, mut data: ServerData) -> anyhow::Result<()> {
+            if data.mode == StreamMode::ByteStream {
+                let mut framed = vec![];
+                for bytes in data.payload.chunks(DATA_CHUNK_BYTES) {
+                    framed.extend(encode(&HttpFrame::Data(bytes.to_vec()))?);
+                }
+                if data.fin {
+                    framed.extend(encode(&HttpFrame::End)?);
+                }
+                data.payload = framed;
+            }
+            self.0.send(data).await?;
+            Ok(())
+        }
+    }
+    struct PeerOutput {
+        rx: mpsc::Receiver<LocalData>,
+        input: mpsc::WeakSender<ServerData>,
+        first: ServerData,
+        decoder: Decoder,
+    }
+    impl PeerOutput {
+        fn decode(&mut self, mut data: LocalData) -> Option<LocalData> {
+            if data.mode != StreamMode::ByteStream {
+                return Some(data);
+            }
+            let frames = self.decoder.feed(&data.payload, data.fin).unwrap();
+            data.payload.clear();
+            let mut visible = false;
+            for frame in frames {
+                match frame {
+                    HttpFrame::Data(bytes) => {
+                        if let Some(input) = self.input.upgrade() {
+                            input
+                                .try_send(ServerData {
+                                    payload: encode(&HttpFrame::Credit(
+                                        bytes.len().max(1024) as u32
+                                    ))
+                                    .unwrap(),
+                                    ..self.first.clone()
+                                })
+                                .unwrap();
+                        }
+                        data.payload.extend(bytes);
+                        visible = true;
+                    }
+                    HttpFrame::End => visible = true,
+                    HttpFrame::Credit(_) => {}
+                    other => panic!("unexpected WebSocket frame {other:?}"),
+                }
+            }
+            visible.then_some(data)
+        }
+        async fn recv(&mut self) -> Option<LocalData> {
+            while let Some(data) = self.rx.recv().await {
+                if let Some(data) = self.decode(data) {
+                    return Some(data);
+                }
+            }
+            None
+        }
+        fn try_recv(&mut self) -> Result<LocalData, mpsc::error::TryRecvError> {
+            loop {
+                let data = self.rx.try_recv()?;
+                if let Some(data) = self.decode(data) {
+                    return Ok(data);
+                }
+            }
+        }
+    }
+
+    fn running_tunnel(
+        port: u16,
+        first: &ServerData,
+    ) -> (tokio::task::JoinHandle<()>, PeerInput, PeerOutput) {
+        let (control, _commands) = mpsc::channel(4);
+        let (outgoing, output) = mpsc::channel(4);
+        let (input, incoming) = mpsc::channel(4);
+        let connection = PikeConnection::from_channels(control, outgoing, incoming);
+        let config = TunnelConfig {
+            cloud: None,
+            id: first.tunnel_id,
+            tunnel_type: TunnelType::Http {
+                local_port: port,
+                subdomain: None,
+            },
+            local_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+        };
+        let mut tunnel = HttpTunnel::new(
+            config,
+            Origin::from_options(Some(port), "127.0.0.1", OriginOptions::default()).unwrap(),
+            None,
+            connection,
+            None,
+        );
+        let task = tokio::spawn(async move {
+            tunnel.run().await.unwrap();
+        });
+        let output = PeerOutput {
+            rx: output,
+            input: input.downgrade(),
+            first: first.clone(),
+            decoder: Decoder::default(),
+        };
+        (task, PeerInput(input), output)
+    }
+
+    async fn typed_http_exchange(port: u16) -> (Vec<u8>, usize) {
+        use pike_core::http_wire::{encode, Decoder, HttpFrame};
+        let first = ServerData {
+            payload: [
+                encode(&HttpFrame::Request {
+                    method: "GET".into(),
+                    target: "/".into(),
+                    headers: vec![("host".into(), b"local".to_vec())],
+                })
+                .unwrap(),
+                encode(&HttpFrame::End).unwrap(),
+            ]
+            .concat(),
+            mode: pike_core::proto::StreamMode::Http,
+            ..opening()
+        };
+        let (task, input, mut output) = running_tunnel(port, &first);
+        input.send(first.clone()).await.unwrap();
+        let mut decoder = Decoder::default();
+        let mut body = vec![];
+        let mut largest = 0;
+        let mut status = None;
+        loop {
+            let response = timeout(Duration::from_secs(10), output.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            largest = largest.max(response.payload.len());
+            for frame in decoder.feed(&response.payload, response.fin).unwrap() {
+                match frame {
+                    HttpFrame::Response { status: value, .. } => status = Some(value),
+                    HttpFrame::Data(bytes) => {
+                        let credit = u32::try_from(bytes.len().max(1024)).unwrap();
+                        body.extend(bytes);
+                        input
+                            .send(ServerData {
+                                payload: encode(&HttpFrame::Credit(credit)).unwrap(),
+                                ..first.clone()
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    HttpFrame::End => {}
+                    other => panic!("unexpected HTTP frame: {other:?}"),
+                }
+            }
+            if response.fin {
+                break;
+            }
+        }
+        assert_eq!(status, Some(200));
+        drop(input);
+        task.await.unwrap();
+        (body, largest)
     }
 
     #[tokio::test]
-    async fn handle_payload_returns_content_length_response_before_upstream_eof() {
+    async fn empty_open_and_fragmented_upgrade_reach_real_local_websocket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    "ready".into(),
+                ))
+                .await
+                .unwrap();
+            let text = socket.next().await.unwrap().unwrap();
+            assert_eq!(text.to_text().unwrap(), "hello");
+            socket.send(text).await.unwrap();
+            let closed = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap();
+            assert!(
+                closed.is_none()
+                    || closed
+                        .is_some_and(|message| message.is_err() || message.unwrap().is_close())
+            );
+        });
+        let first = opening();
+        let (task, input, mut output) = running_tunnel(addr.port(), &first);
+        input.send(first.clone()).await.unwrap();
+        input
+            .send(ServerData {
+                payload: UPGRADE[..27].to_vec(),
+                ..first.clone()
+            })
+            .await
+            .unwrap();
+        let mut remainder = UPGRADE[27..].to_vec();
+        // Masked RFC6455 text frame coalesced with the final HTTP header bytes.
+        remainder.extend_from_slice(&[
+            0x81,
+            0x85,
+            1,
+            2,
+            3,
+            4,
+            b'h' ^ 1,
+            b'e' ^ 2,
+            b'l' ^ 3,
+            b'l' ^ 4,
+            b'o' ^ 1,
+        ]);
+        input
+            .send(ServerData {
+                payload: remainder,
+                ..first.clone()
+            })
+            .await
+            .unwrap();
+        let handshake = output.recv().await.unwrap();
+        assert!(handshake.payload.starts_with(b"HTTP/1.1 101"));
+        assert!(!handshake.fin);
+        let mut received = Vec::new();
+        while received.len() < 14 {
+            let message = timeout(Duration::from_secs(3), output.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!message.fin);
+            received.extend(message.payload);
+        }
+        assert_eq!(received, b"\x81\x05ready\x81\x05hello");
+        input.send(ServerData { fin: true, ..first }).await.unwrap();
+        assert!(
+            timeout(Duration::from_secs(3), output.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .fin
+        );
+        drop(input);
+        task.await.unwrap();
+        assert!(output.recv().await.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_and_header_failures_each_send_exactly_one_fin() {
+        for payload in [UPGRADE.to_vec(), vec![b'x'; MAX_UPGRADE_HEADER_SIZE + 1]] {
+            let first = ServerData {
+                payload,
+                ..opening()
+            };
+            let (task, input, mut output) = running_tunnel(1, &first);
+            input.send(first).await.unwrap();
+            let final_message = output.recv().await.unwrap();
+            assert!(final_message.fin && final_message.payload.is_empty());
+            drop(input);
+            task.await.unwrap();
+            assert!(output.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_upgrade_does_not_reopen_on_late_stream_chunks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = ServerData {
+            payload: UPGRADE.to_vec(),
+            ..opening()
+        };
+        let (task, input, mut output) =
+            running_tunnel(listener.local_addr().unwrap().port(), &first);
+        input.send(first.clone()).await.unwrap();
+        let (mut local, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; UPGRADE.len()];
+        local.read_exact(&mut request).await.unwrap();
+        local
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let handshake = output.recv().await.unwrap();
+        assert!(handshake.payload.starts_with(b"HTTP/1.1 403"));
+        assert!(!handshake.fin);
+        assert!(
+            timeout(Duration::from_secs(3), output.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .fin
+        );
+        input.send(first.clone()).await.unwrap();
+        assert!(timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err());
+        assert!(
+            output.try_recv().is_err(),
+            "late chunk must not cause another FIN/relay"
+        );
+        input
+            .send(ServerData {
+                fin: true,
+                payload: vec![],
+                ..first
+            })
+            .await
+            .unwrap();
+        drop(input);
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_fin_cancels_stalled_upgrade_and_closes_local_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = ServerData {
+            payload: UPGRADE.to_vec(),
+            ..opening()
+        };
+        let (task, input, mut output) =
+            running_tunnel(listener.local_addr().unwrap().port(), &first);
+        input.send(first.clone()).await.unwrap();
+        let (mut local, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; UPGRADE.len()];
+        local.read_exact(&mut request).await.unwrap();
+        input
+            .send(ServerData {
+                payload: vec![],
+                fin: true,
+                ..first
+            })
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(3), output.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .fin
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(3), local.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        drop(input);
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_tunnel_run_cancels_owned_websocket_tasks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = ServerData {
+            payload: UPGRADE.to_vec(),
+            ..opening()
+        };
+        let (task, input, mut output) =
+            running_tunnel(listener.local_addr().unwrap().port(), &first);
+        input.send(first).await.unwrap();
+        let (mut local, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; UPGRADE.len()];
+        local.read_exact(&mut request).await.unwrap();
+        local
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\nready")
+            .await
+            .unwrap();
+        assert!(output
+            .recv()
+            .await
+            .unwrap()
+            .payload
+            .starts_with(b"HTTP/1.1 101"));
+        assert_eq!(
+            timeout(Duration::from_secs(3), output.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"ready"
+        );
+        drop(input);
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(3), local.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn response_larger_than_envelope_limit_streams_in_bounded_chunks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut local, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(local.read(&mut request).await.unwrap() > 0);
+            local
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut body = tokio::io::repeat(b'x').take((MAX_PAYLOAD_SIZE + 1) as u64);
+            let _ = tokio::io::copy(&mut body, &mut local).await;
+        });
+        let (body, largest) = typed_http_exchange(port).await;
+        assert_eq!(body, vec![b'x'; MAX_PAYLOAD_SIZE + 1]);
+        assert!(largest <= 64 * 1024);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_exchange_completes_content_length_response_before_upstream_eof() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -910,77 +940,15 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .await
                 .expect("write response");
+            // Keep the connection open: completion must come from framing, not EOF.
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
 
-        let response = timeout(
-            Duration::from_millis(250),
-            HttpTunnel::handle_payload(
-                "127.0.0.1".to_string(),
-                port,
-                None,
-                b"GET / HTTP/1.1\r\nHost: chat.pike.life\r\n\r\n".to_vec(),
-            ),
-        )
-        .await
-        .expect("response should not wait for upstream EOF")
-        .expect("forwarded response");
-
-        server.abort();
-        let _ = server.await;
-        assert_eq!(
-            response,
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_payload_returns_terminated_chunked_response_before_upstream_eof() {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let (body, _) = timeout(Duration::from_secs(3), typed_http_exchange(port))
             .await
-            .expect("bind test listener");
-        let port = listener.local_addr().expect("listener addr").port();
-
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept connection");
-            let _request = read_request_headers(&mut socket).await;
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
-                )
-                .await
-                .expect("write response");
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        });
-
-        let response = timeout(
-            Duration::from_millis(250),
-            HttpTunnel::handle_payload(
-                "127.0.0.1".to_string(),
-                port,
-                None,
-                b"GET /events HTTP/1.1\r\nHost: chat.pike.life\r\n\r\n".to_vec(),
-            ),
-        )
-        .await
-        .expect("response should not wait for upstream EOF")
-        .expect("forwarded response");
-
+            .expect("response should not wait for upstream EOF");
         server.abort();
         let _ = server.await;
-        assert_eq!(
-            response,
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n".to_vec()
-        );
-    }
-
-    #[test]
-    fn open_ended_chunked_response_is_not_complete_without_terminating_chunk() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nc\r\ndata: ping\n\n\r\n";
-
-        let complete_len =
-            HttpTunnel::complete_upstream_response_len(raw).expect("parse response prefix");
-
-        assert_eq!(complete_len, None);
+        assert_eq!(body, b"ok");
     }
 }

@@ -1,6 +1,5 @@
-//! Integration test for the configurable max-body-size cap (fix: uncapped body buffering ->
-//! memory exhaustion). A request body larger than `max_body_size` must be rejected with 413,
-//! not buffered into memory.
+//! Integration test for the max request body cap. A request body larger than the
+//! configured limit must be rejected with 413 at the edge, not streamed further.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,11 +42,15 @@ async fn start_server_with_body_cap(max_body_size: usize) -> SocketAddr {
         None,
         true,
         TrafficInspectionConfig::default(),
-        "pike.life".to_string(),
-        Duration::from_secs(30),
         max_body_size,
+        "pike.life".to_string(),
+        pike_server::visitor_policy::TrustedProxies::default(),
         false,
+        None,
+        pike_server::certificates::Certificates::disabled(),
         shutdown_rx,
+        None,
+        None,
     ));
 
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -72,12 +75,12 @@ async fn oversized_request_body_is_rejected_with_413() {
         .body(big_body)
         .send()
         .await
-        .expect("request should complete with 413, not OOM/hang");
+        .expect("request should complete with 413, not hang");
 
     assert_eq!(
         resp.status(),
         413,
-        "body over max_body_size must be rejected with Payload Too Large"
+        "body over the request limit must be rejected with Payload Too Large"
     );
 }
 

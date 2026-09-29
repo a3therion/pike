@@ -8,6 +8,9 @@ Type=simple
 User=pike
 Group=pike
 WorkingDirectory=/opt/pike
+StateDirectory=pike
+LogsDirectory=pike
+UMask=0027
 Environment="RUST_LOG=info"
 Environment="RUST_BACKTRACE=1"
 # Optional error monitoring (fix #6). Leave unset to disable Sentry entirely (no-op).
@@ -29,7 +32,7 @@ LimitNPROC=4096
 # Logging
 # Send stdout/stderr to the systemd journal instead of an ever-growing flat
 # file. Journald enforces retention/size caps (see the shipped
-# pike-server.service.d/journald.conf drop-in) so logs cannot fill the disk.
+# deploy/journald.conf drop-in that setup.sh installs) so logs cannot fill the disk.
 # View with: journalctl -u pike-server -f
 StandardOutput=journal
 StandardError=journal

@@ -27,23 +27,35 @@
 pub mod abuse;
 pub mod admin;
 pub mod auth;
+pub mod certificates;
 pub mod config;
 pub mod connection;
 pub mod control_plane;
 pub mod dashboard_ws;
 pub mod http;
 pub mod ingest;
+pub mod ingress;
+pub mod ingress_directory;
 pub mod management;
 pub mod metrics;
+pub mod observed_body;
+pub mod origin_health;
 pub mod proxy;
+pub mod quota;
 pub mod rate_limit;
 pub mod registry;
 pub mod request_log;
 pub mod router;
 pub mod state_store;
 pub mod tcp;
-pub mod transport;
+pub mod tls_material;
+pub mod traffic_meter;
 pub mod tunnel_metrics;
+pub mod usage_journal;
 pub mod usage_reporter;
 pub mod websocket;
 pub mod ws_proxy;
+
+pub mod visitor_policy;
+
+pub mod domain_grants;

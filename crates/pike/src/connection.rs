@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Local;
 use colored::Colorize;
 use pike_core::quic::client::{PikeClient, PikeConnection};
@@ -159,12 +159,27 @@ impl ConnectionHandler {
             relay_addr,
             relay_tls.server_name,
             relay_tls.verify_peer,
-            ApiKey(api_key),
+            ApiKey(api_key.clone()),
             Vec::new(),
         );
 
         self.state = ConnectionState::Handshaking;
-        let connection = client.connect().await?;
+        let timeout = Duration::from_millis(self.config.relay.connect_timeout_ms.max(1));
+        let connection = match tokio::time::timeout(timeout, client.connect()).await {
+            Ok(Ok(connection)) => connection,
+            result if self.config.relay.ws_fallback => {
+                let reason = match result {
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "QUIC connection timed out".to_string(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                let url = websocket_url(&self.config)?;
+                tracing::info!(%reason, "QUIC unavailable; connecting over WebSocket");
+                crate::websocket::connect(&url, &api_key).await?
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(anyhow!("QUIC connection timed out")),
+        };
 
         self.state = ConnectionState::Authenticating;
         self.state = ConnectionState::Active;
@@ -317,6 +332,43 @@ pub fn reconnect_backoff(attempt: u32) -> Duration {
     let final_secs = (base_secs as f64 * jitter_factor).max(1.0);
 
     Duration::from_secs_f64(final_secs)
+}
+
+fn websocket_url(config: &Config) -> Result<String> {
+    let url = if let Some(url) = &config.relay.ws_url {
+        reqwest::Url::parse(url).context("invalid relay.ws_url")?
+    } else {
+        let host = extract_relay_host(&config.relay.addr)?;
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host
+        };
+        reqwest::Url::parse(&format!("wss://{host}/ws/tunnel"))?
+    };
+    if !matches!(url.scheme(), "ws" | "wss")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(anyhow!(
+            "relay.ws_url must be a ws/wss URL without embedded credentials"
+        ));
+    }
+    if url.scheme() == "ws"
+        && !url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    {
+        return Err(anyhow!(
+            "unencrypted WebSocket transport is only allowed on loopback"
+        ));
+    }
+    Ok(url.to_string())
 }
 
 fn resolve_relay_tls_settings(config: &Config) -> Result<RelayTlsSettings> {

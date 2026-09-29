@@ -35,9 +35,21 @@ pub struct IngestEntry {
     pub response_content_type: Option<String>,
 }
 
-/// Batches request logs and periodically flushes them to the Workers API.
+const MAX_ENTRIES: usize = 4096;
+const MAX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ENTRY_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct Queue {
+    entries: std::collections::VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+/// At most 8 MiB queued plus a 1 MiB batch copy and its serialized payload. Drop new entries when
+/// full, preserving older retries. Disabled entirely when no sink is configured.
 pub struct RequestBuffer {
-    buffer: Mutex<Vec<IngestEntry>>,
+    buffer: Mutex<Queue>,
+    flush_lock: Mutex<()>,
     workers_api_url: String,
     server_token: String,
     http_client: reqwest::Client,
@@ -47,20 +59,47 @@ impl RequestBuffer {
     #[must_use]
     pub fn new(workers_api_url: String, server_token: String) -> Self {
         Self {
-            buffer: Mutex::new(Vec::new()),
+            buffer: Mutex::new(Queue::default()),
+            flush_lock: Mutex::new(()),
             workers_api_url,
             server_token,
             http_client: reqwest::Client::new(),
         }
     }
 
-    /// Add an entry to the buffer.
     pub async fn push(&self, entry: IngestEntry) {
-        self.buffer.lock().await.push(entry);
+        if self.workers_api_url.is_empty() || self.server_token.is_empty() {
+            return;
+        }
+        #[derive(Serialize)]
+        struct Event {
+            id: String,
+            #[serde(flatten)]
+            entry: IngestEntry,
+        }
+        let Ok(bytes) = serde_json::to_vec(&Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            entry,
+        }) else {
+            return;
+        };
+        let mut queue = self.buffer.lock().await;
+        if bytes.len() > MAX_ENTRY_BYTES
+            || queue.entries.len() >= MAX_ENTRIES
+            || queue.bytes + bytes.len() > MAX_BUFFER_BYTES
+        {
+            crate::metrics::INGEST_DROPPED.inc();
+            return;
+        }
+        queue.bytes += bytes.len();
+        queue.entries.push_back(bytes);
+        crate::metrics::INGEST_QUEUED_BYTES.set(i64::try_from(queue.bytes).unwrap_or(i64::MAX));
     }
 
-    /// Spawn a background loop that flushes the buffer every 30 seconds.
     pub fn spawn_flush_loop(self: &Arc<Self>) {
+        if self.workers_api_url.is_empty() || self.server_token.is_empty() {
+            return;
+        }
         let this = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
@@ -78,62 +117,77 @@ impl RequestBuffer {
     }
 
     async fn flush(&self) {
-        let entries: Vec<IngestEntry> = {
-            let mut buf = self.buffer.lock().await;
-            if buf.is_empty() {
-                return;
-            }
-            buf.drain(..).collect()
+        // Keep entries in the queue while awaiting acknowledgement. This reserves
+        // their bytes across concurrent producers and preserves stable retry IDs.
+        let Ok(_guard) = self.flush_lock.try_lock() else {
+            return;
         };
-
-        let total = entries.len();
-        info!(count = total, "flushing request buffer to D1");
-
-        // Split into chunks of MAX_BATCH_SIZE
-        for (index, chunk) in entries.chunks(MAX_BATCH_SIZE).enumerate() {
-            if let Err(error) = self.send_batch(chunk).await {
-                warn!(error = %error, count = chunk.len(), "failed to ingest batch to Workers API");
-                let failed_start = index * MAX_BATCH_SIZE;
-                self.requeue_failed_entries(entries[failed_start..].to_vec())
-                    .await;
+        {
+            let mut batch_bytes = 0;
+            let entries: Vec<_> = self
+                .buffer
+                .lock()
+                .await
+                .entries
+                .iter()
+                .take(MAX_BATCH_SIZE)
+                .take_while(|entry| {
+                    batch_bytes += entry.len();
+                    batch_bytes <= 1024 * 1024
+                })
+                .cloned()
+                .collect();
+            if entries.is_empty() {
                 return;
             }
+            let mut payload = Vec::from(b"{\"logs\":[".as_slice());
+            for (i, entry) in entries.iter().enumerate() {
+                if i > 0 {
+                    payload.push(b',');
+                }
+                payload.extend_from_slice(entry);
+            }
+            payload.extend_from_slice(b"]}");
+            let url = format!(
+                "{}/api/v1/analytics/ingest",
+                self.workers_api_url.trim_end_matches('/')
+            );
+            let result = self
+                .http_client
+                .post(url)
+                .header("X-Server-Token", &self.server_token)
+                .header("Content-Type", "application/json")
+                .body(payload)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+            match result {
+                Ok(response) if response.status().is_success() => {
+                    let expected = entries.len();
+                    let ack = response.json::<serde_json::Value>().await;
+                    if !matches!(ack, Ok(ref value) if value["ingested"].as_u64() == Some(expected as u64) && value["skipped"].as_u64().unwrap_or(0) == 0)
+                    {
+                        crate::metrics::INGEST_RETRIES.inc();
+                        warn!("ingest acknowledgement incomplete; retaining batch");
+                        return;
+                    }
+                }
+                other => {
+                    crate::metrics::INGEST_RETRIES.inc();
+                    warn!(status = ?other.map(|response| response.status()), "ingest failed; retaining bounded batch");
+                    return;
+                }
+            }
+            let mut queue = self.buffer.lock().await;
+            for _ in 0..entries.len() {
+                if let Some(entry) = queue.entries.pop_front() {
+                    queue.bytes -= entry.len();
+                }
+            }
+            crate::metrics::INGEST_QUEUED_BYTES.set(i64::try_from(queue.bytes).unwrap_or(i64::MAX));
+            info!(count = entries.len(), "request logs acknowledged");
+            // Next tick drains the next batch.
         }
-    }
-
-    async fn requeue_failed_entries(&self, failed_entries: Vec<IngestEntry>) {
-        let mut buffer = self.buffer.lock().await;
-        let mut retained = failed_entries;
-        retained.append(&mut *buffer);
-        *buffer = retained;
-    }
-
-    async fn send_batch(&self, entries: &[IngestEntry]) -> anyhow::Result<()> {
-        #[derive(Serialize)]
-        struct BatchPayload<'a> {
-            logs: &'a [IngestEntry],
-        }
-
-        let url = format!(
-            "{}/api/v1/analytics/ingest",
-            self.workers_api_url.trim_end_matches('/')
-        );
-        let response = self
-            .http_client
-            .post(&url)
-            .header("X-Server-Token", &self.server_token)
-            .json(&BatchPayload { logs: entries })
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("ingest API returned {status}: {body}");
-        }
-
-        Ok(())
     }
 }
 
@@ -184,6 +238,7 @@ mod tests {
         fn respond(&self, _request: &Request) -> ResponseTemplate {
             if self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ingested":2,"skipped":0}))
             } else {
                 ResponseTemplate::new(500)
             }
@@ -212,6 +267,11 @@ mod tests {
             .await
             .expect("received requests should be available");
         assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].body, requests[1].body,
+            "retries keep stable event IDs"
+        );
+        assert_eq!(buffer.buffer.lock().await.bytes, 0);
 
         let body: serde_json::Value =
             serde_json::from_slice(&requests[1].body).expect("ingest payload should be json");
@@ -219,5 +279,18 @@ mod tests {
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0]["path"], "/a");
         assert_eq!(logs[1]["path"], "/b");
+    }
+    #[tokio::test]
+    async fn missing_sink_and_backpressure_have_bounded_memory() {
+        let disabled = RequestBuffer::new(String::new(), String::new());
+        disabled.push(sample_entry("disabled")).await;
+        assert!(disabled.buffer.lock().await.entries.is_empty());
+        let buffer = RequestBuffer::new("http://unreachable.invalid".into(), "test".into());
+        for _ in 0..super::MAX_ENTRIES + 10 {
+            buffer.push(sample_entry("bounded")).await;
+        }
+        let queue = buffer.buffer.lock().await;
+        assert_eq!(queue.entries.len(), super::MAX_ENTRIES);
+        assert!(queue.bytes <= super::MAX_BUFFER_BYTES);
     }
 }

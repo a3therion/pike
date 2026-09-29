@@ -60,11 +60,15 @@ async fn start_test_server_custom(
         local_api_keys,
         dev_mode,
         TrafficInspectionConfig::default(),
+        pike_server::http::DEFAULT_MAX_BODY_SIZE,
         "pike.life".to_string(),
-        std::time::Duration::from_secs(30),
-        100 * 1024 * 1024,
+        pike_server::visitor_policy::TrustedProxies::default(),
         false,
+        None,
+        pike_server::certificates::Certificates::disabled(),
         shutdown_rx,
+        None,
+        None,
     ));
 
     tokio::spawn(async move {
@@ -277,7 +281,7 @@ async fn sse_exchange_token_single_use() {
         .and(path("/api/v1/auth/validate"))
         .and(header("authorization", "Bearer valid-jwt"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "user_id": "user-1"
+            "valid": true, "auth_type": "jwt", "user_id": "user-1"
         })))
         .mount(&control_plane)
         .await;
@@ -396,4 +400,103 @@ async fn platform_metrics_non_owner_with_local_api_key_returns_404() {
         .unwrap();
 
     assert_eq!(resp.status(), 404);
+}
+
+async fn revocable_control_plane() -> (
+    MockServer,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let server = MockServer::start().await;
+    let revoked = Arc::new(AtomicBool::new(false));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let state = revoked.clone();
+    let rejected_calls = rejected.clone();
+    Mock::given(method("POST")).and(path("/api/v1/auth/validate"))
+        .and(header("Authorization", "Bearer revocable-jwt"))
+        .respond_with(move |_request: &wiremock::Request| {
+            if state.load(Ordering::SeqCst) {
+                rejected_calls.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(401)
+            } else { ResponseTemplate::new(200).set_body_json(serde_json::json!({"valid":true,"user_id":"owner","auth_type":"jwt","scopes":null})) }
+        }).mount(&server).await;
+    (server, revoked, rejected)
+}
+
+#[tokio::test]
+async fn sse_exchange_rechecks_revocation_and_consumes_rejected_token() {
+    use std::sync::atomic::Ordering;
+    let (control_plane, revoked, _) = revocable_control_plane().await;
+    let addr = start_test_server_custom(
+        Some(control_plane.uri()),
+        None,
+        false,
+        Some(("test-id", "owner")),
+    )
+    .await;
+    let token = create_sse_token(addr, "test-id", "revocable-jwt").await;
+    let url = format!("http://{addr}/api/v1/tunnels/test-id/requests/stream?token={token}");
+    revoked.store(true, Ordering::SeqCst);
+    let response = http_client()
+        .get(&url)
+        .header("Host", "pike.life")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        401,
+        "a token exchange cannot outlive the source credential"
+    );
+    revoked.store(false, Ordering::SeqCst);
+    let response = http_client()
+        .get(&url)
+        .header("Host", "pike.life")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        401,
+        "a consumed exchange token must not become usable again"
+    );
+}
+
+#[tokio::test]
+async fn active_sse_stream_ends_after_session_revocation() {
+    use std::sync::atomic::Ordering;
+    let (control_plane, revoked, rejected) = revocable_control_plane().await;
+    let addr = start_test_server_custom(
+        Some(control_plane.uri()),
+        None,
+        false,
+        Some(("test-id", "owner")),
+    )
+    .await;
+    let token = create_sse_token(addr, "test-id", "revocable-jwt").await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .unwrap();
+    let mut response = client
+        .get(format!(
+            "http://{addr}/api/v1/tunnels/test-id/requests/stream?token={token}"
+        ))
+        .header("Host", "pike.life")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    revoked.store(true, Ordering::SeqCst);
+    // Consume keepalive chunks until the server closes the existing stream.
+    tokio::time::timeout(Duration::from_secs(40), async {
+        while response.chunk().await.unwrap().is_some() {}
+    })
+    .await
+    .expect("an active stream must close within one revalidation interval");
+    assert!(
+        rejected.load(Ordering::SeqCst) > 0,
+        "closure must follow a real rejected validation"
+    );
 }

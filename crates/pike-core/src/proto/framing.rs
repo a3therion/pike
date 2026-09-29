@@ -10,7 +10,7 @@ use crate::proto::ControlMessage;
 /// serialized via [`write_frame`]/[`write_control_message`]. HTTP request and
 /// response bodies are sent as raw bytes directly over QUIC data streams
 /// (via `qconn.stream_send`) and are NOT subject to this limit — QUIC handles
-/// packetization natively. The 10 MB HTTP body limit enforced at the HTTP layer
+/// packetization natively. The configurable HTTP body limit enforced at the HTTP layer
 /// is independent and prevents client-side OOM; it has no interaction with this
 /// 1 MB control-frame ceiling.
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;

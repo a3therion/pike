@@ -56,6 +56,8 @@ pub struct UserLimits {
 
 #[derive(Debug, Clone)]
 pub struct ValidatedUser {
+    /// Authoritative hosted active-tunnel cap; absent for standalone/older control planes.
+    pub tunnel_limit: Option<u64>,
     pub user_id: String,
     pub email: String,
     pub plan: String,
@@ -70,6 +72,7 @@ pub struct ValidatedUser {
 pub struct ClientInfo {
     pub connection_id: ConnectionId,
     pub remote_addr: Option<SocketAddr>,
+    pub transport: &'static str,
     pub api_key: Option<String>,
     pub assigned_subdomain: Option<String>,
     pub validated_user: Option<ValidatedUser>,
@@ -100,6 +103,7 @@ impl ClientConnection {
             info: ClientInfo {
                 connection_id,
                 remote_addr,
+                transport: "QUIC",
                 api_key: None,
                 assigned_subdomain: None,
                 validated_user: None,
@@ -169,17 +173,22 @@ impl ClientConnection {
     pub fn register_tunnel_config(
         &mut self,
         config: &TunnelConfig,
-        allocated_tcp_port: Option<u16>,
+        allocated_port: Option<u16>,
     ) -> Result<TunnelRegistration> {
         let remote_port = match config.tunnel_type {
             TunnelType::Tcp { remote_port, .. } => {
-                let selected = allocated_tcp_port.or(remote_port).ok_or_else(|| {
+                let selected = allocated_port.or(remote_port).ok_or_else(|| {
                     anyhow::anyhow!("tcp tunnel registration requires allocated remote port")
                 })?;
                 self.tcp_remote_ports.insert(config.id, selected);
                 Some(selected)
             }
-            TunnelType::Http { .. } => None,
+            TunnelType::Udp { remote_port, .. } => {
+                Some(allocated_port.or(remote_port).ok_or_else(|| {
+                    anyhow::anyhow!("UDP registration requires allocated remote port")
+                })?)
+            }
+            TunnelType::Http { .. } | TunnelType::Tls { .. } => None,
         };
 
         if !self.tunnels.contains(&config.id) {
@@ -303,6 +312,7 @@ mod tests {
         conn.authenticate("pk_test_key_1234", true).expect("auth");
 
         let config = TunnelConfig {
+            cloud: None,
             id: TunnelId::new(),
             tunnel_type: TunnelType::Tcp {
                 local_port: 5432,
@@ -323,6 +333,7 @@ mod tests {
         conn.authenticate("pk_test_key_1234", true).expect("auth");
 
         let config = TunnelConfig {
+            cloud: None,
             id: TunnelId::new(),
             tunnel_type: TunnelType::Tcp {
                 local_port: 5432,
