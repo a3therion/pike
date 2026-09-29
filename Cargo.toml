@@ -50,7 +50,7 @@ async-stream = "0.3"
 futures = "0.3"
 
 # Rate limiting
-governor = "0.7"
+governor = "0.10"
 
 # Observability
 tracing = "0.1"
