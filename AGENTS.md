@@ -1,26 +1,15 @@
-# Agent Guidance
+# Agent guidance
 
-This repo is part of the `pike-ws` workspace. A shared Understand Anything
-knowledge graph is available one directory up:
+Public open-source core of Pike:
 
-- Graph: `../.understand-anything/knowledge-graph.json`
-- Summary: `../.understand-anything/summary.json`
+- `crates/pike`: the CLI tunnel client
+- `crates/pike-server`: the relay
+- `crates/pike-core`: shared protocol, QUIC/WebSocket transport and types
 
-Use that graph before making non-trivial changes. It maps this Rust repo along
-with `../pike-cloud`, including the Pike CLI, Pike Core Protocol, Pike Server,
-deployment/configuration files, and their relationships.
+The private hosted control plane lives in the sibling `pike-cloud` repo, which deploys pinned releases of this one.
 
-Recommended workflow:
+Verify with `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`. For transport changes, also run `python3 scripts/local_tunnel_smoke.py` after `cargo build --workspace`.
 
-1. Check `../.understand-anything/summary.json` for the layer overview.
-2. Search `../.understand-anything/knowledge-graph.json` for relevant files,
-   functions, classes/types, imports, and tour steps before choosing where to
-   edit or add code.
-3. Keep new Rust code within the existing layer boundaries:
-   `pike/crates/pike-core`, `pike/crates/pike-server`, `pike/crates/pike`, and
-   repo operations/configuration.
-4. After adding modules, moving files, or making broad structural changes,
-   refresh the shared graph from the workspace root with
-   `$understand-anything:understand`.
-
-The workspace root is not a git repo; this child directory is.
+- The CLI and relay must speak the same protocol version (`PROTOCOL_VERSION` in `crates/pike-core/src/proto/mod.rs`); change and release them together.
+- `scripts/install.sh` on `main` is live: `pike.life/install` redirects to it, and it installs the latest GitHub release.
+- Pushing a `v*` tag publishes binaries and the `ghcr.io/a3therion/pike-server` image, and new installs pick it up. Don't tag until production runs a matching relay (see the rollout state in `pike-cloud/DEPLOY.md`).
