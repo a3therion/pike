@@ -51,7 +51,9 @@ pub async fn run_ws_test(options: WsTestOptions) -> Result<()> {
     for frame_index in 1..=options.frames {
         let payload = format!("pike-test-ws-{frame_index}");
         if options.binary {
-            socket.send(Message::binary(payload.as_bytes())).await?;
+            socket
+                .send(Message::binary(payload.clone().into_bytes()))
+                .await?;
         } else {
             socket.send(Message::text(payload.clone())).await?;
         }

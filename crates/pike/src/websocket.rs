@@ -49,11 +49,9 @@ async fn monitor_heartbeat(mut acknowledgements: watch::Receiver<Instant>) -> Re
 }
 
 pub async fn connect(url: &str, api_key: &str) -> Result<PikeConnection> {
-    let config = WebSocketConfig {
-        max_message_size: Some(MAX_MESSAGE_SIZE),
-        max_frame_size: Some(MAX_MESSAGE_SIZE),
-        ..WebSocketConfig::default()
-    };
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_MESSAGE_SIZE));
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(10),
         connect_async_with_config(url, Some(config), false),
@@ -62,11 +60,14 @@ pub async fn connect(url: &str, api_key: &str) -> Result<PikeConnection> {
     .context("WebSocket connection timed out")??;
     send_message(
         &mut socket,
-        Message::Binary(encode(&WsMessage::Control(ControlMessage::Login {
-            api_key: api_key.to_string(),
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            protocol_version: Some(PROTOCOL_VERSION),
-        }))?),
+        Message::Binary(
+            encode(&WsMessage::Control(ControlMessage::Login {
+                api_key: api_key.to_string(),
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: Some(PROTOCOL_VERSION),
+            }))?
+            .into(),
+        ),
     )
     .await?;
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -225,7 +226,7 @@ pub async fn connect(url: &str, api_key: &str) -> Result<PikeConnection> {
                         WsMessage::Control(ControlMessage::Heartbeat { seq, timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() })
                     }
                 };
-                send_message(&mut writer, Message::Binary(encode(&message)?)).await?;
+                send_message(&mut writer, Message::Binary(encode(&message)?.into())).await?;
             }
             Ok::<(), anyhow::Error>(())
         };
@@ -281,9 +282,12 @@ mod tests {
             std::future::pending::<std::result::Result<(), tokio_tungstenite::tungstenite::Error>>()
                 .await
         });
-        let error = send_message(&mut Box::pin(sink), Message::Ping(Vec::new()))
-            .await
-            .unwrap_err();
+        let error = send_message(
+            &mut Box::pin(sink),
+            Message::Ping(tokio_tungstenite::tungstenite::Bytes::new()),
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("write timed out"));
     }
 }
