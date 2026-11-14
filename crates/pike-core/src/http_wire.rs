@@ -48,6 +48,8 @@ impl<T: Envelope> Writer<T> {
         }
     }
 
+    // fetch_update is deprecated (renamed try_update) from Rust 1.100; keep it while the MSRV is 1.88.
+    #[allow(deprecated)]
     pub fn grant(&self, count: u32) -> Result<()> {
         let count = count as usize;
         ensure!(
@@ -199,6 +201,8 @@ impl BodySender {
     pub async fn closed(&self) {
         self.sender.closed().await;
     }
+    // fetch_update is deprecated (renamed try_update) from Rust 1.100; keep it while the MSRV is 1.88.
+    #[allow(deprecated)]
     pub fn try_send(&self, frame: std::result::Result<HttpFrame, String>) -> Result<()> {
         use std::sync::atomic::Ordering;
         match &frame {
