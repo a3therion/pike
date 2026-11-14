@@ -12,7 +12,6 @@ edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/a3therion/pike"
-homepage = "https://pike.dev"
 
 [workspace.dependencies]
 # Async runtime
@@ -29,9 +28,6 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-
-# TLS
-rustls = "0.23"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

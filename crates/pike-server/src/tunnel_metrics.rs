@@ -730,6 +730,8 @@ impl TunnelMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    // fetch_update is deprecated (renamed try_update) from Rust 1.100; keep it while the MSRV is 1.88.
+    #[allow(deprecated)]
     fn record_wss_close(&self, now_unix_ms: u64) {
         self.last_activity_unix_ms
             .store(now_unix_ms, Ordering::Relaxed);
