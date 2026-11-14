@@ -31,7 +31,7 @@ notify = "6"
 colored = "2"
 indicatif = "0.17"
 dirs = "5"
-rand = "0.8"
+rand = "0.9"
 rpassword = "7"
 axum = { workspace = true }
 hyper = { workspace = true }
