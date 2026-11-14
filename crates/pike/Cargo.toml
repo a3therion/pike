@@ -29,7 +29,7 @@ serde_json = { workspace = true }
 toml = "0.8"
 notify = "6"
 colored = "2"
-indicatif = "0.17"
+indicatif = "0.18"
 dirs = "5"
 rand = "0.8"
 rpassword = "7"
