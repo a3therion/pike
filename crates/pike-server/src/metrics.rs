@@ -155,7 +155,7 @@ mod tests {
         let families = prometheus::gather();
         families
             .into_iter()
-            .find(|family| family.get_name() == name)
+            .find(|family| family.name() == name)
             .unwrap_or_else(|| panic!("missing metric family: {name}"))
     }
 
@@ -212,17 +212,17 @@ mod tests {
             let labels: std::collections::HashMap<_, _> = metric
                 .get_label()
                 .iter()
-                .map(|l| (l.get_name(), l.get_value()))
+                .map(|l| (l.name(), l.value()))
                 .collect();
             let direction = labels.get("direction").copied().unwrap_or_default();
 
             if direction == "in" {
                 seen_in = true;
-                assert!(metric.get_counter().get_value() >= 1024.0);
+                assert!(metric.get_counter().value() >= 1024.0);
             }
             if direction == "out" {
                 seen_out = true;
-                assert!(metric.get_counter().get_value() >= 2048.0);
+                assert!(metric.get_counter().value() >= 2048.0);
             }
         }
 
@@ -258,7 +258,7 @@ mod tests {
         assert!(family
             .get_metric()
             .iter()
-            .any(|m| m.get_counter().get_value() >= 1.0));
+            .any(|m| m.get_counter().value() >= 1.0));
     }
 
     #[tokio::test]

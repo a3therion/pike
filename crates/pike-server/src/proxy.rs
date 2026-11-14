@@ -250,10 +250,10 @@ pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 #[must_use]
 pub fn to_tungstenite_message(message: AxumWsMessage) -> Option<TungsteniteMessage> {
     match message {
-        AxumWsMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string())),
-        AxumWsMessage::Binary(bin) => Some(TungsteniteMessage::Binary(bin.to_vec())),
-        AxumWsMessage::Ping(data) => Some(TungsteniteMessage::Ping(data.to_vec())),
-        AxumWsMessage::Pong(data) => Some(TungsteniteMessage::Pong(data.to_vec())),
+        AxumWsMessage::Text(text) => Some(TungsteniteMessage::Text(text.as_str().into())),
+        AxumWsMessage::Binary(bin) => Some(TungsteniteMessage::Binary(bin)),
+        AxumWsMessage::Ping(data) => Some(TungsteniteMessage::Ping(data)),
+        AxumWsMessage::Pong(data) => Some(TungsteniteMessage::Pong(data)),
         AxumWsMessage::Close(frame) => Some(TungsteniteMessage::Close(frame.map(|frame| {
             tokio_tungstenite::tungstenite::protocol::CloseFrame {
                 code: frame.code.into(),

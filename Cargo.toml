@@ -43,14 +43,14 @@ toml = "0.8"
 postcard = { version = "1", features = ["alloc"] }
 
 # Networking
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.28"
 
 # Streaming
 async-stream = "0.3"
 futures = "0.3"
 
 # Rate limiting
-governor = "0.7"
+governor = "0.10"
 
 # Observability
 tracing = "0.1"

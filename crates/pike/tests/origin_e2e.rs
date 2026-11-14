@@ -446,7 +446,7 @@ async fn streaming_checks(public: u16, host: &str) {
     let (mut socket, _) = tokio_tungstenite::client_async(request, socket)
         .await
         .unwrap();
-    let frame = tokio_tungstenite::tungstenite::Message::Binary(vec![0, 255, 12, 65]);
+    let frame = tokio_tungstenite::tungstenite::Message::Binary(vec![0, 255, 12, 65].into());
     socket.send(frame.clone()).await.unwrap();
     assert_eq!(socket.next().await.unwrap().unwrap(), frame);
     socket.close(None).await.unwrap();
